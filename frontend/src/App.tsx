@@ -12,6 +12,7 @@ import type { User } from './types'
 import Layout from './components/layout/Layout'
 import LoginPage from './pages/LoginPage'
 import OnboardingPage from './pages/OnboardingPage'
+import HomePage from './pages/HomePage'
 import SearchPage from './pages/SearchPage'
 import BookmarksPage from './pages/BookmarksPage'
 import AdminPage from './pages/AdminPage'
@@ -19,10 +20,16 @@ import SettingsPage from './pages/SettingsPage'
 import CodingPage from './pages/CodingPage'
 import NotFoundPage from './pages/NotFoundPage'
 import ErrorPage from './pages/ErrorPage'
+import InterviewListPage from './pages/interview/InterviewListPage'
+import InterviewDetailPage from './pages/interview/InterviewDetailPage'
+import NewsListPage from './pages/news/NewsListPage'
+import NewsDetailPage from './pages/news/NewsDetailPage'
+import GitHubListPage from './pages/github/GitHubListPage'
+import GitHubDetailPage from './pages/github/GitHubDetailPage'
 
-function CodingRedirect() {
+function CodingRedirect({ basePath }: { basePath: string }) {
   const last = localStorage.getItem('coding_tab') || 'manager'
-  return <Navigate to={`/coding/${last}`} replace />
+  return <Navigate to={`${basePath}/coding/${last}`} replace />
 }
 
 function ProtectedRoute() {
@@ -38,11 +45,9 @@ function ProtectedRoute() {
         setAppMode(mode)
 
         if (mode !== 'multi') {
-          // Non-multi modes: no login required — backend returns synthetic user
           return
         }
 
-        // Multi mode: verify an active session exists
         if (user) return
         try {
           const me = await apiFetch<User>('/auth/me')
@@ -87,25 +92,95 @@ const router = createBrowserRouter([
     element: <ProtectedRoute />,
     errorElement: <ErrorPage />,
     children: [
+      // Module selector home
+      { path: '/', element: <HomePage /> },
+
+      // ── Discord Chat Analysis ─────────────────────────────────────────────
       {
-        element: <Layout />,
+        path: '/discord',
+        element: <Layout basePath="/discord" mode="discord" />,
         errorElement: <ErrorPage />,
         children: [
-          { path: '/', element: <Navigate to="/search" replace /> },
-          { path: '/search', element: <SearchPage /> },
-          { path: '/bookmarks', element: <BookmarksPage /> },
-          { path: '/coding', element: <CodingRedirect /> },
-          { path: '/coding/manager', element: <CodingPage /> },
-          { path: '/coding/table', element: <CodingPage /> },
-          { path: '/settings', element: <SettingsPage /> },
-          { path: '/admin', element: <AdminPage /> },
+          { index: true, element: <Navigate to="/discord/search" replace /> },
+          { path: 'search', element: <SearchPage /> },
+          { path: 'bookmarks', element: <BookmarksPage /> },
+          { path: 'coding', element: <CodingRedirect basePath="/discord" /> },
+          { path: 'coding/manager', element: <CodingPage /> },
+          { path: 'coding/table', element: <CodingPage /> },
+          { path: 'settings', element: <SettingsPage /> },
+          { path: 'admin', element: <AdminPage /> },
         ],
       },
+
+      // ── Coding Manager ────────────────────────────────────────────────────
+      {
+        path: '/coding',
+        element: <Layout basePath="/coding" mode="coding" />,
+        errorElement: <ErrorPage />,
+        children: [
+          { index: true, element: <Navigate to="/coding/bookmarks" replace /> },
+          { path: 'bookmarks', element: <BookmarksPage /> },
+          { path: 'manager', element: <CodingPage /> },
+          { path: 'table', element: <CodingPage /> },
+        ],
+      },
+
+      // ── Online Interview Analysis ──────────────────────────────────────────
+      {
+        path: '/interview',
+        element: <Layout basePath="/interview" mode="interview" />,
+        errorElement: <ErrorPage />,
+        children: [
+          { index: true, element: <InterviewListPage /> },
+          { path: 'bookmarks', element: <BookmarksPage /> },
+          { path: 'coding', element: <CodingRedirect basePath="/interview" /> },
+          { path: 'coding/manager', element: <CodingPage /> },
+          { path: 'coding/table', element: <CodingPage /> },
+          { path: ':id', element: <InterviewDetailPage /> },
+        ],
+      },
+
+      // ── News & Document Analysis ───────────────────────────────────────────
+      {
+        path: '/news',
+        element: <Layout basePath="/news" mode="news" />,
+        errorElement: <ErrorPage />,
+        children: [
+          { index: true, element: <NewsListPage /> },
+          { path: 'bookmarks', element: <BookmarksPage /> },
+          { path: 'coding', element: <CodingRedirect basePath="/news" /> },
+          { path: 'coding/manager', element: <CodingPage /> },
+          { path: 'coding/table', element: <CodingPage /> },
+          { path: ':id', element: <NewsDetailPage /> },
+        ],
+      },
+
+      // ── GitHub Activity Analysis ───────────────────────────────────────────
+      {
+        path: '/github',
+        element: <Layout basePath="/github" mode="github" />,
+        errorElement: <ErrorPage />,
+        children: [
+          { index: true, element: <GitHubListPage /> },
+          { path: 'bookmarks', element: <BookmarksPage /> },
+          { path: 'coding', element: <CodingRedirect basePath="/github" /> },
+          { path: 'coding/manager', element: <CodingPage /> },
+          { path: 'coding/table', element: <CodingPage /> },
+          { path: ':id', element: <GitHubDetailPage /> },
+        ],
+      },
+
+      // Backward-compat redirects for old un-prefixed routes
+      { path: '/search', element: <Navigate to="/discord/search" replace /> },
+      { path: '/bookmarks', element: <Navigate to="/discord/bookmarks" replace /> },
+      { path: '/settings', element: <Navigate to="/discord/settings" replace /> },
+      { path: '/admin', element: <Navigate to="/discord/admin" replace /> },
+      // Backward-compat: old coding-manager routes
+      { path: '/coding-manager', element: <Navigate to="/coding" replace /> },
+      { path: '/coding-manager/*', element: <Navigate to="/coding" replace /> },
+
+      { path: '*', element: <NotFoundPage /> },
     ],
-  },
-  {
-    path: '*',
-    element: <NotFoundPage />,
   },
 ])
 

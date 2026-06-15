@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { useNavigate, useRouteError, isRouteErrorResponse } from 'react-router-dom'
 
 function errorDetails(error: unknown): { code: string; title: string; detail: string } {
@@ -52,9 +53,21 @@ export default function ErrorPage({ error: propError, resetError }: ErrorPagePro
   const routeError = useRouteError()
   const err = propError ?? routeError
   const { code, title, detail } = errorDetails(err)
+  const [copied, setCopied] = useState(false)
+
+  const fullErrorText = err instanceof Error && err.stack
+    ? `${title}\n${detail}\n\n${err.stack}`
+    : `${title}\n${detail}`
+
+  const handleCopy = () => {
+    navigator.clipboard.writeText(fullErrorText).then(() => {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    })
+  }
 
   return (
-    <div className="min-h-screen bg-gray-100 flex flex-col items-center justify-center p-6 select-none">
+    <div className="min-h-screen bg-gray-100 flex flex-col items-center justify-center p-6">
       <div className="w-full max-w-lg bg-white shadow-lg overflow-hidden">
 
         {/* Header */}
@@ -102,7 +115,29 @@ export default function ErrorPage({ error: propError, resetError }: ErrorPagePro
             </p>
           </div>
           <p className="text-lg font-semibold text-gray-800">{title}</p>
-          <p className="mt-1 text-sm text-gray-500 max-w-xs mx-auto">{detail}</p>
+          <p className="mt-1 text-sm text-gray-500 max-w-xs mx-auto select-text">{detail}</p>
+
+          {/* Copy button */}
+          <button
+            onClick={handleCopy}
+            className="mt-3 inline-flex items-center gap-1.5 text-xs text-gray-400 hover:text-gray-600 border border-gray-200 hover:border-gray-400 rounded px-2.5 py-1 transition-colors"
+          >
+            {copied ? (
+              <>
+                <svg className="w-3 h-3 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                </svg>
+                Copied!
+              </>
+            ) : (
+              <>
+                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                </svg>
+                Copy error
+              </>
+            )}
+          </button>
 
           {/* Console-style error box */}
           {err instanceof Error && err.stack && (
@@ -110,7 +145,7 @@ export default function ErrorPage({ error: propError, resetError }: ErrorPagePro
               <summary className="text-xs text-gray-400 cursor-pointer hover:text-gray-600 select-none">
                 Show stack trace
               </summary>
-              <pre className="mt-2 bg-[#1e293b] text-[#e2e8f0] text-[0.65rem] p-3 overflow-x-auto leading-relaxed max-h-32">
+              <pre className="mt-2 bg-[#1e293b] text-[#e2e8f0] text-[0.65rem] p-3 overflow-x-auto leading-relaxed max-h-32 select-text">
                 {err.stack}
               </pre>
             </details>

@@ -1,0 +1,11 @@
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+bertopic>=0.16.0
+sentence-transformers>=3.0.0
+umap-learn>=0.5.6
+hdbscan>=0.8.38
+scikit-learn>=1.4.0
+numpy>=1.26.0,<2.0
+openai>=1.0.0
+transformers>=4.40.0
+torch>=2.0.0

@@ -14,14 +14,37 @@ fn key_from_header(headers: &HeaderMap) -> Option<String> {
         .filter(|s| !s.is_empty())
         .map(String::from)
 }
+
+/// Retry an ai_service request up to 3 times (2 s → 5 s → 10 s back-off).
+/// `make_req` is called fresh each attempt so headers/body are re-attached.
+/// Only connection/request-level errors are retried (service still starting up).
+async fn ai_retry<F>(mut make_req: F) -> Result<reqwest::Response, reqwest::Error>
+where
+    F: FnMut() -> reqwest::RequestBuilder,
+{
+    const DELAYS: [u64; 3] = [2, 5, 10];
+    let mut last_err: Option<reqwest::Error> = None;
+    for (attempt, &delay) in std::iter::once(&0u64).chain(DELAYS.iter()).enumerate() {
+        if attempt > 0 {
+            tracing::warn!("ai_service unreachable (attempt {}), retrying in {}s…", attempt, delay);
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+        }
+        match make_req().send().await {
+            Ok(resp) => return Ok(resp),
+            Err(e) if e.is_connect() || e.is_request() => last_err = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap())
+}
 use serde_json::json;
 use std::convert::Infallible;
 use crate::{
     error::AppError,
     models::{
-        AuthUser, ChatRequest, SummarizeFollowupRequest, SummarizeMsg, SummarizeRequest,
-        SummarizeResultsFollowupRequest, SummarizeResultsRequest, UserProfileFollowupRequest,
-        UserProfileRequest,
+        AuthUser, ChatRequest, StrategyRequest, SummarizeFollowupRequest, SummarizeMsg,
+        SummarizeRequest, SummarizeResultsFollowupRequest, SummarizeResultsRequest,
+        UserProfileFollowupRequest, UserProfileRequest, UserTopicsRequest,
     },
     prompts,
     state::AppState,
@@ -236,7 +259,7 @@ async fn call_openai_stream(
 
 pub async fn chat(
     State(state): State<AppState>,
-    user: AuthUser,
+    _user: AuthUser,
     headers: HeaderMap,
     Json(req): Json<ChatRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -259,7 +282,7 @@ pub async fn chat(
 
 pub async fn summarize(
     State(state): State<AppState>,
-    user: AuthUser,
+    _user: AuthUser,
     headers: HeaderMap,
     Json(req): Json<SummarizeRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -278,7 +301,7 @@ pub async fn summarize(
 
 pub async fn summarize_followup(
     State(state): State<AppState>,
-    user: AuthUser,
+    _user: AuthUser,
     headers: HeaderMap,
     Json(req): Json<SummarizeFollowupRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -299,7 +322,7 @@ pub async fn summarize_followup(
 
 pub async fn summarize_results(
     State(state): State<AppState>,
-    user: AuthUser,
+    _user: AuthUser,
     headers: HeaderMap,
     Json(req): Json<SummarizeResultsRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -497,7 +520,7 @@ pub async fn summarize_results(
 
 pub async fn summarize_results_followup(
     State(state): State<AppState>,
-    user: AuthUser,
+    _user: AuthUser,
     headers: HeaderMap,
     Json(req): Json<SummarizeResultsFollowupRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -524,7 +547,7 @@ pub async fn summarize_results_followup(
 
 pub async fn user_profile(
     State(state): State<AppState>,
-    user: AuthUser,
+    _user: AuthUser,
     headers: HeaderMap,
     Json(req): Json<UserProfileRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -568,7 +591,7 @@ pub async fn user_profile(
 
 pub async fn user_profile_followup(
     State(state): State<AppState>,
-    user: AuthUser,
+    _user: AuthUser,
     headers: HeaderMap,
     Json(req): Json<UserProfileFollowupRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -582,4 +605,488 @@ pub async fn user_profile_followup(
 
     let event_stream = call_openai_stream(&api_key, &system, &req.query, "gpt-4o").await?;
     Ok(Sse::new(event_stream))
+}
+
+pub async fn user_topics_stream(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    Json(req): Json<UserTopicsRequest>,
+) -> impl IntoResponse {
+    let s = async_stream::stream! {
+        macro_rules! emit {
+            ($val:expr) => {{
+                let line = serde_json::to_string(&$val).unwrap_or_default();
+                yield Ok::<Event, Infallible>(Event::default().data(line));
+            }};
+        }
+
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                emit!(json!({"stage":"error","status":"error","message": format!("HTTP client error: {}", e)}));
+                return;
+            }
+        };
+
+        // Stage 1: prepare
+        emit!(json!({
+            "stage": "prepare",
+            "status": "done",
+            "message": format!("Collected {} messages", req.docs.len())
+        }));
+
+        // Stage 2: fetch embeddings
+        let n_batches = (req.msg_uuids.len().saturating_add(249)) / 250;
+        emit!(json!({
+            "stage": "fetch_embeddings",
+            "status": "running",
+            "message": format!("Fetching embeddings from Qdrant ({} batch{})…",
+                n_batches, if n_batches == 1 { "" } else { "es" })
+        }));
+
+        let mut uuid_to_vector: std::collections::HashMap<String, Vec<f64>> =
+            std::collections::HashMap::new();
+
+        for chunk in req.msg_uuids.chunks(250) {
+            let scroll_url = format!(
+                "{}/collections/{}/points/scroll",
+                state.config.qdrant_url, state.config.qdrant_collection
+            );
+            let mut scroll_req = client.post(&scroll_url).json(&json!({
+                "filter": {
+                    "must": [{ "key": "msg_uuid", "match": { "any": chunk } }]
+                },
+                "with_payload": true,
+                "with_vector": true,
+                "limit": chunk.len()
+            }));
+            if let Some(key) = &state.config.qdrant_api_key {
+                scroll_req = scroll_req.header("api-key", key);
+            }
+            if let Ok(resp) = scroll_req.send().await {
+                if let Ok(data) = resp.json::<serde_json::Value>().await {
+                    if let Some(points) = data["result"]["points"].as_array() {
+                        for point in points {
+                            if let (Some(uuid), Some(vector)) = (
+                                point["payload"]["msg_uuid"].as_str(),
+                                point["vector"].as_array(),
+                            ) {
+                                let vec: Vec<f64> =
+                                    vector.iter().filter_map(|v| v.as_f64()).collect();
+                                uuid_to_vector.insert(uuid.to_string(), vec);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        emit!(json!({
+            "stage": "fetch_embeddings",
+            "status": "done",
+            "message": format!("Retrieved {} of {} embeddings",
+                uuid_to_vector.len(), req.msg_uuids.len())
+        }));
+
+        // Stage 3: align docs
+        let mut docs_out: Vec<&str> = Vec::new();
+        let mut embeddings_out: Vec<Vec<f64>> = Vec::new();
+        let mut uuids_out: Vec<&str> = Vec::new();
+        for (doc, uuid) in req.docs.iter().zip(req.msg_uuids.iter()) {
+            if let Some(vec) = uuid_to_vector.get(uuid) {
+                docs_out.push(doc.as_str());
+                embeddings_out.push(vec.clone());
+                uuids_out.push(uuid.as_str());
+            }
+        }
+        let dropped = req.docs.len().saturating_sub(docs_out.len());
+
+        emit!(json!({
+            "stage": "align_docs",
+            "status": "done",
+            "message": if dropped > 0 {
+                format!("Kept {} doc-embedding pairs ({} without embedding)", docs_out.len(), dropped)
+            } else {
+                format!("Aligned all {} doc-embedding pairs", docs_out.len())
+            }
+        }));
+
+        // Stage 4: BERTopic
+        let using_embeddings = !embeddings_out.is_empty();
+        let bertopic_payload = if using_embeddings {
+            json!({ "docs": docs_out, "embeddings": embeddings_out, "msg_uuids": uuids_out })
+        } else {
+            json!({ "docs": req.docs, "msg_uuids": req.msg_uuids })
+        };
+
+        emit!(json!({
+            "stage": "bertopic",
+            "status": "running",
+            "message": if using_embeddings {
+                "Running BERTopic with pre-computed embeddings…"
+            } else {
+                "Running BERTopic (computing embeddings on service)…"
+            }
+        }));
+
+        let ai_service_url = format!("{}/topics", state.config.ai_service_url);
+        let resp = match ai_retry(|| client.post(&ai_service_url).json(&bertopic_payload)).await {
+            Ok(r) => r,
+            Err(e) => {
+                emit!(json!({"stage":"bertopic","status":"error",
+                    "message": format!("AI service unreachable: {}", e)}));
+                return;
+            }
+        };
+
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            emit!(json!({"stage":"bertopic","status":"error",
+                "message": format!("BERTopic error: {}", err)}));
+            return;
+        }
+
+        let result: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                emit!(json!({"stage":"bertopic","status":"error",
+                    "message": format!("Response parse error: {}", e)}));
+                return;
+            }
+        };
+
+        let n_topics = result["topics"].as_array().map(|a| a.len()).unwrap_or(0);
+        let used_openai = result["used_openai_labels"].as_bool().unwrap_or(false);
+        let used_precomputed = result["used_precomputed_embeddings"].as_bool().unwrap_or(false);
+
+        emit!(json!({
+            "stage": "bertopic",
+            "status": "done",
+            "message": format!("Found {} topic{}{}",
+                n_topics,
+                if n_topics == 1 { "" } else { "s" },
+                if used_openai { " · labels generated by GPT" } else { "" }
+            ),
+            "used_precomputed": used_precomputed
+        }));
+
+        // Stage 5: complete — carry the full result
+        emit!(json!({
+            "stage": "complete",
+            "status": "done",
+            "message": "Analysis complete",
+            "result": result
+        }));
+
+        yield Ok(Event::default().data("[DONE]"));
+    };
+
+    Sse::new(s).keep_alive(axum::response::sse::KeepAlive::default())
+}
+
+pub async fn user_topics(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    Json(req): Json<UserTopicsRequest>,
+) -> crate::error::Result<Json<serde_json::Value>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| AppError::Internal(format!("HTTP client error: {}", e)))?;
+
+    // Fetch pre-computed embeddings from Qdrant in batches of 250
+    let mut uuid_to_vector: std::collections::HashMap<String, Vec<f64>> =
+        std::collections::HashMap::new();
+
+    for chunk in req.msg_uuids.chunks(250) {
+        let scroll_url = format!(
+            "{}/collections/{}/points/scroll",
+            state.config.qdrant_url, state.config.qdrant_collection
+        );
+        let mut scroll_req = client.post(&scroll_url).json(&json!({
+            "filter": {
+                "must": [{ "key": "msg_uuid", "match": { "any": chunk } }]
+            },
+            "with_payload": true,
+            "with_vector": true,
+            "limit": chunk.len()
+        }));
+        if let Some(key) = &state.config.qdrant_api_key {
+            scroll_req = scroll_req.header("api-key", key);
+        }
+        if let Ok(resp) = scroll_req.send().await {
+            if let Ok(data) = resp.json::<serde_json::Value>().await {
+                if let Some(points) = data["result"]["points"].as_array() {
+                    for point in points {
+                        if let (Some(uuid), Some(vector)) = (
+                            point["payload"]["msg_uuid"].as_str(),
+                            point["vector"].as_array(),
+                        ) {
+                            let vec: Vec<f64> =
+                                vector.iter().filter_map(|v| v.as_f64()).collect();
+                            uuid_to_vector.insert(uuid.to_string(), vec);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Pair docs with their embeddings; drop any doc whose UUID wasn't found
+    let mut docs_out: Vec<&str> = Vec::new();
+    let mut embeddings_out: Vec<Vec<f64>> = Vec::new();
+    let mut uuids_out: Vec<&str> = Vec::new();
+    for (doc, uuid) in req.docs.iter().zip(req.msg_uuids.iter()) {
+        if let Some(vec) = uuid_to_vector.get(uuid) {
+            docs_out.push(doc.as_str());
+            embeddings_out.push(vec.clone());
+            uuids_out.push(uuid.as_str());
+        }
+    }
+
+    // Build BERTopic payload — include embeddings and uuids if available
+    let bertopic_payload = if embeddings_out.is_empty() {
+        json!({ "docs": req.docs, "msg_uuids": req.msg_uuids })
+    } else {
+        json!({ "docs": docs_out, "embeddings": embeddings_out, "msg_uuids": uuids_out })
+    };
+
+    let ai_service_url = format!("{}/topics", state.config.ai_service_url);
+    let resp = ai_retry(|| client.post(&ai_service_url).json(&bertopic_payload))
+        .await
+        .map_err(|e| AppError::Internal(format!("AI service unreachable: {}", e)))?;
+
+    if !resp.status().is_success() {
+        let err = resp.text().await.unwrap_or_default();
+        return Err(AppError::Internal(format!("AI service error: {}", err)));
+    }
+
+    let result: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("AI service response parse error: {}", e)))?;
+
+    Ok(Json(result))
+}
+
+pub async fn user_emotion(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> crate::error::Result<Json<serde_json::Value>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| AppError::Internal(format!("HTTP client error: {}", e)))?;
+
+    let url = format!("{}/analyze_emotion", state.config.ai_service_url);
+    let hf_token = headers.get("x-hf-token")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let resp = ai_retry(|| {
+        let mut r = client.post(&url).json(&body);
+        if let Some(ref t) = hf_token { r = r.header("X-HF-Token", t.as_str()); }
+        r
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("AI service unreachable: {}", e)))?;
+
+    if !resp.status().is_success() {
+        let err = resp.text().await.unwrap_or_default();
+        return Err(AppError::Internal(format!("AI service error: {}", err)));
+    }
+
+    let result: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("AI service response parse error: {}", e)))?;
+
+    Ok(Json(result))
+}
+
+pub async fn user_strategy_classify(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    headers: HeaderMap,
+    Json(req): Json<StrategyRequest>,
+) -> crate::error::Result<Json<serde_json::Value>> {
+    let api_key = state
+        .get_openai_key(key_from_header(&headers))
+        .await
+        .ok_or_else(|| AppError::BadRequest("OpenAI API key not set".into()))?;
+
+    if req.strategies.is_empty() {
+        return Err(AppError::BadRequest("At least one strategy is required".into()));
+    }
+    if req.messages.is_empty() {
+        return Ok(Json(json!({ "strategies": [], "total_messages": 0, "total_classified": 0 })));
+    }
+
+    let model = req.model.as_deref().unwrap_or("gpt-4o-mini").to_string();
+    let strategy_ids: Vec<String> = req.strategies.iter().map(|s| s.id.clone()).collect();
+
+    let strategy_list = req.strategies.iter()
+        .map(|s| format!("  id=\"{}\" name=\"{}\" - {}", s.id, s.name, s.description))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut uuid_to_strategies: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| AppError::Internal(format!("HTTP client error: {}", e)))?;
+
+    const BATCH: usize = 40;
+
+    for chunk in req.messages.chunks(BATCH) {
+        let msg_list = chunk.iter().enumerate()
+            .map(|(i, m)| {
+                let date = &m.date[..m.date.len().min(10)];
+                let content = if m.content.len() > 300 { &m.content[..300] } else { &m.content };
+                format!("[{}] {} ({}): {}", i, m.username, date, content)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let prompt = format!(
+            "You are a research assistant analysing community reactions on a Suno AI Discord server.\n\
+             Suno is an AI music generation company. The decisions listed below are specific actions or changes made by Suno.\n\
+             For each Discord message, determine whether it is a reaction to — or discussion of — any of these Suno decisions.\n\
+             A message may react to multiple decisions or none at all.\n\n\
+             Suno Decisions:\n{}\n\n\
+             Messages:\n{}\n\n\
+             Return JSON with key \"assignments\": an array of objects, one per message, \
+             each with \"index\" (0-based integer) and \"strategy_ids\" \
+             (array of matching decision id strings — empty array if the message does not react to any listed decision). \
+             Use ONLY the exact id strings above. Include ALL {} messages.",
+            strategy_list, msg_list, chunk.len()
+        );
+
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "assignments": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "index": { "type": "integer" },
+                            "strategy_ids": { "type": "array", "items": { "type": "string" } }
+                        },
+                        "required": ["index", "strategy_ids"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["assignments"],
+            "additionalProperties": false
+        });
+
+        let body = json!({
+            "model": model,
+            "temperature": 0,
+            "seed": 42,
+            "messages": [{ "role": "user", "content": prompt }],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "strategy_assignments",
+                    "strict": true,
+                    "schema": schema
+                }
+            }
+        });
+
+        let resp = client
+            .post("https://api.openai.com/v1/chat/completions")
+            .bearer_auth(&api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AppError::Internal(format!("OpenAI request failed: {}", e)))?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            return Err(AppError::Internal(format!("OpenAI error (strategy): {}", err)));
+        }
+
+        let resp_json: serde_json::Value = resp.json().await
+            .map_err(|e| AppError::Internal(format!("OpenAI response parse error: {}", e)))?;
+
+        let content = resp_json["choices"][0]["message"]["content"].as_str().unwrap_or("{}");
+
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {
+            if let Some(assignments) = parsed["assignments"].as_array() {
+                for item in assignments {
+                    let idx = item["index"].as_u64().unwrap_or(0) as usize;
+                    if idx >= chunk.len() { continue; }
+                    let uuid = chunk[idx].msg_uuid.clone().unwrap_or_default();
+                    if uuid.is_empty() { continue; }
+                    let matched: Vec<String> = item["strategy_ids"]
+                        .as_array()
+                        .map(|arr| arr.iter()
+                            .filter_map(|v| v.as_str())
+                            .filter(|s| strategy_ids.contains(&s.to_string()))
+                            .map(String::from)
+                            .collect())
+                        .unwrap_or_default();
+                    uuid_to_strategies.insert(uuid, matched);
+                }
+            }
+        }
+
+        for msg in chunk {
+            let uuid = msg.msg_uuid.clone().unwrap_or_default();
+            if !uuid.is_empty() {
+                uuid_to_strategies.entry(uuid).or_insert_with(Vec::new);
+            }
+        }
+    }
+
+    let mut buckets: std::collections::HashMap<String, Vec<serde_json::Value>> =
+        req.strategies.iter().map(|s| (s.id.clone(), vec![])).collect();
+
+    for msg in &req.messages {
+        let uuid = msg.msg_uuid.clone().unwrap_or_default();
+        if let Some(sids) = uuid_to_strategies.get(&uuid) {
+            for sid in sids {
+                if let Some(bucket) = buckets.get_mut(sid) {
+                    bucket.push(json!({
+                        "msg_uuid": uuid,
+                        "content": msg.content,
+                        "date": msg.date,
+                        "username": msg.username,
+                    }));
+                }
+            }
+        }
+    }
+
+    let total_classified = uuid_to_strategies.values().filter(|v| !v.is_empty()).count();
+
+    let strategies_out: Vec<serde_json::Value> = req.strategies.iter()
+        .map(|s| {
+            let msgs = buckets.get(&s.id).cloned().unwrap_or_default();
+            json!({
+                "id": s.id,
+                "name": s.name,
+                "description": s.description,
+                "count": msgs.len(),
+                "messages": msgs,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "strategies": strategies_out,
+        "total_messages": req.messages.len(),
+        "total_classified": total_classified,
+    })))
 }

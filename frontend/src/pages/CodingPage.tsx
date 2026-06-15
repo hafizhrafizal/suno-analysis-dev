@@ -1,9 +1,9 @@
-import { useState, useEffect, useRef } from 'react'
-import { useLocation, useNavigate } from 'react-router-dom'
+import { useState, useEffect, useRef, useMemo } from 'react'
+import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '../api/client'
 import ColorPicker from '../components/ui/ColorPicker'
-import type { Code, CodeCategory, Bookmark, BookmarkCode, ContextMessage } from '../types'
+import type { Code, CodeCategory, Bookmark, BookmarkCode, ContextMessage, InterviewBookmark } from '../types'
 
 type PageTab = 'manager' | 'table'
 type AuthorFilter = 'all' | 'only' | 'exclude'
@@ -346,31 +346,155 @@ function CatNode({
   )
 }
 
+function normalizeInterviewBookmark(bm: InterviewBookmark): Bookmark {
+  return {
+    id: bm.id,
+    msg_id: bm.id,
+    content: bm.excerpt,
+    username: bm.interviewees || bm.interview_id,
+    date: bm.source_date || bm.created_at,
+    codes: bm.codes,
+    is_suno_team: false,
+    note: bm.note,
+    created_at: bm.created_at,
+  }
+}
+
+interface NewsBookmark {
+  id: number
+  article_id: string
+  excerpt: string
+  note: string
+  char_start?: number
+  char_end?: number
+  created_at: string
+  codes: Code[]
+}
+
+function normalizeNewsBookmark(bm: NewsBookmark): Bookmark {
+  return {
+    id: bm.id,
+    msg_id: bm.id,
+    content: bm.excerpt,
+    username: bm.article_id,
+    date: bm.created_at,
+    codes: bm.codes,
+    is_suno_team: false,
+    note: bm.note,
+    created_at: bm.created_at,
+  }
+}
+
+type CodingSource = 'all' | 'discord' | 'interview' | 'news'
+
 export default function CodingPage() {
   const { pathname } = useLocation()
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
   const pageTab: PageTab = pathname.endsWith('/table') ? 'table' : 'manager'
   const setPageTab = (tab: PageTab) => {
     localStorage.setItem('coding_tab', tab)
-    navigate(`/coding/${tab}`)
+    // Preserve source query param when switching tabs
+    const source = searchParams.get('source')
+    const suffix = source ? `?source=${source}` : ''
+    navigate(`../${tab}${suffix}`, { relative: 'path' })
   }
+
+  const module = pathname.split('/')[1] // 'discord', 'coding', 'interview', 'news'
+  const sourceParam = searchParams.get('source') as CodingSource | null
+  const defaultSrc: CodingSource =
+    sourceParam === 'interview' || sourceParam === 'news' ? sourceParam :
+    module === 'interview' ? 'interview' :
+    module === 'news' ? 'news' : 'discord'
+  const [sourceFilter, setSourceFilter] = useState<CodingSource>(defaultSrc)
+  const isAllSrc = sourceFilter === 'all'
+  const isDiscordSrc = sourceFilter === 'discord' || isAllSrc
+  const isInterviewSrc = sourceFilter === 'interview' || isAllSrc
+  const isNewsSrc = sourceFilter === 'news' || isAllSrc
 
   const queryClient = useQueryClient()
   const { data: _codes } = useQuery<CodeExt[]>({ queryKey: ['codes'], queryFn: () => apiFetch('/codes') })
   const { data: _categories } = useQuery<CodeCategoryExt[]>({ queryKey: ['code-categories'], queryFn: () => apiFetch('/code-categories') })
-  const { data: _bookmarks } = useQuery<Bookmark[]>({ queryKey: ['bookmarks'], queryFn: () => apiFetch('/bookmarks') })
-  const { data: _bookmarkCodes } = useQuery<BookmarkCode[]>({ queryKey: ['bookmark-codes'], queryFn: () => apiFetch('/bookmark-codes') })
+
+  // Always fetch all sources; merge based on filter
+  const { data: _discordBookmarks } = useQuery<Bookmark[]>({
+    queryKey: ['bookmarks'],
+    queryFn: () => apiFetch('/bookmarks'),
+  })
+  const { data: _discordBookmarkCodes } = useQuery<BookmarkCode[]>({
+    queryKey: ['bookmark-codes'],
+    queryFn: () => apiFetch('/bookmark-codes'),
+  })
+  const { data: _interviewBookmarks } = useQuery<InterviewBookmark[]>({
+    queryKey: ['interview-bookmarks'],
+    queryFn: () => apiFetch('/interview-bookmarks'),
+  })
+  const { data: _interviewBookmarkCodes } = useQuery<BookmarkCode[]>({
+    queryKey: ['interview-bookmark-codes'],
+    queryFn: () => apiFetch('/interview-bookmark-codes'),
+  })
+  const { data: _newsBookmarks } = useQuery<NewsBookmark[]>({
+    queryKey: ['news-bookmarks'],
+    queryFn: () => apiFetch('/news-bookmarks'),
+    retry: false,
+  })
+  const { data: _newsBookmarkCodes } = useQuery<BookmarkCode[]>({
+    queryKey: ['news-bookmark-codes'],
+    queryFn: () => apiFetch('/news-bookmark-codes'),
+    retry: false,
+  })
+
+  // Merge bookmarks and codes based on source filter
+  const _rawBookmarks = useMemo(() => {
+    const result: (Bookmark | InterviewBookmark | NewsBookmark)[] = []
+    if (isDiscordSrc) result.push(...(_discordBookmarks ?? []))
+    if (isInterviewSrc) result.push(...(_interviewBookmarks ?? []))
+    if (isNewsSrc) result.push(...(_newsBookmarks ?? []))
+    return result
+  }, [isDiscordSrc, isInterviewSrc, isNewsSrc, _discordBookmarks, _interviewBookmarks, _newsBookmarks])
+
+  const _bookmarkCodes = useMemo(() => {
+    const result: BookmarkCode[] = []
+    if (isDiscordSrc) result.push(...(_discordBookmarkCodes ?? []))
+    if (isInterviewSrc) result.push(...(_interviewBookmarkCodes ?? []))
+    if (isNewsSrc) result.push(...(_newsBookmarkCodes ?? []))
+    return result
+  }, [isDiscordSrc, isInterviewSrc, isNewsSrc, _discordBookmarkCodes, _interviewBookmarkCodes, _newsBookmarkCodes])
+
+  // Source-aware endpoints (used for mutations - determine source from bookmark context)
+  const bmCodesEndpoint = '/bookmark-codes' // default for discord; overridden per-mutation
+  const rmBmCodeEndpoint = (bmId: number, codeId: number, source?: string) =>
+    source === 'interview' ? `/interview-bookmark-codes/${bmId}/${codeId}` :
+    source === 'news' ? `/news-bookmark-codes/${bmId}/${codeId}` :
+    `/bookmark-codes/${bmId}/${codeId}`
 
   // Initialize from cache so navigating back shows data instantly (no empty flash)
   const [codes, setCodes] = useState<CodeExt[]>(() => queryClient.getQueryData<CodeExt[]>(['codes']) ?? [])
   const [categories, setCategories] = useState<CodeCategoryExt[]>(() => queryClient.getQueryData<CodeCategoryExt[]>(['code-categories']) ?? [])
-  const [bookmarks, setBookmarks] = useState<Bookmark[]>(() => (queryClient.getQueryData<Bookmark[]>(['bookmarks']) ?? []) as Bookmark[])
-  const [bookmarkCodes, setBookmarkCodes] = useState<BookmarkCode[]>(() => queryClient.getQueryData<BookmarkCode[]>(['bookmark-codes']) ?? [])
+  const [bookmarks, setBookmarks] = useState<Bookmark[]>(() => {
+    const d = queryClient.getQueryData<Bookmark[]>(['bookmarks']) ?? []
+    const i = (queryClient.getQueryData<InterviewBookmark[]>(['interview-bookmarks']) ?? []).map(normalizeInterviewBookmark)
+    const n = (queryClient.getQueryData<NewsBookmark[]>(['news-bookmarks']) ?? []).map(normalizeNewsBookmark)
+    return [...d, ...i, ...n]
+  })
+  const [bookmarkCodes, setBookmarkCodes] = useState<BookmarkCode[]>(() =>
+    (queryClient.getQueryData<BookmarkCode[]>(['bookmark-codes']) ?? [])
+      .concat(queryClient.getQueryData<BookmarkCode[]>(['interview-bookmark-codes']) ?? [])
+      .concat(queryClient.getQueryData<BookmarkCode[]>(['news-bookmark-codes']) ?? [])
+  )
 
   useEffect(() => { if (_codes) setCodes(_codes) }, [_codes])
   useEffect(() => { if (_categories) setCategories(_categories) }, [_categories])
-  useEffect(() => { if (_bookmarks) setBookmarks(_bookmarks as Bookmark[]) }, [_bookmarks])
-  useEffect(() => { if (_bookmarkCodes) setBookmarkCodes(_bookmarkCodes) }, [_bookmarkCodes])
+  useEffect(() => {
+    const normalized = (_rawBookmarks as any[]).map((bm: any) => {
+      if (bm.interview_id !== undefined) return normalizeInterviewBookmark(bm as InterviewBookmark)
+      if (bm.article_id !== undefined) return normalizeNewsBookmark(bm as NewsBookmark)
+      return bm as Bookmark
+    })
+    setBookmarks(normalized)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [_rawBookmarks])
+  useEffect(() => { setBookmarkCodes(_bookmarkCodes ?? []) }, [_bookmarkCodes])
 
   const [dateFrom, setDateFrom] = useState('')
   const [dateTo, setDateTo] = useState('')
@@ -429,6 +553,10 @@ export default function CodingPage() {
     queryClient.invalidateQueries({ queryKey: ['code-categories'] })
     queryClient.invalidateQueries({ queryKey: ['bookmarks'] })
     queryClient.invalidateQueries({ queryKey: ['bookmark-codes'] })
+    queryClient.invalidateQueries({ queryKey: ['interview-bookmarks'] })
+    queryClient.invalidateQueries({ queryKey: ['interview-bookmark-codes'] })
+    queryClient.invalidateQueries({ queryKey: ['news-bookmarks'] })
+    queryClient.invalidateQueries({ queryKey: ['news-bookmark-codes'] })
   }
 
   const filterActive = !!(dateFrom || dateTo || authorFilter !== 'all')
@@ -504,7 +632,7 @@ export default function CodingPage() {
   }
 
   const deleteExcerptCode = async (bc: BookmarkCode, bookmarkId: number) => {
-    await apiFetch(`/bookmark-codes/${bookmarkId}/${bc.code_id}`, { method: 'DELETE' }).catch(console.error)
+    await apiFetch(rmBmCodeEndpoint(bookmarkId, bc.code_id), { method: 'DELETE' }).catch(console.error)
     if (detailExcerptBc?.code_id === bc.code_id && detailExcerptBm?.id === bookmarkId) closeDetail()
     setBookmarkCodes(prev => prev.filter(x => !(x.bookmark_id === bookmarkId && x.code_id === bc.code_id)))
   }
@@ -539,14 +667,14 @@ export default function CodingPage() {
         }
       }
       if (currentMode === 'change') {
-        await apiFetch('/bookmark-codes', { method: 'POST', body: JSON.stringify({ bookmark_id: detailExcerptBm.id, code_id: codeId }) })
-        await apiFetch(`/bookmark-codes/${detailExcerptBm.id}/${detailExcerptBc.code_id}`, { method: 'DELETE' })
+        await apiFetch(bmCodesEndpoint, { method: 'POST', body: JSON.stringify({ bookmark_id: detailExcerptBm.id, code_id: codeId }) })
+        await apiFetch(rmBmCodeEndpoint(detailExcerptBm.id, detailExcerptBc.code_id), { method: 'DELETE' })
         setBookmarkCodes(prev => [
           ...prev.filter(x => !(x.bookmark_id === detailExcerptBm.id && x.code_id === detailExcerptBc.code_id)),
           { bookmark_id: detailExcerptBm.id, code_id: codeId, code_name: resolvedCode?.name ?? '', color: resolvedCode?.color ?? '#0d3e7f' },
         ])
       } else {
-        await apiFetch('/bookmark-codes', { method: 'POST', body: JSON.stringify({ bookmark_id: detailExcerptBm.id, code_id: codeId }) })
+        await apiFetch(bmCodesEndpoint, { method: 'POST', body: JSON.stringify({ bookmark_id: detailExcerptBm.id, code_id: codeId }) })
         setBookmarkCodes(prev => [
           ...prev,
           { bookmark_id: detailExcerptBm.id, code_id: codeId, code_name: resolvedCode?.name ?? '', color: resolvedCode?.color ?? '#0d3e7f' },
@@ -663,8 +791,8 @@ export default function CodingPage() {
     for (const id of ids.slice(1)) {
       const assignments = bookmarkCodes.filter(bc => bc.code_id === id)
       for (const a of assignments) {
-        await apiFetch('/bookmark-codes', { method: 'POST', body: JSON.stringify({ bookmark_id: a.bookmark_id, code_id: target }) }).catch(() => {})
-        await apiFetch(`/bookmark-codes/${a.bookmark_id}/${id}`, { method: 'DELETE' }).catch(() => {})
+        await apiFetch(bmCodesEndpoint, { method: 'POST', body: JSON.stringify({ bookmark_id: a.bookmark_id, code_id: target }) }).catch(() => {})
+        await apiFetch(rmBmCodeEndpoint(a.bookmark_id, id), { method: 'DELETE' }).catch(() => {})
       }
       await apiFetch(`/codes/${id}`, { method: 'DELETE' }).catch(() => {})
     }
@@ -673,12 +801,12 @@ export default function CodingPage() {
 
   const exportCSV = () => {
     const q = (s: string) => `"${s.replace(/"/g, '""')}"`
-    const rows = [['2nd-order Coding', 'Open Coding', 'Quote / Excerpt', 'Source Username', 'Source Date', 'Note'].join(',')]
+    const rows = [['2nd-order Coding', 'Open Coding', 'Quote / Excerpt', 'Source Username', 'Source Date', 'Source', 'Note'].join(',')]
 
     const emitCode = (catName: string, code: CodeExt) => {
       const excerpts = filteredCodes.filter(bc => bc.code_id === code.id)
       if (excerpts.length === 0) {
-        rows.push([q(catName), q(code.name), '', '', '', ''].join(','))
+        rows.push([q(catName), q(code.name), '', '', '', '', ''].join(','))
       } else {
         for (const bc of excerpts) {
           const bm = bookmarks.find(b => b.id === bc.bookmark_id)
@@ -688,7 +816,8 @@ export default function CodingPage() {
             q(code.name),
             q(quote),
             q(bm?.username || ''),
-            bm?.date?.slice(0, 10) || '',
+            bm?.date?.slice(0, 19).replace('T', ' ') || '',
+            interviewBmIds.has(bc.bookmark_id) ? 'Interview' : newsBmIds.has(bc.bookmark_id) ? 'News' : 'Discord',
             q(bm?.note || ''),
           ].join(','))
         }
@@ -696,8 +825,8 @@ export default function CodingPage() {
     }
 
     sortedCats.forEach(cat => {
-      const catCodes = codes.filter(c => c.category_id === cat.id).sort((a, b) => a.name.localeCompare(b.name))
-      const visibleCatCodes = filterActive ? catCodes.filter(code => filteredCodes.some(bc => bc.code_id === code.id)) : catCodes
+      const catCodes = codeSourceFiltered.filter(c => c.category_id === cat.id).sort((a, b) => a.name.localeCompare(b.name))
+      const visibleCatCodes = catCodes.filter(code => filteredCodes.some(bc => bc.code_id === code.id))
       visibleCatCodes.forEach(code => emitCode(cat.name, code))
     })
     visibleUncategorized.forEach(code => emitCode('', code))
@@ -737,8 +866,8 @@ export default function CodingPage() {
     const fromCodeId = parseInt(e.dataTransfer.getData('from_code_id'))
     setDragOverCodeId(null)
     if (!bookmarkId || !fromCodeId || fromCodeId === toCodeId) return
-    await apiFetch('/bookmark-codes', { method: 'POST', body: JSON.stringify({ bookmark_id: bookmarkId, code_id: toCodeId }) }).catch(() => {})
-    await apiFetch(`/bookmark-codes/${bookmarkId}/${fromCodeId}`, { method: 'DELETE' }).catch(() => {})
+    await apiFetch(bmCodesEndpoint, { method: 'POST', body: JSON.stringify({ bookmark_id: bookmarkId, code_id: toCodeId }) }).catch(() => {})
+    await apiFetch(rmBmCodeEndpoint(bookmarkId, fromCodeId), { method: 'DELETE' }).catch(() => {})
     const toCode = codes.find(c => c.id === toCodeId)
     setBookmarkCodes(prev => prev.map(bc =>
       bc.bookmark_id === bookmarkId && bc.code_id === fromCodeId
@@ -766,11 +895,26 @@ export default function CodingPage() {
     return pool.filter(c => c.name.toLowerCase().includes(term)).slice(0, 8)
   })()
 
+  // Build sets of bookmark IDs per source for source-aware code filtering
+  const discordBmIds = useMemo(() => new Set((_discordBookmarks ?? []).map(b => b.id)), [_discordBookmarks])
+  const interviewBmIds = useMemo(() => new Set((_interviewBookmarks ?? []).map(b => b.id)), [_interviewBookmarks])
+  const newsBmIds = useMemo(() => new Set((_newsBookmarks ?? []).map(b => b.id)), [_newsBookmarks])
+
+  // Source-aware code filter: only show codes that have quotes from the selected source
+  const codeSourceFiltered = useMemo(() => {
+    if (sourceFilter === 'all') return codes
+    const sourceBmIds = sourceFilter === 'discord' ? discordBmIds :
+      sourceFilter === 'interview' ? interviewBmIds : newsBmIds
+    return codes.filter(code =>
+      bookmarkCodes.some(bc => bc.code_id === code.id && sourceBmIds.has(bc.bookmark_id))
+    )
+  }, [sourceFilter, codes, bookmarkCodes, discordBmIds, interviewBmIds, newsBmIds])
+
   // Build tree
   const buildTree = (): TreeNode[] => {
     const catMap = new Map<number, TreeNode>()
     categories.forEach(c => catMap.set(c.id, { ...c, children: [], codes: [] }))
-    codes.forEach(code => {
+    codeSourceFiltered.forEach(code => {
       if (code.category_id != null) {
         const node = catMap.get(code.category_id as number)
         if (node) node.codes.push(code)
@@ -794,19 +938,20 @@ export default function CodingPage() {
   }
 
   const treeRoots = buildTree()
-  const uncategorized = codes.filter(c => c.category_id == null).sort((a, b) => a.name.localeCompare(b.name))
+  const uncategorized = codeSourceFiltered.filter(c => c.category_id == null).sort((a, b) => a.name.localeCompare(b.name))
   const sortedCats = [...categories].sort((a, b) => a.name.localeCompare(b.name))
 
   const codeHasFilteredExcerpts = (code: CodeExt) =>
-    bookmarkCodes.some(bc => bc.code_id === code.id && filteredBmIds.has(bc.bookmark_id))
+    bookmarkCodes.some(bc => bc.code_id === code.id && filteredBmIds.has(bc.bookmark_id)) &&
+    codeSourceFiltered.some(c => c.id === code.id)
 
   const treeNodeHasVisible = (node: TreeNode): boolean => {
-    if (!filterActive) return true
+    if (!filterActive && sourceFilter === 'all') return true
     return node.codes.some(codeHasFilteredExcerpts) || node.children.some(treeNodeHasVisible)
   }
 
-  const visibleTreeRoots = filterActive ? treeRoots.filter(treeNodeHasVisible) : treeRoots
-  const visibleUncategorized = filterActive ? uncategorized.filter(codeHasFilteredExcerpts) : uncategorized
+  const visibleTreeRoots = (filterActive || sourceFilter !== 'all') ? treeRoots.filter(treeNodeHasVisible) : treeRoots
+  const visibleUncategorized = (filterActive || sourceFilter !== 'all') ? uncategorized.filter(codeHasFilteredExcerpts) : uncategorized
 
   const codeFilterLower = codeSearchFilter.trim().toLowerCase()
   const flatSearchResults = codeFilterLower
@@ -830,6 +975,25 @@ export default function CodingPage() {
             }`}
           >
             {tab === 'manager' ? 'Coding Manager' : 'Coding Table'}
+          </button>
+        ))}
+      </div>
+
+      {/* Source filter chips */}
+      <div className="flex items-center gap-2 px-1 flex-wrap">
+        <span className="text-xs font-semibold text-gray-400 uppercase tracking-wide shrink-0">Source</span>
+        {([
+          { value: 'all' as const, label: 'All', active: 'bg-gray-700 text-white', inactive: 'bg-gray-100 text-gray-600 hover:bg-gray-200' },
+          { value: 'discord' as const, label: 'Discord', active: 'bg-indigo-600 text-white', inactive: 'bg-indigo-50 text-indigo-700 hover:bg-indigo-100' },
+          { value: 'interview' as const, label: 'Interview', active: 'bg-teal-600 text-white', inactive: 'bg-teal-50 text-teal-700 hover:bg-teal-100' },
+          { value: 'news' as const, label: 'News', active: 'bg-amber-600 text-white', inactive: 'bg-amber-50 text-amber-700 hover:bg-amber-100' },
+        ]).map(({ value, label, active, inactive }) => (
+          <button
+            key={value}
+            onClick={() => setSourceFilter(value as CodingSource)}
+            className={`text-xs px-3 py-1 rounded-full font-semibold transition-colors ${sourceFilter === value ? active : inactive}`}
+          >
+            {label}
           </button>
         ))}
       </div>
@@ -1021,7 +1185,7 @@ export default function CodingPage() {
               <div className="flex items-center gap-3 mb-3 pb-3 border-b border-gray-100">
                 <div>
                   <span className="text-sm font-semibold text-gray-700">{codeFilterLower ? 'Search Results' : 'Code Tree'}</span>
-                  <span className="ml-2 text-xs text-gray-400">{categories.length} categories · {codes.length} codes · {bookmarkCodes.length} quotes</span>
+                  <span className="ml-2 text-xs text-gray-400">{visibleTreeRoots.length} categories · {codeSourceFiltered.length} codes · {bookmarkCodes.length} quotes</span>
                 </div>
                 <div className="relative ml-auto w-52">
                   <input
@@ -1041,7 +1205,7 @@ export default function CodingPage() {
                 )}
               </div>
 
-              {codes.length === 0 && categories.length === 0 ? (
+              {codeSourceFiltered.length === 0 && categories.length === 0 ? (
                 <p className="text-sm text-gray-400 text-center py-8">No codes yet. Click &ldquo;+ Open Coding&rdquo; to get started.</p>
               ) : codeFilterLower && flatSearchResults.length === 0 ? (
                 <p className="text-sm text-gray-400 text-center py-6">No codes match &ldquo;{codeSearchFilter}&rdquo;</p>
@@ -1242,7 +1406,7 @@ export default function CodingPage() {
                         <span className="text-[11px] px-2 py-0.5 rounded-full font-semibold bg-indigo-100 text-indigo-700">
                           {detailExcerptBm.username}
                         </span>
-                        <span>{detailExcerptBm.date?.slice(0, 10)}</span>
+                        <span>{detailExcerptBm.date?.slice(0, 19).replace('T', ' ')}</span>
                       </div>
                       {/* Current coding */}
                       <div>
@@ -1437,11 +1601,21 @@ export default function CodingPage() {
                   {(() => {
                     const rows: React.ReactElement[] = []
 
+                    // Helper to resolve bookmark source label
+                    const getBmSource = (bmId: number): string => {
+                      if (interviewBmIds.has(bmId)) return 'Interview'
+                      if (newsBmIds.has(bmId)) return 'News'
+                      return 'Discord'
+                    }
+                    const sourceStyle = (src: string) => {
+                      if (src === 'Interview') return 'bg-teal-100 text-teal-700'
+                      if (src === 'News') return 'bg-amber-100 text-amber-700'
+                      return 'bg-indigo-100 text-indigo-700'
+                    }
+
                     sortedCats.forEach(cat => {
-                      const allCatCodes = codes.filter(c => c.category_id === cat.id).sort((a, b) => a.name.localeCompare(b.name))
-                      const catCodes = filterActive
-                        ? allCatCodes.filter(code => filteredCodes.some(bc => bc.code_id === code.id))
-                        : allCatCodes
+                      const allCatCodes = codeSourceFiltered.filter(c => c.category_id === cat.id).sort((a, b) => a.name.localeCompare(b.name))
+                      const catCodes = allCatCodes.filter(code => filteredCodes.some(bc => bc.code_id === code.id))
                       if (catCodes.length === 0) return
                       const catTotalRows = catCodes.reduce((sum, code) => {
                         return sum + Math.max(filteredCodes.filter(bc => bc.code_id === code.id).length, 1)
@@ -1512,7 +1686,8 @@ export default function CodingPage() {
                                 </td>
                                 <td className="px-3 py-2 text-xs text-gray-500 border-b border-gray-100 whitespace-nowrap">
                                   <div className="font-medium">{bm?.username || '—'}</div>
-                                  <div className="text-gray-400">{bm?.date?.slice(0, 10) || ''}</div>
+                                  <div className="text-gray-400">{bm?.date?.slice(0, 19).replace('T', ' ') || ''}</div>
+                                  <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded-full mt-1 inline-block ${sourceStyle(getBmSource(bc.bookmark_id))}`}>{getBmSource(bc.bookmark_id)}</span>
                                 </td>
                                 <td className="px-3 py-2 text-xs text-gray-400 border-b border-gray-100"></td>
                               </tr>
@@ -1587,7 +1762,8 @@ export default function CodingPage() {
                                 </td>
                                 <td className="px-3 py-2 text-xs text-gray-500 border-b border-gray-100 whitespace-nowrap">
                                   <div className="font-medium">{bm?.username || '—'}</div>
-                                  <div className="text-gray-400">{bm?.date?.slice(0, 10) || ''}</div>
+                                  <div className="text-gray-400">{bm?.date?.slice(0, 19).replace('T', ' ') || ''}</div>
+                                  <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded-full mt-1 inline-block ${sourceStyle(getBmSource(bc.bookmark_id))}`}>{getBmSource(bc.bookmark_id)}</span>
                                 </td>
                                 <td className="px-3 py-2 text-xs text-gray-400 border-b border-gray-100"></td>
                               </tr>
@@ -1597,7 +1773,7 @@ export default function CodingPage() {
                       })
                     }
 
-                    if (codes.length === 0) {
+                    if (codeSourceFiltered.length === 0) {
                       rows.push(
                         <tr key="empty">
                           <td colSpan={5} className="px-3 py-8 text-center text-sm text-gray-400">

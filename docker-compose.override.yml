@@ -1,0 +1,19 @@
+# Automatically merged with docker-compose.yml by Docker Compose for local dev.
+# Overrides:
+#   - backend: compile Rust inside Docker (CI/CD uses a pre-built binary)
+#   - nginx: HTTP-only on port 80, no SSL certs required
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.local
+    image: retrieval-backend:local
+    ports:
+      - "8000:8000"
+
+  nginx:
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.local.conf:/etc/nginx/nginx.conf:ro
+      - ./frontend/dist:/usr/share/nginx/html:ro

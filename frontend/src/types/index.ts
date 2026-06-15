@@ -27,16 +27,33 @@ export interface User {
   created_at?: string
 }
 
+export type BookmarkSource = 'discord' | 'interview' | 'news'
+
 export interface Bookmark {
   id: number
   msg_id: number
   note?: string
   created_at: string
+  source?: BookmarkSource
   content?: string
   username?: string
   date?: string
   is_suno_team?: string | boolean
   codes: Code[]
+}
+
+export interface InterviewBookmark {
+  id: number
+  interview_id: string
+  excerpt: string
+  note: string
+  char_start?: number
+  char_end?: number
+  created_at: string
+  interviewees?: string
+  source_date?: string
+  codes: Code[]
+  highlights?: Array<{ id: number; code_id: number; code_name: string; code_color: string; highlighted_text: string }>
 }
 
 export interface Code {
@@ -102,6 +119,31 @@ export interface UserInRange {
   pct_weeks?: number
 }
 
+export interface UserTopic {
+  id: number
+  label: string
+  keywords: string[]
+  message_count: number
+  representative_docs?: string[]
+}
+
+export interface UserTopicsResult {
+  topics: UserTopic[]
+  doc_assignments?: Record<string, number>  // msg_uuid → topic_id
+  total_docs: number
+  filtered_docs: number
+  warning?: string
+}
+
+export type TopicPipelineStage = 'prepare' | 'fetch_embeddings' | 'align_docs' | 'bertopic' | 'complete' | 'error'
+export type TopicPipelineStatus = 'pending' | 'running' | 'done' | 'error'
+
+export interface TopicPipelineStep {
+  stage: TopicPipelineStage
+  status: TopicPipelineStatus
+  message: string
+}
+
 export interface SearchFilters {
   q?: string
   date_from?: string
@@ -133,4 +175,35 @@ export interface ContextMessage {
   content: string
   is_target?: boolean
   is_suno_team?: string | boolean
+}
+
+export interface EmotionScore {
+  label: string
+  score: number
+}
+
+export interface EmotionPerMessage {
+  msg_uuid: string
+  date: string
+  top_emotions: EmotionScore[]
+  sentiment: 'positive' | 'negative' | 'neutral'
+}
+
+export interface EmotionTimeline {
+  period: string
+  positive: number
+  negative: number
+  neutral: number
+  count: number
+}
+
+export interface EmotionResult {
+  per_message: EmotionPerMessage[]
+  summary: {
+    sentiment_ratio: { positive: number; negative: number; neutral: number }
+    top_emotions: EmotionScore[]
+    timeline: EmotionTimeline[]
+  }
+  total_messages: number
+  analyzed_messages: number
 }

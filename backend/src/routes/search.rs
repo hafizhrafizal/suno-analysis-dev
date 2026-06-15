@@ -74,6 +74,8 @@ pub struct UsernameParams {
 pub struct RangeParams {
     pub date_from: Option<String>,
     pub date_to: Option<String>,
+    pub is_suno_team: Option<String>,
+    pub min_words: Option<i64>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
     pub upload_ids: Option<String>,
@@ -84,6 +86,8 @@ pub struct UserRangeParams {
     pub date_from: Option<String>,
     pub date_to: Option<String>,
     pub upload_ids: Option<String>,
+    pub is_suno_team: Option<String>,
+    pub min_words: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,7 +106,7 @@ pub async fn keyword_search(
     if q.is_empty() {
         return Ok(Json(json!([])));
     }
-    let limit = params.limit.unwrap_or(200).min(10_000);
+    let limit = params.limit.unwrap_or(10_000).min(10_000);
     let match_type = params.match_type.as_deref().unwrap_or("fuzzy");
     let use_fts = state.fts_ready.load(Ordering::Relaxed);
 
@@ -366,7 +370,7 @@ pub struct SemanticParams {
 
 pub async fn semantic_search(
     State(state): State<AppState>,
-    user: AuthUser,
+    _user: AuthUser,
     headers: HeaderMap,
     Query(params): Query<SemanticParams>,
 ) -> Result<Json<Value>> {
@@ -615,7 +619,7 @@ pub async fn username_search(
     Query(params): Query<UsernameParams>,
 ) -> Result<Json<Value>> {
     let q = params.q.unwrap_or_default();
-    let limit = params.limit.unwrap_or(200).min(10_000);
+    let limit = params.limit.unwrap_or(10_000).min(10_000);
 
     let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
         "SELECT id, msg_uuid, author_id, username, date, content,
@@ -682,6 +686,7 @@ pub async fn username_search(
                 "username": r.get::<String, _>("username"),
                 "date": r.get::<String, _>("date"),
                 "content": r.get::<String, _>("content"),
+                "is_suno_team": r.get::<Option<String>, _>("is_suno_team"),
                 "upload_id": r.get::<Option<String>, _>("upload_id"),
                 "row_index": r.get::<Option<i64>, _>("row_index"),
             })
@@ -710,6 +715,25 @@ pub async fn range_search(
     if let Some(ref dt) = params.date_to {
         qb.push(" AND date <= ");
         qb.push_bind(dt.clone());
+    }
+    if let Some(ref st) = params.is_suno_team {
+        match st.as_str() {
+            "true" | "1" | "only" => {
+                qb.push(" AND LOWER(is_suno_team) IN ('true','1')");
+            }
+            "exclude" | "false" | "0" => {
+                qb.push(" AND (is_suno_team IS NULL OR LOWER(is_suno_team) NOT IN ('true','1'))");
+            }
+            _ => {}
+        }
+    }
+    if let Some(mw) = params.min_words {
+        if mw > 0 {
+            qb.push(format!(
+                " AND (length(content) - length(replace(content,' ','')) + 1) >= {}",
+                mw
+            ));
+        }
     }
     if let Some(ref uid_str) = params.upload_ids {
         let ids: Vec<&str> = uid_str
@@ -747,6 +771,7 @@ pub async fn range_search(
                 "username": r.get::<String, _>("username"),
                 "date": r.get::<String, _>("date"),
                 "content": r.get::<String, _>("content"),
+                "is_suno_team": r.get::<Option<String>, _>("is_suno_team"),
                 "upload_id": r.get::<Option<String>, _>("upload_id"),
                 "row_index": r.get::<Option<i64>, _>("row_index"),
             })
@@ -775,6 +800,20 @@ pub async fn users_in_range(
         let n = args.len() + 1;
         filters.push_str(&format!(" AND date <= ${}", n));
         args.push(dt.clone());
+    }
+    match params.is_suno_team.as_deref() {
+        Some("only") => filters.push_str(" AND LOWER(is_suno_team) IN ('true', '1')"),
+        Some("exclude") => filters.push_str(" AND LOWER(is_suno_team) NOT IN ('true', '1')"),
+        _ => {}
+    }
+    if let Some(mw) = params.min_words {
+        if mw > 0 {
+            let n = args.len() + 1;
+            filters.push_str(&format!(
+                " AND COALESCE(word_count, length(content) - length(replace(content, ' ', '')) + 1) >= ${}", n
+            ));
+            args.push(mw.to_string());
+        }
     }
 
     let upload_ids: Vec<String> = params.upload_ids.as_deref()

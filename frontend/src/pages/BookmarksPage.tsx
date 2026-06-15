@@ -1,10 +1,13 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
+import { useLocation, useSearchParams } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '../api/client'
 import { getUserStyle } from '../utils/colors'
 import { randomPaletteColor } from '../utils/palette'
 import ColorPicker from '../components/ui/ColorPicker'
-import type { Code, Message } from '../types'
+import type { Code, Message, InterviewBookmark, BookmarkSource } from '../types'
+
+type SourceFilter = 'all' | 'discord' | 'interview' | 'news'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -27,6 +30,7 @@ interface BookmarkWithAll {
   is_suno_team?: string | boolean
   codes: Code[]
   highlights: BookmarkHighlight[]
+  source: BookmarkSource
 }
 
 interface PopoverState {
@@ -397,7 +401,7 @@ function BookmarkCard({
                 </span>
               )}
             </div>
-            <span className="text-xs text-gray-400">{bookmark.date?.slice(0, 16)}</span>
+            <span className="text-xs text-gray-400">{bookmark.date?.slice(0, 19).replace('T', ' ')}</span>
           </div>
         </div>
 
@@ -658,7 +662,7 @@ function BookmarkCard({
               key={m.id}
               className={`flex gap-2 text-xs px-2 py-1.5 ${
                 m.id === bookmark.msg_id
-                  ? 'bg-yellow-50 border border-yellow-200 rounded'
+                  ? 'bg-yellow-50 border border-yellow-200 rounded-lg'
                   : 'bg-slate-50'
               }`}
             >
@@ -678,6 +682,18 @@ function BookmarkCard({
 // ── BookmarksPage ─────────────────────────────────────────────────────────────
 
 export default function BookmarksPage() {
+  const { pathname } = useLocation()
+  const [searchParams] = useSearchParams()
+  const module = pathname.split('/')[1] // 'discord', 'coding', etc.
+  const sourceParam = searchParams.get('source') as SourceFilter | null
+
+  const defaultSource: SourceFilter =
+    sourceParam === 'interview' || sourceParam === 'news' ? sourceParam :
+    module === 'interview' ? 'interview' :
+    module === 'news' ? 'news' :
+    module === 'coding' ? 'all' : 'discord'
+  const [sourceFilter, setSourceFilter] = useState<SourceFilter>(defaultSource)
+
   const [ctxBefore, setCtxBefore] = useState(10)
   const [ctxAfter, setCtxAfter] = useState(10)
   const [sortKey, setSortKey] = useState<SortKey>('date')
@@ -723,6 +739,17 @@ export default function BookmarksPage() {
   const { data: allCodes = [] } = useQuery<Code[]>({
     queryKey: ['codes'],
     queryFn: () => apiFetch('/codes'),
+  })
+
+  const { data: interviewBookmarks = [] } = useQuery<InterviewBookmark[]>({
+    queryKey: ['interview-bookmarks'],
+    queryFn: () => apiFetch('/interview-bookmarks'),
+  })
+
+  const { data: newsBookmarks = [] } = useQuery<{ id: number; excerpt: string; note: string; created_at: string; codes: Code[] }[]>({
+    queryKey: ['news-bookmarks'],
+    queryFn: () => apiFetch('/news-bookmarks'),
+    retry: false,
   })
 
   // Sync server data into local state — rawBookmarks is undefined until loaded (stable ref),
@@ -837,38 +864,59 @@ export default function BookmarksPage() {
     }
   }, [handleMouseUp, handleContextMenu, handleMouseDown])
 
-  // ── Mutations ─────────────────────────────────────────────────────────────────
+  // ── Mutations (source-aware) ──────────────────────────────────────────────────
 
-  const deleteBookmark = async (id: number) => {
-    await apiFetch(`/bookmarks/${id}`, { method: 'DELETE' })
-    setBookmarks((prev) => prev.filter((bm) => bm.id !== id))
-    queryClient.invalidateQueries({ queryKey: ['bookmark-ids'] })
-  }
-
-  const addCode = async (bookmarkId: number, codeId: number) => {
-    await apiFetch('/bookmark-codes', {
-      method: 'POST',
-      body: JSON.stringify({ bookmark_id: bookmarkId, code_id: codeId }),
-    })
-    const codeObj = allCodes.find((c) => c.id === codeId)
-    if (codeObj) {
-      setBookmarks((prev) =>
-        prev.map((bm) =>
-          bm.id === bookmarkId && !bm.codes.some((c) => c.id === codeId)
-            ? { ...bm, codes: [...bm.codes, codeObj] }
-            : bm,
-        ),
-      )
+  const deleteBookmark = async (bm: BookmarkWithAll) => {
+    if (bm.source === 'interview') {
+      await apiFetch(`/interview-bookmarks/${bm.id}`, { method: 'DELETE' })
+      queryClient.invalidateQueries({ queryKey: ['interview-bookmarks'] })
+    } else {
+      await apiFetch(`/bookmarks/${bm.id}`, { method: 'DELETE' })
+      setBookmarks((prev) => prev.filter((b) => b.id !== bm.id))
+      queryClient.invalidateQueries({ queryKey: ['bookmark-ids'] })
     }
   }
 
-  const removeCode = async (bookmarkId: number, codeId: number) => {
-    await apiFetch(`/bookmark-codes/${bookmarkId}/${codeId}`, { method: 'DELETE' })
-    setBookmarks((prev) =>
-      prev.map((bm) =>
-        bm.id === bookmarkId ? { ...bm, codes: bm.codes.filter((c) => c.id !== codeId) } : bm,
-      ),
-    )
+  const addCode = async (bm: BookmarkWithAll, codeId: number) => {
+    const endpoint = bm.source === 'interview' ? '/interview-bookmark-codes' : '/bookmark-codes'
+    await apiFetch(endpoint, {
+      method: 'POST',
+      body: JSON.stringify({ bookmark_id: bm.id, code_id: codeId }),
+    })
+    const codeObj = allCodes.find((c) => c.id === codeId)
+    if (codeObj) {
+      if (bm.source === 'interview') {
+        queryClient.setQueryData<InterviewBookmark[]>(['interview-bookmarks'], (prev) =>
+          (prev ?? []).map((b) => b.id === bm.id ? { ...b, codes: [...b.codes, codeObj] } : b),
+        )
+      } else {
+        setBookmarks((prev) =>
+          prev.map((b) =>
+            b.id === bm.id && !b.codes.some((c) => c.id === codeId)
+              ? { ...b, codes: [...b.codes, codeObj] }
+              : b,
+          ),
+        )
+      }
+    }
+  }
+
+  const removeCode = async (bm: BookmarkWithAll, codeId: number) => {
+    const endpoint = bm.source === 'interview'
+      ? `/interview-bookmark-codes/${bm.id}/${codeId}`
+      : `/bookmark-codes/${bm.id}/${codeId}`
+    await apiFetch(endpoint, { method: 'DELETE' })
+    if (bm.source === 'interview') {
+      queryClient.setQueryData<InterviewBookmark[]>(['interview-bookmarks'], (prev) =>
+        (prev ?? []).map((b) => b.id === bm.id ? { ...b, codes: b.codes.filter((c) => c.id !== codeId) } : b),
+      )
+    } else {
+      setBookmarks((prev) =>
+        prev.map((b) =>
+          b.id === bm.id ? { ...b, codes: b.codes.filter((c) => c.id !== codeId) } : b,
+        ),
+      )
+    }
   }
 
   const createCode = async (name: string, color: string): Promise<Code> => {
@@ -881,12 +929,15 @@ export default function BookmarksPage() {
   }
 
   const addHighlight = async (
-    bmId: number,
+    bm: BookmarkWithAll,
     codeId: number,
     text: string,
   ): Promise<BookmarkHighlight> => {
+    const baseEndpoint = bm.source === 'interview'
+      ? `/interview-bookmarks/${bm.id}/highlights`
+      : `/bookmarks/${bm.id}/highlights`
     const result = await apiFetch<{ id: number; bookmark_id: number; code_id: number; highlighted_text: string }>(
-      `/bookmarks/${bmId}/highlights`,
+      baseEndpoint,
       {
         method: 'POST',
         body: JSON.stringify({ code_id: codeId, highlighted_text: text }),
@@ -900,34 +951,79 @@ export default function BookmarksPage() {
       code_color: codeObj?.color ?? '#888888',
       highlighted_text: text,
     }
-    setBookmarks((prev) =>
-      prev.map((bm) => {
-        if (bm.id !== bmId) return bm
-        // Also add code to codes list if not present
-        const newCodes =
-          codeObj && !bm.codes.some((c) => c.id === codeId)
-            ? [...bm.codes, codeObj]
-            : bm.codes
-        return { ...bm, highlights: [...bm.highlights, hl], codes: newCodes }
-      }),
-    )
+    if (bm.source !== 'interview') {
+      setBookmarks((prev) =>
+        prev.map((b) => {
+          if (b.id !== bm.id) return b
+          const newCodes = codeObj && !b.codes.some((c) => c.id === codeId)
+            ? [...b.codes, codeObj] : b.codes
+          return { ...b, highlights: [...b.highlights, hl], codes: newCodes }
+        }),
+      )
+    }
     return hl
   }
 
-  const removeHighlight = async (bmId: number, hlId: number) => {
-    await apiFetch(`/bookmarks/${bmId}/highlights/${hlId}`, { method: 'DELETE' })
-    setBookmarks((prev) =>
-      prev.map((bm) =>
-        bm.id === bmId
-          ? { ...bm, highlights: bm.highlights.filter((h) => h.id !== hlId) }
-          : bm,
-      ),
-    )
+  const removeHighlight = async (bm: BookmarkWithAll, hlId: number) => {
+    const baseEndpoint = bm.source === 'interview'
+      ? `/interview-bookmarks/${bm.id}/highlights/${hlId}`
+      : `/bookmarks/${bm.id}/highlights/${hlId}`
+    await apiFetch(baseEndpoint, { method: 'DELETE' })
+    if (bm.source !== 'interview') {
+      setBookmarks((prev) =>
+        prev.map((b) =>
+          b.id === bm.id
+            ? { ...b, highlights: b.highlights.filter((h) => h.id !== hlId) }
+            : b,
+        ),
+      )
+    }
   }
+
+  // ── Merge all sources into unified list ───────────────────────────────────────
+
+  const allBookmarks = useMemo(() => {
+    const discordBms: BookmarkWithAll[] = (bookmarks ?? []).map(b => ({ ...b, source: 'discord' as const }))
+    const interviewBms: BookmarkWithAll[] = (interviewBookmarks ?? []).map(b => ({
+      id: b.id,
+      msg_id: b.id,
+      note: b.note,
+      created_at: b.created_at,
+      content: b.excerpt,
+      username: b.interviewees || b.interview_id,
+      date: b.source_date || b.created_at,
+      is_suno_team: false,
+      codes: b.codes,
+      highlights: (b.highlights ?? []).map(h => ({
+        id: h.id,
+        code_id: h.code_id,
+        code_name: h.code_name,
+        code_color: h.code_color,
+        highlighted_text: h.highlighted_text,
+      })),
+      source: 'interview' as const,
+    }))
+    const newsBms: BookmarkWithAll[] = (newsBookmarks ?? []).map(b => ({
+      id: b.id,
+      msg_id: b.id,
+      note: b.note ?? '',
+      created_at: b.created_at,
+      content: b.excerpt,
+      username: (b as any).article_id ?? '',
+      date: b.created_at,
+      is_suno_team: false,
+      codes: b.codes ?? [],
+      highlights: [],
+      source: 'news' as const,
+    }))
+    return [...discordBms, ...interviewBms, ...newsBms]
+  }, [bookmarks, interviewBookmarks, newsBookmarks])
 
   // ── Filter & sort ─────────────────────────────────────────────────────────────
 
-  const filtered = bookmarks.filter((bm) => {
+  const filtered = allBookmarks.filter((bm) => {
+    // Source filter
+    if (sourceFilter !== 'all' && bm.source !== sourceFilter) return false
     if (filterUser && !(bm.username || '').toLowerCase().includes(filterUser.toLowerCase()))
       return false
     if (filterSuno === 'only' && !isTruthy(bm.is_suno_team)) return false
@@ -953,7 +1049,7 @@ export default function BookmarksPage() {
     return 0
   })
 
-  const total = bookmarks.length
+  const total = allBookmarks.length
   const shown = sorted.length
   const codedCount = filtered.filter(
     (b) => (b.codes?.length ?? 0) > 0 || (b.highlights?.length ?? 0) > 0,
@@ -996,11 +1092,35 @@ export default function BookmarksPage() {
   return (
     <div className="max-w-5xl mx-auto px-3 sm:px-4 py-4 space-y-4">
 
+      {/* Source filter chips */}
+      <div className="flex items-center gap-2 flex-wrap px-1">
+        <span className="text-xs font-semibold text-gray-400 uppercase tracking-wide">Source</span>
+        {(['all', 'discord', 'interview', 'news'] as SourceFilter[]).map((src) => {
+          const active = sourceFilter === src
+          const labels: Record<SourceFilter, string> = { all: 'All', discord: 'Discord', interview: 'Interview', news: 'News' }
+          const colors: Record<SourceFilter, string> = {
+            all: active ? 'bg-gray-700 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200',
+            discord: active ? 'bg-indigo-600 text-white' : 'bg-indigo-50 text-indigo-700 hover:bg-indigo-100',
+            interview: active ? 'bg-teal-600 text-white' : 'bg-teal-50 text-teal-700 hover:bg-teal-100',
+            news: active ? 'bg-amber-600 text-white' : 'bg-amber-50 text-amber-700 hover:bg-amber-100',
+          }
+          return (
+            <button
+              key={src}
+              onClick={() => setSourceFilter(src)}
+              className={`text-xs px-3 py-1 rounded-full font-semibold transition-colors ${colors[src]}`}
+            >
+              {labels[src]}
+            </button>
+          )
+        })}
+      </div>
+
       {/* Floating popover (fixed position) */}
       {popover && (
         <div
           ref={popoverRef}
-          className="fixed z-[200] bg-white border border-indigo-300 shadow-lg px-3 py-2 flex flex-col gap-1.5 min-w-[220px]"
+          className="fixed z-[200] bg-white border border-indigo-300 shadow-lg rounded-lg px-3 py-2 flex flex-col gap-1.5 min-w-[220px]"
           style={{ left: popover.x + 8, top: popover.y - 8 }}
         >
           <button
@@ -1019,7 +1139,7 @@ export default function BookmarksPage() {
 
       {/* Sticky filter bar */}
       <div
-        className="sticky top-0 z-30 bg-white border-b border-gray-100 shadow-sm px-4 py-3"
+        className="sticky top-0 z-30 bg-white rounded-2xl border-b border-gray-100 shadow-sm px-4 py-3"
         role="search"
         aria-label="Bookmark filters"
       >
@@ -1139,7 +1259,7 @@ export default function BookmarksPage() {
             </button>
           )}
           <button
-            onClick={() => refetch()}
+            onClick={() => { refetch(); queryClient.invalidateQueries({ queryKey: ['interview-bookmarks'] }); queryClient.invalidateQueries({ queryKey: ['news-bookmarks'] }) }}
             className="self-end ml-auto pb-1 text-xs font-semibold text-indigo-700 hover:underline shrink-0"
           >
             Refresh
@@ -1147,17 +1267,25 @@ export default function BookmarksPage() {
         </div>
       </div>
 
-      {/* Bookmarks list */}
-      <section className="bg-white shadow p-5" aria-labelledby="bookmarks-heading">
+      {/* Unified bookmarks section */}
+      <section className="bg-white rounded-2xl shadow p-5" aria-labelledby="bookmarks-heading">
         <div className="flex items-center gap-2 mb-4 flex-wrap">
           <h2
             id="bookmarks-heading"
             className="font-semibold text-sm text-gray-700 uppercase tracking-wide"
           >
-            Saved Bookmarks
+            Bookmarks
           </h2>
+          <span className={`text-[10px] font-semibold uppercase tracking-wide px-2 py-0.5 rounded-full ${
+            sourceFilter === 'discord' ? 'bg-indigo-100 text-indigo-700' :
+            sourceFilter === 'interview' ? 'bg-teal-100 text-teal-700' :
+            sourceFilter === 'news' ? 'bg-amber-100 text-amber-700' :
+            'bg-gray-100 text-gray-700'
+          }`}>
+            {sourceFilter === 'all' ? 'All Sources' : sourceFilter.charAt(0).toUpperCase() + sourceFilter.slice(1)}
+          </span>
           {total > 0 && (
-            <span className="text-xs font-semibold px-2 py-0.5 bg-indigo-50 text-indigo-700">
+            <span className="text-xs font-semibold px-2 py-0.5 bg-gray-50 text-gray-600">
               {shown === total ? String(total) : `${shown} / ${total}`}
             </span>
           )}
@@ -1169,19 +1297,19 @@ export default function BookmarksPage() {
         </div>
 
         <div className="space-y-4" aria-live="polite">
-          {isLoading ? (
+          {isLoading && sourceFilter !== 'interview' && sourceFilter !== 'news' ? (
             <p className="text-sm text-gray-600 text-center py-8">Loading bookmarks…</p>
           ) : sorted.length === 0 ? (
             <p className="text-sm text-gray-400 text-center py-8">
-              {bookmarks.length === 0
-                ? 'No bookmarks yet. Use the bookmark button on any search result.'
+              {allBookmarks.length === 0
+                ? 'No bookmarks yet. Bookmark messages, interview excerpts, or news passages to get started.'
                 : 'No bookmarks match the current filters.'}
             </p>
           ) : (
             <>
               {sorted.slice(0, visibleCount).map((bm) => (
                 <BookmarkCard
-                  key={bm.id}
+                  key={`${bm.source}-${bm.id}`}
                   bookmark={bm}
                   ctxBefore={ctxBefore}
                   ctxAfter={ctxAfter}
@@ -1190,12 +1318,12 @@ export default function BookmarksPage() {
                   hlText={activeHl?.bmId === bm.id ? activeHl.text : ''}
                   hlSegs={activeHl?.bmId === bm.id ? activeHl.segs : []}
                   closeAllStamp={closeAllStamp}
-                  onDelete={() => deleteBookmark(bm.id)}
-                  onAddCode={(codeId) => addCode(bm.id, codeId)}
-                  onRemoveCode={(codeId) => removeCode(bm.id, codeId)}
+                  onDelete={() => deleteBookmark(bm)}
+                  onAddCode={(codeId) => addCode(bm, codeId)}
+                  onRemoveCode={(codeId) => removeCode(bm, codeId)}
                   onNewCode={(name, color) => createCode(name, color)}
-                  onAddHighlight={addHighlight}
-                  onRemoveHighlight={removeHighlight}
+                  onAddHighlight={(bmId, codeId, text) => addHighlight(bm, codeId, text)}
+                  onRemoveHighlight={(bmId, hlId) => removeHighlight(bm, hlId)}
                   onOpenHlPanel={() => setActiveHl({ bmId: bm.id, text: '', segs: [] })}
                   onCloseHlPanel={() => setActiveHl(null)}
                 />

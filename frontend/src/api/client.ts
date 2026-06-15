@@ -13,6 +13,15 @@ function openaiKeyHeader(): Record<string, string> {
   return k ? { 'X-OpenAI-Key': k } : {}
 }
 
+function hfTokenHeader(): Record<string, string> {
+  const t = localStorage.getItem('hf_token')
+  return t ? { 'X-HF-Token': t } : {}
+}
+
+function aiHeaders(): Record<string, string> {
+  return { ...openaiKeyHeader(), ...hfTokenHeader() }
+}
+
 export async function apiFetch<T = unknown>(
   path: string,
   options?: RequestInit,
@@ -20,10 +29,10 @@ export async function apiFetch<T = unknown>(
   const isFormData = options?.body instanceof FormData
   const res = await fetch(`/api${path}`, {
     headers: isFormData
-      ? { ...openaiKeyHeader(), ...(options?.headers ?? {}) }
+      ? { ...aiHeaders(), ...(options?.headers ?? {}) }
       : {
           'Content-Type': 'application/json',
-          ...openaiKeyHeader(),
+          ...aiHeaders(),
           ...(options?.headers ?? {}),
         },
     credentials: 'include',
@@ -67,7 +76,7 @@ export function streamEvents(
     try {
       const res = await fetch(`/api${path}`, {
         method,
-        headers: { 'Content-Type': 'application/json', ...openaiKeyHeader() },
+        headers: { 'Content-Type': 'application/json', ...aiHeaders() },
         body: JSON.stringify(body),
         signal: controller.signal,
         credentials: 'include',

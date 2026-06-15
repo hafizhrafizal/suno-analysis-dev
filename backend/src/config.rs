@@ -9,6 +9,7 @@ pub struct Config {
     pub qdrant_api_key: Option<String>,
     pub openai_api_key: Option<String>,
     pub app_mode: Option<String>,
+    pub ai_service_url: String,
 }
 
 impl Config {
@@ -23,6 +24,8 @@ impl Config {
             qdrant_api_key: env::var("QDRANT_API_KEY").ok(),
             openai_api_key: env::var("OPENAI_API_KEY").ok(),
             app_mode: env::var("APP_MODE").ok(),
+            ai_service_url: env::var("AI_SERVICE_URL")
+                .unwrap_or_else(|_| "http://localhost:8001".to_string()),
         }
     }
 

@@ -1,13 +1,19 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     Json,
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
 use crate::{
     error::{AppError, Result},
     models::{AuthUser, CreateBookmarkRequest},
     state::AppState,
 };
+
+#[derive(Debug, Deserialize)]
+pub struct ListBookmarksQuery {
+    pub source: Option<String>,
+}
 
 pub async fn create_bookmark(
     State(state): State<AppState>,
@@ -42,28 +48,33 @@ pub async fn create_bookmark(
 pub async fn list_bookmarks(
     State(state): State<AppState>,
     user: AuthUser,
+    Query(q): Query<ListBookmarksQuery>,
 ) -> Result<Json<Value>> {
     let mode = state.get_app_mode().await;
+    let source_filter = q.source.as_deref().unwrap_or("discord");
     let bookmark_rows = if mode.as_deref() == Some("multi") {
         sqlx::query(
             "SELECT b.id, b.msg_id, b.ctx_before, b.ctx_after, b.note, b.created_at,
-                    m.content, m.username, m.date, m.is_suno_team
+                    b.source, m.content, m.username, m.date, m.is_suno_team
              FROM bookmarks b
              JOIN messages m ON m.id = b.msg_id
-             WHERE b.user_id = $1
+             WHERE b.user_id = $1 AND b.source = $2
              ORDER BY b.created_at DESC",
         )
         .bind(user.id)
+        .bind(source_filter)
         .fetch_all(&state.db)
         .await?
     } else {
         sqlx::query(
             "SELECT b.id, b.msg_id, b.ctx_before, b.ctx_after, b.note, b.created_at,
-                    m.content, m.username, m.date, m.is_suno_team
+                    b.source, m.content, m.username, m.date, m.is_suno_team
              FROM bookmarks b
              JOIN messages m ON m.id = b.msg_id
+             WHERE b.source = $1
              ORDER BY b.created_at DESC",
         )
+        .bind(source_filter)
         .fetch_all(&state.db)
         .await?
     };
@@ -142,6 +153,7 @@ pub async fn list_bookmarks(
                 "ctx_after": row.get::<i64, _>("ctx_after"),
                 "note": row.get::<Option<String>, _>("note"),
                 "created_at": row.get::<String, _>("created_at"),
+                "source": row.get::<String, _>("source"),
                 "content": row.get::<String, _>("content"),
                 "username": row.get::<String, _>("username"),
                 "date": row.get::<String, _>("date"),

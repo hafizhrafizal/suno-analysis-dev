@@ -2,8 +2,11 @@ import { useState, useEffect, useRef } from 'react'
 import { Outlet } from 'react-router-dom'
 import Header from './Header'
 import ApiKeyModal from '../modals/ApiKeyModal'
+import HfTokenModal from '../modals/HfTokenModal'
 
-export default function Layout() {
+export type AppMode = 'discord' | 'coding' | 'interview' | 'news' | 'github'
+
+export default function Layout({ basePath, mode }: { basePath: string; mode: AppMode }) {
   const mainRef = useRef<HTMLElement>(null)
   const [showBackToTop, setShowBackToTop] = useState(false)
 
@@ -17,11 +20,12 @@ export default function Layout() {
 
   return (
     <div className="flex flex-col h-screen bg-slate-100">
-      <Header />
+      <Header basePath={basePath} mode={mode} />
       <main ref={mainRef} className="flex-1 overflow-auto">
         <Outlet />
       </main>
       <ApiKeyModal />
+      <HfTokenModal />
       {showBackToTop && (
         <button
           onClick={() => mainRef.current?.scrollTo({ top: 0, behavior: 'smooth' })}

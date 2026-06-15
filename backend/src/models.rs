@@ -110,6 +110,38 @@ pub struct UserProfileRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct UserTopicsRequest {
+    pub docs: Vec<String>,
+    pub msg_uuids: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EmotionMessageItem {
+    pub content: String,
+    pub date: String,
+    pub msg_uuid: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UserEmotionRequest {
+    pub messages: Vec<EmotionMessageItem>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StrategyDef {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StrategyRequest {
+    pub messages: Vec<SummarizeMsg>,
+    pub strategies: Vec<StrategyDef>,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct UserProfileFollowupRequest {
     #[allow(dead_code)]
     pub username: String,
@@ -119,6 +151,7 @@ pub struct UserProfileFollowupRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct SetApiKeyRequest {
+    #[allow(dead_code)]
     pub api_key: String,
 }
 

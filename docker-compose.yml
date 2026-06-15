@@ -20,6 +20,22 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
 
+  ai_service:
+    build:
+      context: ./ai_service
+    restart: unless-stopped
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    volumes:
+      - ai_model_cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 300s   # allow up to 5 min for model loading on first start
+    # No external port needed — only the backend calls it via the internal network
+
   backend:
     build:
       context: .        # used by: docker compose up --build (git-pull workflow)
@@ -30,6 +46,8 @@ services:
         condition: service_healthy
       qdrant:
         condition: service_started
+      ai_service:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgres://retrieval:${POSTGRES_PASSWORD}@postgres:5432/retrieval
       VECTOR_DB: qdrant
@@ -39,6 +57,7 @@ services:
       APP_MODE: ${APP_MODE:-multi}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       RUST_LOG: ${RUST_LOG:-info}
+      AI_SERVICE_URL: http://ai_service:8001
 
   nginx:
     image: nginx:alpine
@@ -58,3 +77,4 @@ volumes:
   postgres_data:
   qdrant_data:
   nginx_cache:
+  ai_model_cache:   # HuggingFace model weights — persists across rebuilds

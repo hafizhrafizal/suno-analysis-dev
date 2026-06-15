@@ -178,7 +178,7 @@ function UploadCard({
         <div className="flex-1 min-w-0">
           <p className="font-semibold text-sm text-gray-800 truncate">{upload.filename}</p>
           <p className="text-xs text-gray-500 mt-0.5">
-            {Number(upload.row_count).toLocaleString()} rows &bull; Uploaded {upload.upload_time.slice(0, 16)}
+            {Number(upload.row_count).toLocaleString()} rows &bull; Uploaded {upload.upload_time.slice(0, 19).replace('T', ' ')}
           </p>
           <p className="text-xs text-gray-400 font-mono mt-0.5">{upload.id}</p>
           <div className="flex flex-wrap gap-1.5 mt-2">{modelBadges}</div>
@@ -238,7 +238,7 @@ function UploadCard({
 }
 
 export default function SettingsPage() {
-  const { user, appMode, setShowKeyModal } = useAuthStore()
+  const { user, appMode, setShowKeyModal, setShowHfTokenModal } = useAuthStore()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const isAdmin = appMode !== 'multi' || user?.is_admin === true
@@ -519,6 +519,8 @@ export default function SettingsPage() {
     ? 'API key is set and active.'
     : 'No API key set. Click "Change Key" to add one.'
 
+  const hasHfToken = !!localStorage.getItem('hf_token')
+
   return (
     <div className="max-w-5xl mx-auto px-3 sm:px-4 py-4 space-y-5">
 
@@ -582,6 +584,30 @@ export default function SettingsPage() {
           </div>
           <button onClick={() => setShowKeyModal(true)} className="shrink-0 px-4 py-2 text-sm font-semibold bg-indigo-700 text-white rounded-lg hover:bg-indigo-800 transition-colors">
             Change Key
+          </button>
+        </div>
+      </section>
+
+      {/* Hugging Face Token */}
+      <section className="bg-white rounded-2xl shadow p-5">
+        <div className="flex items-center justify-between gap-4">
+          <div className="min-w-0">
+            <h2 className="font-semibold text-sm text-gray-700 uppercase tracking-wide">Hugging Face Token</h2>
+            <p className="text-xs text-gray-600 mt-1">
+              {hasHfToken ? 'Token is set and active.' : 'No token set — only public models are accessible.'}
+            </p>
+            <p className="text-xs text-gray-400 mt-1.5 flex items-start gap-1">
+              <svg className="w-3.5 h-3.5 shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+              </svg>
+              Stored in your browser's localStorage only. Also set <code className="bg-gray-100 px-1 rounded text-gray-700">HF_TOKEN</code> in your deployment env for the AI service to download gated models.
+            </p>
+          </div>
+          <button
+            onClick={() => setShowHfTokenModal(true)}
+            className="shrink-0 px-4 py-2 text-sm font-semibold bg-[#ff7a00] text-white rounded-lg hover:bg-[#e06e00] transition-colors"
+          >
+            {hasHfToken ? 'Change Token' : 'Set Token'}
           </button>
         </div>
       </section>
