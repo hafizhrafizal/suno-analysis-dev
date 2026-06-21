@@ -113,6 +113,30 @@ pub struct UserProfileRequest {
 pub struct UserTopicsRequest {
     pub docs: Vec<String>,
     pub msg_uuids: Vec<String>,
+    // Metadata for auto-saving to DB after analysis
+    pub username: Option<String>,
+    pub date_from: Option<String>,
+    pub date_to: Option<String>,
+    pub upload_ids: Option<String>,
+}
+
+// ── User topic DB types ────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct SaveTopicsRequest {
+    pub username: String,
+    pub date_from: Option<String>,
+    pub date_to: Option<String>,
+    pub upload_ids: Option<String>,
+    pub result: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BatchGetTopicsRequest {
+    pub usernames: Vec<String>,
+    pub date_from: Option<String>,
+    pub date_to: Option<String>,
+    pub upload_ids: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

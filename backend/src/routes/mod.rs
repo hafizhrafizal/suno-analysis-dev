@@ -13,6 +13,7 @@ pub mod persona;
 pub mod search;
 pub mod stats;
 pub mod suno_team;
+pub mod topics;
 pub mod uploads;
 
 use axum::{extract::DefaultBodyLimit, routing::{delete, get, post, put}, Router};
@@ -62,6 +63,10 @@ pub fn all_routes(state: AppState) -> Router {
         .route("/user-profile/followup", post(chat::user_profile_followup))
         .route("/user-topics", post(chat::user_topics))
         .route("/user-topics/stream", post(chat::user_topics_stream))
+        // Topic analysis results DB
+        .route("/topics/save", post(topics::save_topics))
+        .route("/topics/user/:username", get(topics::get_topics_for_user))
+        .route("/topics/batch-get", post(topics::batch_get_topics))
         .route("/user-emotion", post(chat::user_emotion))
         .route("/search/sentiment-count", post(chat::sentiment_count))
         .route("/search/batch-sentiment", post(chat::user_batch_sentiment))

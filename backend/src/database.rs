@@ -576,6 +576,57 @@ pub async fn init_db(pool: &PgPool) -> Result<(), sqlx::Error> {
         let _ = sqlx::query(stmt).execute(pool).await;
     }
 
+    // ── User topic analysis tables ────────────────────────────────────────────
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS user_topic_runs (
+            id          BIGSERIAL PRIMARY KEY,
+            username    TEXT NOT NULL,
+            date_from   TEXT NOT NULL DEFAULT '',
+            date_to     TEXT NOT NULL DEFAULT '',
+            upload_ids  TEXT NOT NULL DEFAULT '',
+            total_docs  INTEGER NOT NULL DEFAULT 0,
+            filtered_docs INTEGER NOT NULL DEFAULT 0,
+            warning     TEXT,
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (username, date_from, date_to, upload_ids)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS user_topic_items (
+            id            BIGSERIAL PRIMARY KEY,
+            run_id        BIGINT NOT NULL REFERENCES user_topic_runs(id) ON DELETE CASCADE,
+            topic_id      INTEGER NOT NULL,
+            label         TEXT NOT NULL,
+            keywords      TEXT[] NOT NULL DEFAULT '{}',
+            message_count INTEGER NOT NULL DEFAULT 0
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS user_topic_messages (
+            id        BIGSERIAL PRIMARY KEY,
+            run_id    BIGINT NOT NULL REFERENCES user_topic_runs(id) ON DELETE CASCADE,
+            msg_uuid  TEXT NOT NULL,
+            topic_id  INTEGER NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    for stmt in &[
+        "CREATE INDEX IF NOT EXISTS idx_user_topic_items_run_id ON user_topic_items(run_id)",
+        "CREATE INDEX IF NOT EXISTS idx_user_topic_messages_run_id ON user_topic_messages(run_id)",
+        "CREATE INDEX IF NOT EXISTS idx_user_topic_messages_uuid ON user_topic_messages(msg_uuid)",
+    ] {
+        let _ = sqlx::query(stmt).execute(pool).await;
+    }
+
     Ok(())
 }
 

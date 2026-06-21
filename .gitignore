@@ -70,3 +70,5 @@ site-packages/
 *.temp
 .cache/
 discord_db_export.sql
+
+*.sql
