@@ -103,6 +103,7 @@ const router = createBrowserRouter([
         children: [
           { index: true, element: <Navigate to="/discord/search" replace /> },
           { path: 'search', element: <SearchPage /> },
+          { path: 'users/:username', element: <SearchPage /> },
           { path: 'bookmarks', element: <BookmarksPage /> },
           { path: 'coding', element: <CodingRedirect basePath="/discord" /> },
           { path: 'coding/manager', element: <CodingPage /> },

@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>User Dropout Classification Algorithm</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    padding: 28px 20px 56px;
+    background: #f8fafc;
+    font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  }
+  h1 {
+    text-align: center;
+    font-size: 21px;
+    font-weight: 700;
+    color: #0f172a;
+    margin-bottom: 6px;
+  }
+  .subtitle {
+    text-align: center;
+    font-size: 13px;
+    color: #64748b;
+    margin-bottom: 28px;
+    letter-spacing: 0.01em;
+  }
+  .wrap { display: flex; justify-content: center; }
+  svg { max-width: 100%; height: auto; }
+
+  .legend {
+    max-width: 960px;
+    margin: 28px auto 0;
+    background: #fff;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    padding: 18px 22px;
+  }
+  .legend h2 { font-size: 13px; color: #334155; margin-bottom: 12px; font-weight: 700; }
+  .legend-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 8px 20px;
+    margin-bottom: 14px;
+  }
+  .legend-item { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #475569; }
+  .dot {
+    width: 13px; height: 13px; border-radius: 3px; flex-shrink: 0; border: 1.5px solid;
+  }
+  .notes { border-top: 1px solid #f1f5f9; padding-top: 12px; }
+  .note { font-size: 11.5px; color: #64748b; margin-bottom: 5px; padding-left: 14px; text-indent: -14px; }
+</style>
+</head>
+<body>
+
+<h1>Active Users Dropout Classification Algorithm</h1>
+<div class="subtitle">Priority cascade: ① Active Range (Weeks) → ② Message Number → ③ Word Length → ④ Classify</div>
+
+<div class="wrap">
+<svg width="960" height="1330" viewBox="0 0 960 1330" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <!-- Default grey arrow -->
+  <marker id="arr" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+    <polygon points="0 0,8 3,0 6" fill="#64748b"/>
+  </marker>
+  <!-- Red arrow (YES → reject path) -->
+  <marker id="arr-r" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+    <polygon points="0 0,8 3,0 6" fill="#dc2626"/>
+  </marker>
+  <!-- Green arrow (YES → pass path) -->
+  <marker id="arr-g" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+    <polygon points="0 0,8 3,0 6" fill="#16a34a"/>
+  </marker>
+</defs>
+
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<!-- START NODE                                                              -->
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<ellipse cx="420" cy="36" rx="92" ry="23" fill="#e2e8f0" stroke="#94a3b8" stroke-width="2"/>
+<text x="420" y="40" text-anchor="middle" dominant-baseline="middle"
+      font-size="13" font-weight="700" fill="#334155">USER IN RANGE</text>
+
+<line x1="420" y1="59" x2="420" y2="82" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<!-- SCALE THRESHOLDS                                                        -->
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<rect x="280" y="84" width="280" height="56" rx="8" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="420" y="103" text-anchor="middle" font-size="12" font-weight="600" fill="#334155">Scale Thresholds to Window</text>
+<text x="420" y="118" text-anchor="middle" font-size="10" fill="#64748b">minMsg · dropoutMinMsg · activeMinMsg  (≈1/2/3 per week)</text>
+<text x="420" y="132" text-anchor="middle" font-size="10" fill="#64748b">minPctWeeks · dropoutPctWeeks · activePctWeeks  (scale up for long windows)</text>
+
+<line x1="420" y1="140" x2="420" y2="162" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<!-- COMPUTE METRICS                                                         -->
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<rect x="280" y="164" width="280" height="74" rx="8" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="420" y="183" text-anchor="middle" font-size="12" font-weight="600" fill="#334155">Compute User Metrics</text>
+<text x="420" y="199" text-anchor="middle" font-size="10" fill="#64748b">pctWeeks  =  weeks_active / windowWeeks × 100</text>
+<text x="420" y="214" text-anchor="middle" font-size="10" fill="#64748b">silenceDays  =  daysBetween(last_date, filterEnd)</text>
+<text x="420" y="229" text-anchor="middle" font-size="10" fill="#64748b">activeSpan  =  daysBetween(first_date, last_date)</text>
+
+<line x1="420" y1="238" x2="420" y2="260" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<!-- SECTION 1 — PRIORITY 1: WEEKS                                          -->
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<rect x="16" y="262" width="928" height="28" rx="6" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+<text x="480" y="281" text-anchor="middle" font-size="12" font-weight="700" fill="#1d4ed8">① PRIORITY 1 — ACTIVE RANGE (WEEKS)   ·   primary gate, no compensation possible</text>
+
+<line x1="420" y1="290" x2="420" y2="310" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+
+<!-- DIAMOND 1 — pctWeeks < minPctWeeks? -->
+<!-- cy=350, hh=40, hw=145: top=(420,310) right=(565,350) bot=(420,390) left=(275,350) -->
+<polygon points="420,310 565,350 420,390 275,350" fill="#eff6ff" stroke="#93c5fd" stroke-width="1.5"/>
+<text x="420" y="343" text-anchor="middle" font-size="11" font-weight="600" fill="#1e3a8a">pctWeeks  &lt;  T.minPctWeeks% ?</text>
+<text x="420" y="359" text-anchor="middle" font-size="10" fill="#3b82f6">e.g.  &lt;12 % (7-wk window)  →  &lt;17 % (56-wk window)</text>
+
+<!-- YES → right → TRANSIENT-1 -->
+<line x1="565" y1="350" x2="636" y2="350" stroke="#dc2626" stroke-width="1.5" marker-end="url(#arr-r)"/>
+<text x="600" y="341" text-anchor="middle" font-size="10" font-weight="700" fill="#dc2626">YES</text>
+<rect x="638" y="328" width="206" height="44" rx="8" fill="#fffbeb" stroke="#fcd34d" stroke-width="2"/>
+<text x="741" y="346" text-anchor="middle" font-size="12" font-weight="700" fill="#92400e">TRANSIENT</text>
+<text x="741" y="362" text-anchor="middle" font-size="10" fill="#b45309">No consistent weekly presence</text>
+
+<!-- NO → down -->
+<line x1="420" y1="390" x2="420" y2="412" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+<text x="435" y="404" font-size="10" font-weight="600" fill="#16a34a">NO</text>
+
+<!-- Week bonus box -->
+<rect x="280" y="414" width="280" height="44" rx="8" fill="#dbeafe" stroke="#93c5fd" stroke-width="1.5"/>
+<text x="420" y="432" text-anchor="middle" font-size="11" font-weight="600" fill="#1e40af">Earn weekBonus  (0 – 20%)</text>
+<text x="420" y="449" text-anchor="middle" font-size="10" fill="#1d4ed8">pctWeeks above activePctWeeks  →  relax ② message bar by ≤ 20%</text>
+
+<line x1="420" y1="458" x2="420" y2="480" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<!-- SECTION 2 — PRIORITY 2: MESSAGES                                       -->
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<rect x="16" y="482" width="928" height="28" rx="6" fill="#dcfce7" stroke="#86efac" stroke-width="1"/>
+<text x="480" y="501" text-anchor="middle" font-size="12" font-weight="700" fill="#166534">② PRIORITY 2 — MESSAGE NUMBER   ·   adaptive to week score</text>
+
+<line x1="420" y1="510" x2="420" y2="528" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+
+<!-- DIAMOND 2 — messages < adaptiveMinMsg? -->
+<!-- cy=568, hh=40, hw=145: top=(420,528) right=(565,568) bot=(420,608) left=(275,568) -->
+<polygon points="420,528 565,568 420,608 275,568" fill="#f0fdf4" stroke="#86efac" stroke-width="1.5"/>
+<text x="420" y="561" text-anchor="middle" font-size="11" font-weight="600" fill="#14532d">messages  &lt;  adaptiveMinMsg ?</text>
+<text x="420" y="577" text-anchor="middle" font-size="10" fill="#16a34a">T.minMessages × max(0.75,  1 − weekBonus)</text>
+
+<!-- YES → right → TRANSIENT-2 -->
+<line x1="565" y1="568" x2="636" y2="568" stroke="#dc2626" stroke-width="1.5" marker-end="url(#arr-r)"/>
+<text x="600" y="559" text-anchor="middle" font-size="10" font-weight="700" fill="#dc2626">YES</text>
+<rect x="638" y="546" width="206" height="44" rx="8" fill="#fffbeb" stroke="#fcd34d" stroke-width="2"/>
+<text x="741" y="564" text-anchor="middle" font-size="12" font-weight="700" fill="#92400e">TRANSIENT</text>
+<text x="741" y="580" text-anchor="middle" font-size="10" fill="#b45309">Too few messages for window length</text>
+
+<!-- NO → down -->
+<line x1="420" y1="608" x2="420" y2="630" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+<text x="435" y="622" font-size="10" font-weight="600" fill="#16a34a">NO</text>
+
+<!-- Msg bonus box -->
+<rect x="280" y="632" width="280" height="44" rx="8" fill="#dcfce7" stroke="#86efac" stroke-width="1.5"/>
+<text x="420" y="650" text-anchor="middle" font-size="11" font-weight="600" fill="#166534">Earn msgBonus  (0 – 30%)</text>
+<text x="420" y="667" text-anchor="middle" font-size="10" fill="#16a34a">messages above activeMinMessages  →  relax ③ word bar by ≤ 30%</text>
+
+<line x1="420" y1="676" x2="420" y2="698" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<!-- SECTION 3 — PRIORITY 3: WORD LENGTH                                    -->
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<rect x="16" y="700" width="928" height="28" rx="6" fill="#fef9c3" stroke="#fde68a" stroke-width="1"/>
+<text x="480" y="719" text-anchor="middle" font-size="12" font-weight="700" fill="#854d0e">③ PRIORITY 3 — WORD LENGTH   ·   adaptive to message score</text>
+
+<line x1="420" y1="728" x2="420" y2="746" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+
+<!-- DIAMOND 3 — avg_words < adaptiveMinWords? -->
+<!-- cy=786, hh=40, hw=145: top=(420,746) right=(565,786) bot=(420,826) left=(275,786) -->
+<polygon points="420,746 565,786 420,826 275,786" fill="#fefce8" stroke="#fde68a" stroke-width="1.5"/>
+<text x="420" y="779" text-anchor="middle" font-size="11" font-weight="600" fill="#713f12">avg_words  &lt;  adaptiveMinWords ?</text>
+<text x="420" y="795" text-anchor="middle" font-size="10" fill="#b45309">max(2,  T.minAvgWords × (1 − msgBonus))   ·   floor: 2 words</text>
+
+<!-- YES → right → TRANSIENT-3 -->
+<line x1="565" y1="786" x2="636" y2="786" stroke="#dc2626" stroke-width="1.5" marker-end="url(#arr-r)"/>
+<text x="600" y="777" text-anchor="middle" font-size="10" font-weight="700" fill="#dc2626">YES</text>
+<rect x="638" y="764" width="206" height="44" rx="8" fill="#fffbeb" stroke="#fcd34d" stroke-width="2"/>
+<text x="741" y="782" text-anchor="middle" font-size="12" font-weight="700" fill="#92400e">TRANSIENT</text>
+<text x="741" y="798" text-anchor="middle" font-size="10" fill="#b45309">Reaction-only / very short messages</text>
+
+<!-- NO → down -->
+<line x1="420" y1="826" x2="420" y2="848" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+<text x="435" y="840" font-size="10" font-weight="600" fill="#16a34a">NO</text>
+
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<!-- SECTION 4 — CLASSIFY                                                   -->
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<rect x="16" y="850" width="928" height="28" rx="6" fill="#f3e8ff" stroke="#d8b4fe" stroke-width="1"/>
+<text x="480" y="869" text-anchor="middle" font-size="12" font-weight="700" fill="#7e22ce">④ CLASSIFY   ·   user has cleared all 3 gates</text>
+
+<line x1="420" y1="878" x2="420" y2="896" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+
+<!-- Dropout silence computation box -->
+<rect x="244" y="898" width="352" height="66" rx="8" fill="#fdf4ff" stroke="#d8b4fe" stroke-width="1.5"/>
+<text x="420" y="918" text-anchor="middle" font-size="11" font-weight="600" fill="#6b21a8">Compute Dropout Silence  (dual-signal)</text>
+<text x="420" y="934" text-anchor="middle" font-size="10" fill="#7c3aed">isDropoutSilent  =  silenceDays ≥ 14 d</text>
+<text x="420" y="950" text-anchor="middle" font-size="10" fill="#7c3aed">AND  ( relSilence ≥ 55% of own span   OR   absFrac ≥ 28% of window )</text>
+
+<line x1="420" y1="964" x2="420" y2="984" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+
+<!-- DIAMOND 4 — wasEngaged AND isDropoutSilent? (wide) -->
+<!-- cy=1034, hh=44, hw=165: top=(420,990) right=(585,1034) bot=(420,1078) left=(255,1034) -->
+<polygon points="420,990 585,1034 420,1078 255,1034" fill="#fdf4ff" stroke="#d8b4fe" stroke-width="1.5"/>
+<text x="420" y="1020" text-anchor="middle" font-size="11" font-weight="600" fill="#6b21a8">wasEngaged  AND  isDropoutSilent ?</text>
+<text x="420" y="1036" text-anchor="middle" font-size="10" fill="#7c3aed">pctWeeks ≥ dropoutPct%  ·  msgs ≥ adaptiveDropoutMin</text>
+<text x="420" y="1050" text-anchor="middle" font-size="10" fill="#7c3aed">weeks_active ≥ dropoutMinWeeks  ·  silent by dual-signal</text>
+
+<!-- YES → right → DROPOUT -->
+<line x1="585" y1="1034" x2="636" y2="1034" stroke="#dc2626" stroke-width="1.5" marker-end="url(#arr-r)"/>
+<text x="610" y="1025" text-anchor="middle" font-size="10" font-weight="700" fill="#dc2626">YES</text>
+<rect x="638" y="1006" width="206" height="56" rx="8" fill="#fff1f2" stroke="#fda4af" stroke-width="2"/>
+<text x="741" y="1025" text-anchor="middle" font-size="12" font-weight="700" fill="#be123c">DROPOUT</text>
+<text x="741" y="1041" text-anchor="middle" font-size="10" fill="#e11d48">recent  ·  silence &lt; 30% of window</text>
+<text x="741" y="1055" text-anchor="middle" font-size="10" fill="#e11d48">faded / gone  ·  30–50% / &gt;50%</text>
+
+<!-- NO → down -->
+<line x1="420" y1="1078" x2="420" y2="1098" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+<text x="435" y="1091" font-size="10" font-weight="600" fill="#64748b">NO</text>
+
+<!-- DIAMOND 5 — isSustained? -->
+<!-- cy=1140, hh=40, hw=145: top=(420,1100) right=(565,1140) bot=(420,1180) left=(275,1140) -->
+<polygon points="420,1100 565,1140 420,1180 275,1140" fill="#f3e8ff" stroke="#d8b4fe" stroke-width="1.5"/>
+<text x="420" y="1133" text-anchor="middle" font-size="11" font-weight="600" fill="#6b21a8">isSustained ?</text>
+<text x="420" y="1149" text-anchor="middle" font-size="10" fill="#7c3aed">pctWeeks ≥ actPct%  ·  msgs ≥ adaptiveActiveMin  ·  wks ≥ activeMinWeeks</text>
+
+<!-- NO → right → TRANSIENT-4 -->
+<line x1="565" y1="1140" x2="636" y2="1140" stroke="#dc2626" stroke-width="1.5" marker-end="url(#arr-r)"/>
+<text x="600" y="1131" text-anchor="middle" font-size="10" font-weight="700" fill="#dc2626">NO</text>
+<rect x="638" y="1118" width="206" height="44" rx="8" fill="#fffbeb" stroke="#fcd34d" stroke-width="2"/>
+<text x="741" y="1136" text-anchor="middle" font-size="12" font-weight="700" fill="#92400e">TRANSIENT</text>
+<text x="741" y="1152" text-anchor="middle" font-size="10" fill="#b45309">Was engaged but not sustained</text>
+
+<!-- YES → down -->
+<line x1="420" y1="1180" x2="420" y2="1200" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+<text x="435" y="1193" font-size="10" font-weight="600" fill="#16a34a">YES</text>
+
+<!-- DIAMOND 6 — weeklyDeclineRatio ≥ 40%? -->
+<!-- cy=1240, hh=38, hw=145: top=(420,1202) right=(565,1240) bot=(420,1278) left=(275,1240) -->
+<polygon points="420,1202 565,1240 420,1278 275,1240" fill="#fff7ed" stroke="#fed7aa" stroke-width="1.5"/>
+<text x="420" y="1233" text-anchor="middle" font-size="11" font-weight="600" fill="#c2410c">weeklyDeclineRatio ≥ 40% ?</text>
+<text x="420" y="1249" text-anchor="middle" font-size="10" fill="#ea580c">recent 4 wks  ↓40%+  vs prior 4 wks</text>
+
+<!-- YES → right → COOLING -->
+<line x1="565" y1="1240" x2="636" y2="1240" stroke="#dc2626" stroke-width="1.5" marker-end="url(#arr-r)"/>
+<text x="600" y="1231" text-anchor="middle" font-size="10" font-weight="700" fill="#dc2626">YES</text>
+<rect x="638" y="1218" width="206" height="44" rx="8" fill="#fff7ed" stroke="#fed7aa" stroke-width="2"/>
+<text x="741" y="1236" text-anchor="middle" font-size="12" font-weight="700" fill="#c2410c">COOLING</text>
+<text x="741" y="1252" text-anchor="middle" font-size="10" fill="#ea580c">Sustained but activity declining</text>
+
+<!-- NO → down → ACTIVE -->
+<line x1="420" y1="1278" x2="420" y2="1300" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+<text x="435" y="1292" font-size="10" font-weight="600" fill="#16a34a">NO</text>
+
+<!-- ACTIVE oval -->
+<ellipse cx="420" cy="1318" rx="100" ry="24" fill="#bbf7d0" stroke="#22c55e" stroke-width="2.5"/>
+<text x="420" y="1322" text-anchor="middle" dominant-baseline="middle"
+      font-size="15" font-weight="700" fill="#15803d">ACTIVE</text>
+
+</svg>
+</div>
+
+<!-- ──────────────────────────────── LEGEND ──────────────────────────────── -->
+<div class="legend">
+  <h2>Status Definitions</h2>
+  <div class="legend-grid">
+    <div class="legend-item">
+      <div class="dot" style="background:#fffbeb;border-color:#fcd34d;"></div>
+      <span><strong>Transient</strong> — lurker, reaction-only, or insufficient weekly / message presence</span>
+    </div>
+    <div class="legend-item">
+      <div class="dot" style="background:#fff1f2;border-color:#fda4af;"></div>
+      <span><strong>Dropout</strong> — was genuinely engaged, then went silent (tiered: recent / faded / gone)</span>
+    </div>
+    <div class="legend-item">
+      <div class="dot" style="background:#fff7ed;border-color:#fed7aa;"></div>
+      <span><strong>Cooling</strong> — sustained baseline, but recent 4-week activity fell ≥ 40% vs prior 4 weeks</span>
+    </div>
+    <div class="legend-item">
+      <div class="dot" style="background:#bbf7d0;border-color:#22c55e;"></div>
+      <span><strong>Active</strong> — passes all gates, sustained over the window, not silent or cooling</span>
+    </div>
+  </div>
+
+  <div class="notes">
+    <p class="note">✦ <strong>Adaptive compensation:</strong> excelling in a higher-priority dimension relaxes the bar in the next dimension — it does <em>not</em> skip it. Gates 1–3 can each be lowered but never waived.</p>
+    <p class="note">✦ <strong>weekBonus (≤ 20%):</strong> earned when pctWeeks exceeds activePctWeeks. Reduces ② message thresholds. Max relaxation: 25% of base (floor at 75%).</p>
+    <p class="note">✦ <strong>msgBonus (≤ 30%):</strong> earned when total_messages exceeds activeMinMessages. Reduces ③ word-length threshold. Floor is always 2 avg words (excludes "+1" reactions regardless).</p>
+    <p class="note">✦ <strong>Dual-signal silence:</strong> a user is "dropout-silent" when <em>both</em> conditions hold: (a) silenceDays ≥ 14 d, <em>and</em> (b) relSilence ≥ 55% of own active span <em>or</em> absFrac ≥ 28% of the full window. Veterans get proportionally more tolerance before being called a dropout.</p>
+    <p class="note">✦ <strong>Window scaling:</strong> all thresholds scale with windowDays. A 56-week window requires ~168 messages for Active vs ~21 for a 7-week window. pctWeeks bars also rise (e.g. activePctWeeks goes from 25% → 40% for a year-long window).</p>
+  </div>
+</div>
+
+</body>
+</html>

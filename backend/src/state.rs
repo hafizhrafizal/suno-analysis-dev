@@ -1,8 +1,14 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use sqlx::PgPool;
 use crate::config::Config;
+
+/// Max concurrent HTTP calls to the AI service (emotion/BERTopic).
+/// Kept at 8 so the backend never pushes more in-flight requests than the AI
+/// service's asyncio queue can hold (concurrency_slots × 2).  Higher values
+/// cause the AI service to 503-fast-reject the excess, triggering retry storms.
+pub const AI_CONCURRENCY: usize = 8;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -10,6 +16,10 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub openai_key: Arc<RwLock<Option<String>>>,
     pub fts_ready: Arc<AtomicBool>,
+    pub http_client: reqwest::Client,
+    /// Global rate-limiter for calls to the AI service.  Shared across all
+    /// tabs/users so two browser sessions can't collectively overwhelm the service.
+    pub ai_semaphore: Arc<Semaphore>,
 }
 
 impl AsRef<AppState> for AppState {
@@ -21,11 +31,21 @@ impl AsRef<AppState> for AppState {
 impl AppState {
     pub fn new(db: PgPool, config: Config, fts_ready: Arc<AtomicBool>) -> Self {
         let openai_key = config.openai_api_key.clone();
+        // 600s timeout: under CPU contention an emotion-inference chunk can
+        // legitimately take 5-30s; the previous 300s cliff was tripping while
+        // the AI service was still working.  The AI-side semaphore caps
+        // working set, so genuine hangs are not expected — this is headroom.
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(600))
+            .build()
+            .expect("Failed to build shared HTTP client");
         Self {
             db,
             config: Arc::new(config),
             openai_key: Arc::new(RwLock::new(openai_key)),
             fts_ready,
+            http_client,
+            ai_semaphore: Arc::new(Semaphore::new(AI_CONCURRENCY)),
         }
     }
 

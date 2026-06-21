@@ -1,4 +1,5 @@
-import { useState, useCallback, useEffect, useRef, useMemo } from 'react'
+import { useState, useCallback, useEffect, useRef, useMemo, Fragment } from 'react'
+import { Link, useNavigate, useParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import {
   BarChart, Bar, AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell,
@@ -7,8 +8,14 @@ import ReactMarkdown from 'react-markdown'
 import { apiFetch, streamEvents } from '../api/client'
 import { useSearchStore } from '../store/searchStore'
 import { useAuthStore } from '../store/authStore'
+import { usePhaseStore } from '../store/phaseStore'
 import { getUserStyle, getUserColor, highlightText, highlightTerms } from '../utils/colors'
-import type { Message, Upload, UserInRange, Stats, UserTopicsResult, TopicPipelineStep, EmotionResult, EmotionTimeline } from '../types'
+import type { Message, Upload, UserInRange, Stats, UserTopicsResult, TopicPipelineStep, EmotionResult, EmotionPerMessage, EmotionTimeline } from '../types'
+import {
+  makeBertopicKey, getBertopicResult, saveBertopicResult,
+  makeEmotionKey, checkEmotionCompleted, markEmotionCompleted,
+  getEmotionMessages, saveEmotionMessages, buildEmotionResult,
+} from '../lib/analysisCache'
 
 const POSITIVE_EMOTION_SET = new Set([
   'admiration','amusement','approval','caring','excitement',
@@ -41,6 +48,7 @@ function heatmapColor(positive: number, negative: number, neutral: number, maxCo
 type SearchTab = 'keyword' | 'semantic' | 'username' | 'range' | 'browse'
 type MatchType = 'fuzzy' | 'exact' | 'any'
 type SearchCat = 'chat' | 'users'
+type UsersDataTab = 'search' | 'phases'
 type TrendBucket = 'month' | 'week' | 'day'
 type AnalysisTab = 'none' | 'summarize' | 'viz'
 type FilterMode = 'exact' | 'any' | 'fuzzy' | 'semantic'
@@ -72,9 +80,14 @@ const LOG_ICONS: Record<string, string> = {
 
 function UsernameTag({ username }: { username: string }) {
   return (
-    <span className="ubadge text-xs font-semibold" style={getUserStyle(username)}>
+    <Link
+      to={`/discord/users/${encodeURIComponent(username)}`}
+      className="ubadge text-xs font-semibold hover:underline"
+      style={getUserStyle(username)}
+      onClick={e => e.stopPropagation()}
+    >
       {username}
-    </span>
+    </Link>
   )
 }
 
@@ -93,6 +106,8 @@ function formatMsgDate(raw: string | undefined): string {
   })
 }
 
+type MsgEmotion = { sentiment: string; dominant_emotion: string; top_emotions: { label: string; score: number }[] }
+
 interface MessageCardProps {
   msg: Message
   keyword: string
@@ -104,9 +119,10 @@ interface MessageCardProps {
   ctxBefore: number
   ctxAfter: number
   isGrouped?: boolean
+  emotion?: MsgEmotion
 }
 
-function MessageCard({ msg, keyword, tokens, isBookmarked, isSelected, onBookmarkToggle, onSelectToggle, ctxBefore, ctxAfter, isGrouped = false }: MessageCardProps) {
+function MessageCard({ msg, keyword, tokens, isBookmarked, isSelected, onBookmarkToggle, onSelectToggle, ctxBefore, ctxAfter, isGrouped = false, emotion }: MessageCardProps) {
   const [copied, setCopied] = useState(false)
   const [ctxOpen, setCtxOpen] = useState(false)
   const [ctxMessages, setCtxMessages] = useState<Message[]>([])
@@ -170,6 +186,25 @@ function MessageCard({ msg, keyword, tokens, isBookmarked, isSelected, onBookmar
                 {(msg.similarity * 100).toFixed(1)}%
               </span>
             )}
+            {emotion && (() => {
+              const sentColor = emotion.sentiment === 'positive' ? '#10b981' : emotion.sentiment === 'negative' ? '#f43f5e' : '#9ca3af'
+              const sentBg   = emotion.sentiment === 'positive' ? '#d1fae5' : emotion.sentiment === 'negative' ? '#ffe4e6' : '#f3f4f6'
+              const tooltip = [
+                `Sentiment: ${emotion.sentiment}`,
+                emotion.dominant_emotion ? `Dominant emotion: ${emotion.dominant_emotion}` : '',
+                ...(emotion.top_emotions?.length ? ['Top emotions: ' + emotion.top_emotions.map(e => `${e.label} (${(e.score * 100).toFixed(0)}%)`).join(', ')] : []),
+              ].filter(Boolean).join('\n')
+              return (
+                <span
+                  className="inline-flex items-center gap-1 text-[9px] font-semibold px-1.5 py-0.5 rounded-full capitalize"
+                  style={{ color: sentColor, backgroundColor: sentBg }}
+                  title={tooltip}
+                >
+                  💬 {emotion.sentiment}
+                  {emotion.dominant_emotion && <span className="opacity-70">· {emotion.dominant_emotion}</span>}
+                </span>
+              )
+            })()}
           </div>
         )}
 
@@ -223,7 +258,7 @@ function MessageCard({ msg, keyword, tokens, isBookmarked, isSelected, onBookmar
                     key={m.id}
                     className={`flex gap-2 text-xs px-2 py-1 rounded ${m.id === msg.id ? 'bg-amber-50 border border-amber-200' : 'bg-gray-50'}`}
                   >
-                    <span className="shrink-0 font-semibold" style={getUserStyle(m.username)}>{m.username}</span>
+                    <Link to={`/discord/users/${encodeURIComponent(m.username)}`} className="shrink-0 font-semibold hover:underline" style={getUserStyle(m.username)} onClick={e => e.stopPropagation()}>{m.username}</Link>
                     <span className="text-gray-400 shrink-0">{formatMsgDate(m.date)}</span>
                     <span className="text-gray-700 flex-1">{m.content}</span>
                   </div>
@@ -283,7 +318,12 @@ function BrowseChatRow({
       <div className="flex-1 min-w-0">
         {!isGrouped && (
           <div className="flex items-baseline gap-2 mb-0.5">
-            <span className="text-sm font-semibold" style={{ color: textColor }}>{msg.username}</span>
+            <Link
+              to={`/discord/users/${encodeURIComponent(msg.username)}`}
+              className="text-sm font-semibold hover:underline"
+              style={{ color: textColor }}
+              onClick={e => e.stopPropagation()}
+            >{msg.username}</Link>
             <span className="text-xs text-gray-400 tabular-nums">{formatMsgDate(msg.date)}</span>
             {(msg.is_suno_team === 'True' || msg.is_suno_team === true || msg.is_suno_team === '1') && (
               <span className="text-[10px] font-semibold bg-violet-100 text-violet-700 px-1.5 py-0.5 rounded-full">Suno Team</span>
@@ -388,50 +428,97 @@ function getMondayKey(dateStr: string): string {
   return d.toISOString().slice(0, 10)
 }
 
-// --- Dropout analysis helpers ---
+// --- Engagement analysis helpers ---
 
-type DropoutStatus = 'active' | 'dropout' | 'transient'
-type DropoutTier = 'recent' | 'faded' | 'gone'
-interface DropoutInfo { status: DropoutStatus; silenceDays: number; tier?: DropoutTier; activeSpan: number }
+type EngagementLevel = 'high' | 'medium' | 'low'
+interface EngagementInfo {
+  level: EngagementLevel
+  pctWeeks: number
+}
+
+type CrossPhaseTransition = 'dropout-high' | 'dropout-med' | 'dropout-low' | 'dec-hm' | 'dec-hl' | 'dec-ml'
 
 function daysBetween(dateA: string, dateB: string): number {
   return Math.round((new Date(dateB).getTime() - new Date(dateA).getTime()) / 86400000)
 }
 
-function computeDropout(
-  u: UserInRange,
-  filterEnd: string,
-  silenceThreshold: number,
-  transientMinMessages: number,
-  transientMinActiveDays: number,
-  activeMinMessages: number,
-  activeMinWeeks: number,
-): DropoutInfo {
-  const silenceDays = u.last_date ? daysBetween(u.last_date.slice(0, 10), filterEnd) : 9999
-  const activeSpan = (u.first_date && u.last_date)
-    ? daysBetween(u.first_date.slice(0, 10), u.last_date.slice(0, 10))
-    : 0
-  // Never meaningfully engaged → transient (low-engagement / burst / one-time)
-  if (u.total_messages < transientMinMessages || activeSpan < transientMinActiveDays) {
-    return { status: 'transient', silenceDays, activeSpan }
+function deriveThresholds(windowDays: number) {
+  const w = Math.max(14, windowDays)
+  const wk = w / 7
+  const extraWks = Math.max(0, wk - 7)
+  return {
+    minMessages:       Math.max(5,  Math.round(wk * 1.0)),
+    activeMinMessages: Math.max(15, Math.round(wk * 3.0)),
+    minAvgWords:       3,
+    minPctWeeks:   Math.min(20, Math.round(12 + extraWks * 0.10)),
+    activePctWeeks: 40,
+    activeMinWeeks: Math.max(3, Math.ceil(wk * 0.12)),
+    silenceDays: Math.min(120, Math.max(21, Math.round(w * 0.28))),
   }
-  // Engaged but doesn't meet the "active" bar → still transient
-  if (u.total_messages < activeMinMessages || (u.weeks_active ?? 0) < activeMinWeeks) {
-    return { status: 'transient', silenceDays, activeSpan }
-  }
-  // Meaningfully engaged and now silent → dropout
-  if (silenceDays >= silenceThreshold) {
-    const tier: DropoutTier = silenceDays < 60 ? 'recent' : silenceDays < 90 ? 'faded' : 'gone'
-    return { status: 'dropout', silenceDays, tier, activeSpan }
-  }
-  // Meaningfully engaged and still posting → active
-  return { status: 'active', silenceDays, activeSpan }
 }
 
-const STATUS_COLORS: Record<DropoutStatus, { bg: string; text: string; dot: string; border: string }> = {
-  active:    { bg: 'bg-emerald-50', text: 'text-emerald-700', dot: 'bg-emerald-500', border: 'border-emerald-200' },
-  dropout:   { bg: 'bg-rose-50',    text: 'text-rose-700',    dot: 'bg-rose-500',    border: 'border-rose-200'    },
-  transient: { bg: 'bg-amber-50',   text: 'text-amber-600',   dot: 'bg-amber-400',   border: 'border-amber-200'   },
+function classifyEngagement(u: UserInRange, filterStart: string, filterEnd: string): EngagementInfo {
+  const windowDays = filterStart ? Math.max(14, daysBetween(filterStart, filterEnd)) : 90
+  const windowWeeks = windowDays / 7
+  const pctWeeks = windowWeeks > 0 ? Math.round(((u.weeks_active ?? 0) / windowWeeks) * 100) : 0
+  // Floor = 20 × 50% of total phase weeks — fixed target regardless of how many weeks the user was active
+  // High: ≥50% weeks present AND total msgs ≥ floor
+  // Low: <20% weeks present
+  // Medium: everything else
+  const msgFloor = 20 * Math.ceil(windowWeeks * 0.5)
+  let level: EngagementLevel
+  if (pctWeeks >= 50 && u.total_messages >= msgFloor) level = 'high'
+  else if (pctWeeks < 20) level = 'low'
+  else level = 'medium'
+  return { level, pctWeeks }
+}
+
+function classifyEngagementSingle(u: UserInRange, filterStart: string, filterEnd: string): EngagementInfo {
+  const windowDays = filterStart ? Math.max(14, daysBetween(filterStart, filterEnd)) : 90
+  const windowWeeks = windowDays / 7
+  const pctWeeks = windowWeeks > 0 ? Math.round(((u.weeks_active ?? 0) / windowWeeks) * 100) : 0
+  const msgFloor = 20 * Math.ceil(windowWeeks * 0.5)
+  let level: EngagementLevel
+  if (pctWeeks >= 50 && u.total_messages >= msgFloor) level = 'high'
+  else if (pctWeeks < 20) level = 'low'
+  else level = 'medium'
+  return { level, pctWeeks }
+}
+
+const ENGAGEMENT_COLORS: Record<EngagementLevel, { bg: string; text: string; dot: string; border: string }> = {
+  high:   { bg: 'bg-emerald-50',  text: 'text-emerald-700', dot: 'bg-emerald-500',  border: 'border-emerald-200'  },
+  medium: { bg: 'bg-sky-50',      text: 'text-sky-700',     dot: 'bg-sky-500',      border: 'border-sky-200'      },
+  low:    { bg: 'bg-amber-50',    text: 'text-amber-600',   dot: 'bg-amber-400',    border: 'border-amber-200'    },
+}
+
+
+// --- Shared utilities ---
+
+function mondayKey(iso: string): string {
+  const d = new Date(iso)
+  const diff = (d.getUTCDay() + 6) % 7
+  const mon = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - diff))
+  return mon.toISOString().slice(0, 10)
+}
+
+function deriveUserInRange(username: string, messages: Message[]): UserInRange {
+  if (messages.length === 0) return { username, total_messages: 0 }
+  const dates = messages.map(m => m.date?.slice(0, 10) ?? '').filter(Boolean).sort()
+  const total_words = messages.reduce(
+    (sum, m) => sum + m.content.split(/\s+/).filter(Boolean).length, 0
+  )
+  const weekSet = new Set(messages.map(m => (m.date ? mondayKey(m.date) : '')).filter(Boolean))
+  return {
+    username,
+    total_messages: messages.length,
+    first_date: dates[0],
+    last_date: dates[dates.length - 1],
+    avg_words: Math.round((total_words / messages.length) * 10) / 10,
+    weeks_active: weekSet.size,
+    is_suno_team: messages.some(
+      m => m.is_suno_team === 'True' || m.is_suno_team === true || m.is_suno_team === '1'
+    ),
+  }
 }
 
 // --- Main component ---
@@ -520,9 +607,83 @@ function mergeEmotionResults(a: EmotionResult, b: EmotionResult): EmotionResult 
   }
 }
 
+async function fetchStoredEmotionFromDB(
+  uuids: string[],
+  dateByUuid: Map<string, string>,
+  totalCount: number,
+): Promise<EmotionResult | null> {
+  if (uuids.length === 0) return null
+  try {
+    const resp = await apiFetch<Record<string, { sentiment: string; top_emotions: { label: string; score: number }[] }>>(
+      '/messages/emotions',
+      { method: 'POST', body: JSON.stringify({ msg_uuids: uuids }) }
+    )
+    const perMessage: EmotionPerMessage[] = uuids
+      .filter(uuid => resp[uuid])
+      .map(uuid => ({
+        msg_uuid: uuid,
+        date: dateByUuid.get(uuid) ?? '',
+        sentiment: resp[uuid].sentiment as 'positive' | 'negative' | 'neutral',
+        top_emotions: resp[uuid].top_emotions,
+      }))
+    if (perMessage.length === 0) return null
+    const result = buildEmotionResult(perMessage)
+    result.total_messages = totalCount
+    return result
+  } catch {
+    return null
+  }
+}
+
+function downloadChartAsPNG(container: HTMLElement | null, filename: string): void {
+  if (!container) return
+  const svg = container.querySelector('svg')
+  if (!svg) return
+  const { width, height } = svg.getBoundingClientRect()
+  const serialized = new XMLSerializer().serializeToString(svg)
+  const blob = new Blob([serialized], { type: 'image/svg+xml' })
+  const url = URL.createObjectURL(blob)
+  const img = new Image()
+  img.onload = () => {
+    const scale = 2
+    const canvas = document.createElement('canvas')
+    canvas.width = width * scale
+    canvas.height = height * scale
+    const ctx = canvas.getContext('2d')!
+    ctx.scale(scale, scale)
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, width, height)
+    ctx.drawImage(img, 0, 0, width, height)
+    URL.revokeObjectURL(url)
+    const a = document.createElement('a')
+    a.download = filename
+    a.href = canvas.toDataURL('image/png')
+    a.click()
+  }
+  img.src = url
+}
+
+function downloadTableAsCSV(headers: string[], rows: (string | number | null)[][], filename: string): void {
+  const esc = (v: string | number | null) => {
+    const s = String(v ?? '')
+    return /[,"\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
+  }
+  const csv = [headers, ...rows].map(r => r.map(esc).join(',')).join('\n')
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
 export default function SearchPage() {
+  const PHASE_DEFS = usePhaseStore(s => s.defs)
   const { results, setResults, selectedIds, toggleSelected, selectAll, clearSelected, bookmarkedIds, setBookmarkedIds, toggleBookmarked } = useSearchStore()
   const { setShowKeyModal } = useAuthStore()
+  const { username: routeUsername } = useParams<{ username?: string }>()
+  const navigate = useNavigate()
 
   // Search state
   const [searchCat, setSearchCat] = useState<SearchCat>(() => (localStorage.getItem('search_cat') as SearchCat) || 'chat')
@@ -535,8 +696,9 @@ export default function SearchPage() {
   const [rangeDateFrom, setRangeDateFrom] = useState(() => ssGet('sr_range_date_from', ''))
   const [rangeDateTo, setRangeDateTo] = useState(() => ssGet('sr_range_date_to', ''))
   const [sunoTeam, setSunoTeam] = useState('all')
-  const [maxResults, setMaxResults] = useState(10000)
+  const [maxResults, setMaxResults] = useState(1000000)
   const [minWords, setMinWords] = useState(0)
+  const [minMessages, setMinMessages] = useState(0)
   const [ctxBefore, setCtxBefore] = useState(10)
   const [ctxAfter, setCtxAfter] = useState(10)
   const [sortBy, setSortBy] = useState('similarity')
@@ -548,12 +710,20 @@ export default function SearchPage() {
   const [uploads, setUploads] = useState<Upload[]>([])
   const [selectedUploads, setSelectedUploads] = useState<Set<string>>(new Set())
   const [userStats, setUserStats] = useState<UserInRange[]>(() => ssGet<UserInRange[]>('sr_user_stats', []))
+  const [usersDataTab, setUsersDataTab] = useState<UsersDataTab>('search')
+  const [selectedPhases, setSelectedPhases] = useState<Set<string>>(new Set())
+  const [phaseData, setPhaseData] = useState<Record<string, UserInRange[]>>({})
+  const [phaseLoadingSet, setPhaseLoadingSet] = useState<Set<string>>(new Set())
+  const [expandedPhaseSections, setExpandedPhaseSections] = useState<Set<string>>(new Set(['cross-active', 'username-trend']))
+  const [phaseUsernameSearch, setPhaseUsernameSearch] = useState('')
+  const [phaseChartStatuses, setPhaseChartStatuses] = useState<Set<string>>(new Set(['High', 'Medium', 'Low']))
   const [userSortCol, setUserSortCol] = useState<'username' | 'total_messages' | 'first_date' | 'last_date' | 'avg_words' | 'weeks_active' | 'pct_weeks'>('total_messages')
   const [userSortDir, setUserSortDir] = useState<'asc' | 'desc'>('desc')
   const [userNameFilter, setUserNameFilter] = useState('')
   const [refineFirstMsgIn, setRefineFirstMsgIn] = useState('')
   const [refineLastMsgFrom, setRefineLastMsgFrom] = useState('')
   const [refineMinMessages, setRefineMinMessages] = useState('')
+  const [refineMaxMessages, setRefineMaxMessages] = useState('')
   const [refineMinWeeks, setRefineMinWeeks] = useState('')
   const [refineAvgWordsMin, setRefineAvgWordsMin] = useState('')
   const [refineAvgWordsMax, setRefineAvgWordsMax] = useState('')
@@ -624,7 +794,45 @@ export default function SearchPage() {
   const [expandedTopicSamples, setExpandedTopicSamples] = useState<Set<number>>(new Set())
   const [userTopicsSteps, setUserTopicsSteps] = useState<TopicPipelineStep[]>([])
   const [topicModalId, setTopicModalId] = useState<number | null>(null)
-  const [userAnalysisTab, setUserAnalysisTab] = useState<'topics' | 'emotion' | 'timeline' | 'dropout' | 'summary' | 'strategy'>('topics')
+  const [userAnalysisTab, setUserAnalysisTab] = useState<'topics' | 'emotion' | 'timeline' | 'dropout' | 'summary' | 'strategy' | 'persona'>('dropout')
+  const [dropoutSubTab, setDropoutSubTab] = useState<'current' | 'phases' | 'cross'>('cross')
+  const [crossPhaseNarrative, setCrossPhaseNarrative] = useState<string | null>(null)
+  const [narrativeLoading, setNarrativeLoading] = useState(false)
+  const [msgEmotions, setMsgEmotions] = useState<Record<string, MsgEmotion>>({})
+
+  // Persona classification state
+  type PersonaResult = { persona: string; confidence: number; reasoning: string; created_at?: string }
+  type UserPersonas = Record<string, { rule_based?: PersonaResult; llm?: PersonaResult }>
+  const [userPersonas, setUserPersonas] = useState<UserPersonas>({})
+  const [personaClassifying, setPersonaClassifying] = useState<Set<string>>(new Set())
+  const [personaSummary, setPersonaSummary] = useState<
+    { phase: string; phase_label: string; method: string; persona: string; count: number }[]
+  >([])
+  const [personaSummaryMethod, setPersonaSummaryMethod] = useState<'rule_based' | 'llm'>('rule_based')
+  const [personaSummaryLoading, setPersonaSummaryLoading] = useState(false)
+  const [batchPersonaClassifying, setBatchPersonaClassifying] = useState(false)
+  const [batchPersonaProgress, setBatchPersonaProgress] = useState<{ done: number; total: number; errors: number } | null>(null)
+  const [batchTopicRunning, setBatchTopicRunning] = useState(false)
+  const [batchTopicProgress, setBatchTopicProgress] = useState<{ done: number; total: number; errors: number } | null>(null)
+  const [tablePersonas, setTablePersonas] = useState<Record<string, { rule_based?: PersonaResult; llm?: PersonaResult }>>({})
+  type EmotionEntry = { label: string; score: number }
+  type SentBucket = { count: number; top_emotions: EmotionEntry[] }
+  type TableSentiment = {
+    positive: number; negative: number; neutral: number; analyzed: number;
+    top_emotions: EmotionEntry[];
+    by_sentiment: { positive: SentBucket; negative: SentBucket; neutral: SentBucket };
+  }
+  const [tableSentiments, setTableSentiments] = useState<Record<string, TableSentiment>>({})
+  const [batchSentimentRunning, setBatchSentimentRunning] = useState(false)
+  const [sentimentDetailUser, setSentimentDetailUser] = useState<string | null>(null)
+  const [sentimentProgress, setSentimentProgress] = useState<{ msgs: number; totalMsgs: number; users: number; totalUsers: number } | null>(null)
+  const [tableTopics, setTableTopics] = useState<Record<string, UserTopicsResult>>({})
+  const [topicDetailUser, setTopicDetailUser] = useState<string | null>(null)
+  type FlowModalUser = { username: string; total_messages: number; weeks_active: number | null; pct_weeks: number | null; avg_words: number | null; status: EngagementLevel | 'no-data' | null }
+  const [flowModal, setFlowModal] = useState<{ title: string; users: FlowModalUser[]; totalWeeks?: number } | null>(null)
+  const [flowModalSortCol, setFlowModalSortCol] = useState<'username' | 'total_messages' | 'weeks_active' | 'pct_weeks' | 'avg_words'>('total_messages')
+  const [flowModalSortDir, setFlowModalSortDir] = useState<'asc' | 'desc'>('desc')
+
   const topicsStopRef = useRef<(() => void) | null>(null)
 
   // Emotion analysis state
@@ -648,32 +856,43 @@ export default function SearchPage() {
   const [expandedStrategyIds, setExpandedStrategyIds] = useState<Set<string>>(new Set())
 
   // Dropout analysis parameters
-  const [dropoutSilenceDays, setDropoutSilenceDays] = useState(30)
-  const [dropoutMinMessages, setDropoutMinMessages] = useState(5)
-  const [dropoutMinActiveDays, setDropoutMinActiveDays] = useState(14)
-  const [activeMinMessages, setActiveMinMessages] = useState(10)
-  const [activeMinWeeks, setActiveMinWeeks] = useState(2)
-  const [dropoutStatusFilter, setDropoutStatusFilter] = useState<'all' | DropoutStatus>('all')
+  const [dropoutStatusFilter, setDropoutStatusFilter] = useState<'all' | EngagementLevel | 'decreased' | 'dropout'>('all')
 
   // Timeline interactivity
   const [selectedTopicIds, setSelectedTopicIds] = useState<Set<number> | null>(null)
   const [heatmapCell, setHeatmapCell] = useState<{ topicId: number; period: string } | null>(null)
 
-  // Analysis result cache — persists across user navigation, keyed by username
+  // Analysis result cache — persists across user navigation, keyed by username|dateFrom|dateTo
   const topicsCacheRef = useRef<Map<string, { result: UserTopicsResult; uuids: Set<string> }>>(new Map())
   const emotionCacheRef = useRef<Map<string, { result: EmotionResult; uuids: Set<string> }>>(new Map())
+  const openedWithKeyRef = useRef<string | null>(null)
+  const makeAnalysisKey = (username: string, from: string, to: string) => `${username}|${from}|${to}`
+  const routeLoadedRef = useRef<string | null>(null)
+  const sentimentReqIdRef = useRef(0)
+  const chartCountsRef    = useRef<HTMLDivElement>(null)
+  const chartTrendsRef    = useRef<HTMLDivElement>(null)
+  const chartStackedRef   = useRef<HTMLDivElement>(null)
+  const chartUserTrendRef = useRef<HTMLDivElement>(null)
 
   // Semantic filter debounce ref
   const semanticFilterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  // Infinite scroll
+  // Infinite scroll — chat results
   const [visibleCount, setVisibleCount] = useState(50)
   const sentinelRef = useRef<HTMLDivElement>(null)
+
+  // Infinite scroll — users table
+  const [visibleUserCount, setVisibleUserCount] = useState(50)
+  // Callback ref: the observer is created when the sentinel mounts and destroyed when it
+  // unmounts. Using useState (not useRef) so the effect re-runs on mount/unmount.
+  const [userTableSentinelEl, setUserTableSentinelEl] = useState<HTMLDivElement | null>(null)
+  const userTableScrollRef = useRef<HTMLDivElement>(null)
 
   // Browse All tab — server-side pagination
   const [browseMessages, setBrowseMessages] = useState<Message[]>([])
   const [browseFetching, setBrowseFetching] = useState(false)
   const [browseHasMore, setBrowseHasMore] = useState(true)
+  const [browseExporting, setBrowseExporting] = useState(false)
   const resultsAnchorRef = useRef<HTMLDivElement>(null)
   const browseOffsetRef = useRef(0)
   const browseHasMoreRef = useRef(true)
@@ -703,6 +922,26 @@ export default function SearchPage() {
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // Fetch stored emotions for newly loaded message results
+  useEffect(() => {
+    const uuids = results.map(m => m.msg_uuid).filter((u): u is string => !!u)
+    if (uuids.length === 0) { setMsgEmotions({}); return }
+    apiFetch<Record<string, MsgEmotion>>('/messages/emotions', {
+      method: 'POST',
+      body: JSON.stringify({ msg_uuids: uuids }),
+    }).then(data => setMsgEmotions(data)).catch(() => {})
+  }, [results])
+
+  // Fetch stored emotions for user detail messages and merge into msgEmotions
+  useEffect(() => {
+    const uuids = userMsgs.map(m => m.msg_uuid).filter((u): u is string => !!u)
+    if (uuids.length === 0) return
+    apiFetch<Record<string, MsgEmotion>>('/messages/emotions', {
+      method: 'POST',
+      body: JSON.stringify({ msg_uuids: uuids }),
+    }).then(data => setMsgEmotions(prev => ({ ...prev, ...data }))).catch(() => {})
+  }, [userMsgs])
 
   // Sync key state to sessionStorage so it survives navigation and page refresh
   useEffect(() => { ssSet('sr_results', results) }, [results])
@@ -741,6 +980,31 @@ export default function SearchPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [displayedResults.length])
 
+  // Reset users table page when search result or any filter changes
+  useEffect(() => {
+    setVisibleUserCount(50)
+  }, [userStats, dropoutStatusFilter, userNameFilter, refineMinMessages, refineMaxMessages, refineMinWeeks,
+      refineFirstMsgIn, refineLastMsgFrom, refineAvgWordsMin, refineAvgWordsMax,
+      userSortCol, userSortDir])
+
+  // IntersectionObserver: load next 50 users when sentinel scrolls into view.
+  // Depends on the sentinel element (state-based callback ref), not visibleUserCount.
+  // This prevents the cascade where recreating the observer on every count increment
+  // causes it to fire immediately because the sentinel is still visible.
+  useEffect(() => {
+    const el = userTableSentinelEl
+    const root = userTableScrollRef.current
+    if (!el || !root) return
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting) setVisibleUserCount((prev) => prev + 50)
+      },
+      { root, rootMargin: '100px' },
+    )
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [userTableSentinelEl])
+
   const scopeParam = selectedUploads.size > 0 ? [...selectedUploads].join(',') : ''
 
   const buildParams = useCallback(() => {
@@ -750,10 +1014,11 @@ export default function SearchPage() {
     if (sunoTeam === 'only') p.set('is_suno_team', 'only')
     else if (sunoTeam === 'exclude') p.set('is_suno_team', 'exclude')
     if (minWords > 0) p.set('min_words', String(minWords))
+    if (minMessages > 0) p.set('min_messages', String(minMessages))
     p.set('limit', String(maxResults))
     if (scopeParam) p.set('upload_ids', scopeParam)
     return p
-  }, [dateFrom, dateTo, sunoTeam, minWords, maxResults, scopeParam])
+  }, [dateFrom, dateTo, sunoTeam, minWords, minMessages, maxResults, scopeParam])
 
   const toggleScopeChip = (id: string) => {
     setSelectedUploads((prev) => {
@@ -896,6 +1161,29 @@ export default function SearchPage() {
     }
     return msgs
   }, [browseMessages, browseUsernameFilter, browseTokens])
+
+  const handleBrowseDownloadCsv = useCallback(async () => {
+    setBrowseExporting(true)
+    try {
+      const p = new URLSearchParams()
+      if (browseDateFrom) p.set('date_from', browseDateFrom)
+      if (browseDateTo) p.set('date_to', browseDateTo)
+      if (scopeParam) p.set('upload_ids', scopeParam)
+      const res = await fetch(`/api/messages/export?${p}`, { credentials: 'include' })
+      if (!res.ok) throw new Error(`Export failed: HTTP ${res.status}`)
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `chat_export_${new Date().toISOString().slice(0, 10)}.csv`
+      a.click()
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      console.error('CSV export error:', err)
+    } finally {
+      setBrowseExporting(false)
+    }
+  }, [browseDateFrom, browseDateTo, scopeParam])
 
   // Apply text filter + optional chart range filter on top of full results
   const applyFilters = useCallback((
@@ -1068,14 +1356,87 @@ export default function SearchPage() {
     }
   }, [query, activeTab, matchType, filterUsername, buildParams, rangeLimit, rangeOffset, sortBy, trendBucket, setResults, clearSelected, buildTrend, dateFrom, dateTo, rangeDateFrom, rangeDateTo, sunoTeam, minWords, scopeParam, setShowKeyModal])
 
-  const doUserSearch = async () => {
+  // When rendered at /discord/users/:username, auto-load that user's detail panel
+  useEffect(() => {
+    if (!routeUsername || routeLoadedRef.current === routeUsername) return
+    routeLoadedRef.current = routeUsername
+    ;(async () => {
+      setUserMsgsLoading(true)
+      setUserMsgs([])
+      setUserDetailDateFrom('')
+      setUserDetailDateTo('')
+      setUserDetailContains('')
+      setUserDetailMinWords(0)
+      setUserDetailPage(0)
+      setUserSumResult('')
+      setUserSumVisible(false)
+      setUserSumFollowUp([])
+      setUserTopicsResult(null)
+      setUserTopicsVisible(false)
+      setUserTopicsSteps([])
+      setUserEmotionResult(null)
+      setStrategyResult(null)
+      setStrategyError(null)
+      setExpandedStrategyIds(new Set())
+      try {
+        const data = await apiFetch<Message[]>(
+          `/search/user-messages?username=${encodeURIComponent(routeUsername)}&limit=1000000`
+        )
+        const u = deriveUserInRange(routeUsername, data)
+        openedWithKeyRef.current = makeAnalysisKey(routeUsername, '', '')
+        setSelectedUser(u)
+        setUserStats(prev => {
+          // Add/update this user in the stats list so dropoutMap can compute their status
+          const without = prev.filter(x => x.username !== routeUsername)
+          return [u, ...without]
+        })
+        setUserMsgs(data)
+      } finally {
+        setUserMsgsLoading(false)
+      }
+    })()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [routeUsername])
+
+  const doUserSearch = async (datesOverride?: { from: string; to: string }) => {
+    setUserStats([])
+    setSentimentDetailUser(null)
+    setTopicDetailUser(null)
     setSearching(true)
     setTimeout(() => resultsAnchorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 30)
     setError(null)
     try {
       const params = buildParams()
+      // Override dates when called directly from phase buttons (state hasn't re-rendered yet)
+      if (datesOverride) {
+        if (datesOverride.from) params.set('date_from', datesOverride.from)
+        else params.delete('date_from')
+        if (datesOverride.to) params.set('date_to', datesOverride.to)
+        else params.delete('date_to')
+      }
       const data = await apiFetch<UserInRange[]>(`/search/users-in-range?${params}`)
-      setUserStats(data)
+      const users = data.filter(u => u.username !== 'Deleted User')
+      setUserStats(users)
+      if (users.length > 0) {
+        const sentBody: Record<string, unknown> = { usernames: users.map(u => u.username) }
+        const df = params.get('date_from') ?? ''
+        const dt = params.get('date_to') ?? ''
+        if (df) sentBody.date_from = df
+        if (dt) sentBody.date_to = dt
+        if (scopeParam) sentBody.upload_ids = scopeParam
+        const reqId = ++sentimentReqIdRef.current
+        apiFetch<{ results: (TableSentiment & { username: string })[] }>(
+          '/search/stored-sentiment',
+          { method: 'POST', body: JSON.stringify(sentBody) }
+        ).then(sentData => {
+          if (sentimentReqIdRef.current !== reqId) return  // stale response, discard
+          const fresh: Record<string, TableSentiment> = {}
+          for (const { username, ...rest } of sentData.results) {
+            if ((rest as TableSentiment).analyzed > 0) fresh[username] = rest as TableSentiment
+          }
+          setTableSentiments(prev => ({ ...prev, ...fresh }))
+        }).catch(() => {})
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Search failed')
     } finally {
@@ -1083,6 +1444,30 @@ export default function SearchPage() {
       setDidSearch(true)
       setTimeout(() => resultsAnchorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 60)
     }
+  }
+
+  const fetchPhaseSummary = (phases: Set<string>, opts?: { minWords?: number; minMessages?: number }) => {
+    const toFetch = [...phases].filter((k) => !(k in phaseData))
+    if (toFetch.length === 0) return
+    setPhaseLoadingSet((prev) => new Set([...prev, ...toFetch]))
+    toFetch.forEach(async (key) => {
+      try {
+        const def = PHASE_DEFS.find((p) => p.key === key)
+        if (!def) return
+        const p = new URLSearchParams()
+        if (def.from) p.set('date_from', def.from)
+        if (def.to) p.set('date_to', def.to)
+        p.set('is_suno_team', 'exclude')
+        if ((opts?.minWords ?? 0) > 0) p.set('min_words', String(opts!.minWords))
+        if ((opts?.minMessages ?? 0) > 0) p.set('min_messages', String(opts!.minMessages))
+        const data = await apiFetch<UserInRange[]>(`/search/users-in-range?${p}`)
+        setPhaseData((prev) => ({ ...prev, [key]: data.filter((u) => u.username !== 'Deleted User') }))
+      } catch (err) {
+        setError(err instanceof Error ? err.message : `Failed to load phase ${key}`)
+      } finally {
+        setPhaseLoadingSet((prev) => { const next = new Set(prev); next.delete(key); return next })
+      }
+    })
   }
 
   const handleBookmarkToggle = async (msg: Message) => {
@@ -1327,27 +1712,126 @@ export default function SearchPage() {
       (u.last_date && u.last_date > max ? u.last_date.slice(0, 10) : max), '')
   }, [dateTo, userStats])
 
-  // Dropout status map for all users
+  // Filter start date: explicit dateFrom or min first_date in dataset
+  const filterStartDate = useMemo(() => {
+    if (dateFrom) return dateFrom
+    return userStats.reduce((mn, u) =>
+      (u.first_date && (!mn || u.first_date < mn) ? u.first_date.slice(0, 10) : mn), '')
+  }, [dateFrom, userStats])
+
+  // Analysis window in days — drives adaptive dropout thresholds
+  const windowDays = useMemo(() => {
+    if (!filterStartDate || !filterEndDate) return 90
+    return Math.max(14, daysBetween(filterStartDate, filterEndDate))
+  }, [filterStartDate, filterEndDate])
+
+  // Engagement status map for all users
   const dropoutMap = useMemo(() => {
-    if (!filterEndDate || userStats.length === 0) return new Map<string, DropoutInfo>()
-    const map = new Map<string, DropoutInfo>()
+    if (!filterEndDate || userStats.length === 0) return new Map<string, EngagementInfo>()
+    const map = new Map<string, EngagementInfo>()
     for (const u of userStats) {
-      map.set(u.username, computeDropout(u, filterEndDate, dropoutSilenceDays, dropoutMinMessages, dropoutMinActiveDays, activeMinMessages, activeMinWeeks))
+      map.set(u.username, classifyEngagement(u, filterStartDate, filterEndDate))
     }
     return map
-  }, [userStats, filterEndDate, dropoutSilenceDays, dropoutMinMessages, dropoutMinActiveDays, activeMinMessages, activeMinWeeks])
+  }, [userStats, filterStartDate, filterEndDate])
+
+  const currentBatchPhaseKey = useMemo(() => {
+    const matched = PHASE_DEFS.find(def =>
+      def.from === filterStartDate && (def.to === filterEndDate || (!def.to && !filterEndDate))
+    )
+    return matched ? matched.key : `custom|${filterStartDate || 'start'}|${filterEndDate || 'end'}`
+  }, [filterStartDate, filterEndDate])
+
+  // Cross-phase transition map: for users relative to the previous phase
+  const crossPhaseMap = useMemo(() => {
+    const result = new Map<string, CrossPhaseTransition>()
+    const currentIdx = PHASE_DEFS.findIndex(d => d.key === currentBatchPhaseKey)
+    if (currentIdx <= 0) return result
+    const prevDef = PHASE_DEFS[currentIdx - 1]
+    const prevData = phaseData[prevDef.key]
+    if (!prevData?.length) return result
+    const prevEnd = prevDef.to || prevData.reduce((mx, u) =>
+      (u.last_date && u.last_date > mx ? u.last_date : mx), '').slice(0, 10)
+    const prevLevelMap = new Map<string, EngagementLevel>()
+    for (const u of prevData) {
+      prevLevelMap.set(u.username, classifyEngagement(u, prevDef.from, prevEnd).level)
+    }
+    const currentUsernames = new Set(userStats.map(u => u.username))
+    for (const u of userStats) {
+      const prevLevel = prevLevelMap.get(u.username)
+      if (!prevLevel) continue
+      const currLevel = dropoutMap.get(u.username)?.level ?? 'low'
+      if (prevLevel === 'high' && currLevel === 'medium') result.set(u.username, 'dec-hm')
+      else if (prevLevel === 'high' && currLevel === 'low') result.set(u.username, 'dec-hl')
+      else if (prevLevel === 'medium' && currLevel === 'low') result.set(u.username, 'dec-ml')
+    }
+    for (const [username, prevLevel] of prevLevelMap) {
+      if (!currentUsernames.has(username)) {
+        result.set(username, prevLevel === 'high' ? 'dropout-high' : prevLevel === 'medium' ? 'dropout-med' : 'dropout-low')
+      }
+    }
+    return result
+  }, [PHASE_DEFS, currentBatchPhaseKey, phaseData, userStats, dropoutMap])
+
+  const dropoutUsersFromPrev = useMemo(() =>
+    [...crossPhaseMap.entries()].filter(([, v]) => v.startsWith('dropout-')).map(([u]) => u).sort()
+  , [crossPhaseMap])
+
+  useEffect(() => {
+    apiFetch<{ username: string; method: string; persona: string; confidence: number; reasoning: string; created_at?: string }[]>(
+      `/persona/by-phase?phase=${encodeURIComponent(currentBatchPhaseKey)}`
+    )
+      .then(rows => {
+        const map: Record<string, { rule_based?: PersonaResult; llm?: PersonaResult }> = {}
+        for (const r of rows) {
+          if (!map[r.username]) map[r.username] = {}
+          const pr: PersonaResult = { persona: r.persona, confidence: r.confidence, reasoning: r.reasoning, created_at: r.created_at }
+          if (r.method === 'rule_based') map[r.username].rule_based = pr
+          else if (r.method === 'llm') map[r.username].llm = pr
+        }
+        setTablePersonas(map)
+      })
+      .catch(() => {})
+  }, [currentBatchPhaseKey])
+
+  // Load BERTopic results from IndexedDB for all users in the current search
+  useEffect(() => {
+    if (userStats.length === 0) { setTableTopics({}); return }
+    let cancelled = false
+    const load = async () => {
+      const entries: Record<string, UserTopicsResult> = {}
+      await Promise.all(userStats.map(async (u) => {
+        const key = makeBertopicKey(u.username, filterStartDate, filterEndDate, scopeParam)
+        const result = await getBertopicResult(key).catch(() => null)
+        if (result) entries[u.username] = result
+      }))
+      if (!cancelled) setTableTopics(entries)
+    }
+    load()
+    return () => { cancelled = true }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userStats, filterStartDate, filterEndDate, scopeParam])
 
   const filteredUsers = userStats.filter((u) => {
     if (userNameFilter.trim() && !u.username.toLowerCase().includes(userNameFilter.trim().toLowerCase())) return false
     if (refineFirstMsgIn && (u.first_date ?? '') < refineFirstMsgIn) return false
     if (refineLastMsgFrom && (u.last_date ?? '') < refineLastMsgFrom) return false
     if (refineMinMessages && u.total_messages < parseInt(refineMinMessages)) return false
+    if (refineMaxMessages && u.total_messages > parseInt(refineMaxMessages)) return false
     if (refineMinWeeks && (u.weeks_active ?? 0) < parseInt(refineMinWeeks)) return false
     if (refineAvgWordsMin && (u.avg_words ?? 0) < parseFloat(refineAvgWordsMin)) return false
     if (refineAvgWordsMax && (u.avg_words ?? 0) > parseFloat(refineAvgWordsMax)) return false
     if (dropoutStatusFilter !== 'all') {
-      const info = dropoutMap.get(u.username)
-      if (!info || info.status !== dropoutStatusFilter) return false
+      if (dropoutStatusFilter === 'decreased') {
+        const cp = crossPhaseMap.get(u.username)
+        if (!cp || !cp.startsWith('dec-')) return false
+      } else if (dropoutStatusFilter === 'dropout') {
+        const cp = crossPhaseMap.get(u.username)
+        if (!cp || !cp.startsWith('dropout-')) return false
+      } else {
+        const info = dropoutMap.get(u.username)
+        if (!info || info.level !== dropoutStatusFilter) return false
+      }
     }
     return true
   })
@@ -1375,6 +1859,7 @@ export default function SearchPage() {
     setRefineFirstMsgIn('')
     setRefineLastMsgFrom('')
     setRefineMinMessages('')
+    setRefineMaxMessages('')
     setRefineMinWeeks('')
     setRefineAvgWordsMin('')
     setRefineAvgWordsMax('')
@@ -1419,17 +1904,17 @@ export default function SearchPage() {
   // How many filtered messages haven't been covered by the last cached analysis
   const topicsRemainingCount = useMemo(() => {
     if (!selectedUser || !userTopicsResult) return 0
-    const cached = topicsCacheRef.current.get(selectedUser.username)
+    const cached = topicsCacheRef.current.get(makeAnalysisKey(selectedUser.username, userDetailDateFrom, userDetailDateTo))
     if (!cached) return 0
     return userDetailFiltered.filter(m => !cached.uuids.has(m.msg_uuid ?? '')).length
-  }, [selectedUser, userTopicsResult, userDetailFiltered])
+  }, [selectedUser, userTopicsResult, userDetailFiltered, userDetailDateFrom, userDetailDateTo])
 
   const emotionRemainingCount = useMemo(() => {
     if (!selectedUser || !userEmotionResult) return 0
-    const cached = emotionCacheRef.current.get(selectedUser.username)
+    const cached = emotionCacheRef.current.get(makeAnalysisKey(selectedUser.username, userDetailDateFrom, userDetailDateTo))
     if (!cached) return 0
     return userDetailFiltered.filter(m => !cached.uuids.has(m.msg_uuid ?? '')).length
-  }, [selectedUser, userEmotionResult, userDetailFiltered])
+  }, [selectedUser, userEmotionResult, userDetailFiltered, userDetailDateFrom, userDetailDateTo])
 
   // Cross-join BERTopic + Emotion + dates into a temporal matrix
   const userTimeline = useMemo(() => {
@@ -1513,6 +1998,75 @@ export default function SearchPage() {
     msgContainerRef.current?.scrollTo({ top: 0, behavior: 'smooth' })
   }, [userDetailFiltered])
 
+  // When user changes phase date shortcuts while a user is open, reload analysis from cache
+  useEffect(() => {
+    if (!selectedUser || userMsgsLoading || userMsgs.length === 0) return
+    const currentKey = makeAnalysisKey(selectedUser.username, userDetailDateFrom, userDetailDateTo)
+    if (currentKey === openedWithKeyRef.current) return  // initial open already handled
+
+    // Clear stale analysis results
+    setUserTopicsResult(null)
+    setUserEmotionResult(null)
+
+    // Try BERTopic from IndexedDB for this date range
+    const bertopicKey = makeBertopicKey(selectedUser.username, userDetailDateFrom, userDetailDateTo, scopeParam)
+    getBertopicResult(bertopicKey)
+      .then(cached => {
+        if (cached) {
+          setUserTopicsResult(cached)
+          setUserTopicsVisible(true)
+          topicsCacheRef.current.set(currentKey, {
+            result: cached,
+            uuids: new Set(userMsgs.map(m => m.msg_uuid ?? '')),
+          })
+        } else {
+          const mem = topicsCacheRef.current.get(currentKey)
+          if (mem) { setUserTopicsResult(mem.result); setUserTopicsVisible(true) }
+        }
+      })
+      .catch(() => null)
+
+    // Restore emotion — try IndexedDB, then in-memory cache, then stored DB rows
+    const emotionFilteredUuids = userMsgs
+      .filter(m => {
+        const d = m.date?.slice(0, 10) ?? ''
+        if (userDetailDateFrom && d < userDetailDateFrom) return false
+        if (userDetailDateTo && d > userDetailDateTo) return false
+        return true
+      })
+      .map(m => m.msg_uuid ?? '')
+      .filter(Boolean)
+    const emotionKey = makeEmotionKey(selectedUser.username, userDetailDateFrom, userDetailDateTo)
+    checkEmotionCompleted(emotionKey)
+      .then(async completed => {
+        if (completed) {
+          const emotionMap = await getEmotionMessages(emotionFilteredUuids)
+          if (emotionMap.size > 0) {
+            const perMessage = emotionFilteredUuids
+              .map(uuid => emotionMap.get(uuid))
+              .filter((v): v is NonNullable<typeof v> => !!v)
+            const result = buildEmotionResult(perMessage)
+            setUserEmotionResult(result)
+            emotionCacheRef.current.set(currentKey, { result, uuids: new Set(emotionMap.keys()) })
+            return
+          }
+        }
+        const mem = emotionCacheRef.current.get(currentKey)
+        if (mem) {
+          setUserEmotionResult(mem.result)
+        } else {
+          const dateByUuid = new Map(userMsgs.map(m => [m.msg_uuid ?? '', m.date ?? '']))
+          const dbResult = await fetchStoredEmotionFromDB(emotionFilteredUuids, dateByUuid, emotionFilteredUuids.length)
+          if (dbResult) {
+            setUserEmotionResult(dbResult)
+            emotionCacheRef.current.set(currentKey, { result: dbResult, uuids: new Set(emotionFilteredUuids) })
+          }
+        }
+      })
+      .catch(() => null)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedUser?.username, userDetailDateFrom, userDetailDateTo])
+
   const userDetailStats = useMemo(() => {
     if (userDetailFiltered.length === 0) return null
     const dates = userDetailFiltered.map(m => m.date?.slice(0, 19) ?? '').filter(Boolean).sort()
@@ -1577,6 +2131,14 @@ export default function SearchPage() {
   }, [heatmapCell, topicMessages])
 
   const openUserDetail = async (u: UserInRange) => {
+    // Capture filter values before state updates so we can build the cache key
+    const initialTopicsKey = makeBertopicKey(u.username, dateFrom, dateTo, scopeParam)
+    const initialAnalysisKey = makeAnalysisKey(u.username, dateFrom, dateTo)
+    openedWithKeyRef.current = initialAnalysisKey
+    // Mark as loaded so the route effect doesn't double-fetch when the URL changes
+    routeLoadedRef.current = u.username
+    navigate(`/discord/users/${encodeURIComponent(u.username)}`)
+
     setSelectedUser(u)
     setUserMsgsLoading(true)
     setUserMsgs([])
@@ -1588,22 +2150,101 @@ export default function SearchPage() {
     setUserSumVisible(false)
     setUserSumFollowUp([])
     setUserDetailPage(0)
-    const cachedTopics = topicsCacheRef.current.get(u.username)
-    setUserTopicsResult(cachedTopics?.result ?? null)
-    setUserTopicsVisible(!!cachedTopics)
+    setUserTopicsResult(null)
+    setUserTopicsVisible(false)
     setUserTopicsSteps([])
-    setUserEmotionResult(emotionCacheRef.current.get(u.username)?.result ?? null)
+    setUserEmotionResult(null)
     setEmotionMsgFilter(null)
     setSelectedTopicIds(null)
     setHeatmapCell(null)
+    setDropoutSubTab('cross')
+    setCrossPhaseNarrative(null)
+    setNarrativeLoading(false)
+    setUserPersonas({})
+    setPersonaClassifying(new Set())
     setStrategyResult(null)
     setStrategyError(null)
     setExpandedStrategyIds(new Set())
     try {
-      const userMsgParams = new URLSearchParams({ username: u.username, limit: '10000' })
+      const userMsgParams = new URLSearchParams({ username: u.username, limit: '1000000' })
       if (scopeParam) userMsgParams.set('upload_ids', scopeParam)
-      const data = await apiFetch<Message[]>(`/search/user-messages?${userMsgParams}`)
+
+      // Fetch messages, BERTopic cache, and saved personas in parallel
+      const [data, cachedTopics, savedPersonas] = await Promise.all([
+        apiFetch<Message[]>(`/search/user-messages?${userMsgParams}`),
+        getBertopicResult(initialTopicsKey).catch(() => null),
+        apiFetch<{ phase: string; method: string; persona: string; confidence: number; reasoning: string; created_at: string }[]>(
+          `/persona/user/${encodeURIComponent(u.username)}`
+        ).catch(() => [] as { phase: string; method: string; persona: string; confidence: number; reasoning: string; created_at: string }[]),
+      ])
+      // Organize saved personas into per-phase map
+      if (savedPersonas.length > 0) {
+        const personaMap: UserPersonas = {}
+        for (const p of savedPersonas) {
+          if (!personaMap[p.phase]) personaMap[p.phase] = {}
+          personaMap[p.phase][p.method as 'rule_based' | 'llm'] = {
+            persona: p.persona, confidence: p.confidence, reasoning: p.reasoning, created_at: p.created_at,
+          }
+        }
+        setUserPersonas(personaMap)
+      }
       setUserMsgs(data)
+
+      // Restore BERTopic from IndexedDB
+      if (cachedTopics) {
+        setUserTopicsResult(cachedTopics)
+        setUserTopicsVisible(true)
+        topicsCacheRef.current.set(initialAnalysisKey, {
+          result: cachedTopics,
+          uuids: new Set(data.map(m => m.msg_uuid ?? '')),
+        })
+      } else {
+        // Fall back to in-memory cache (same session, different user navigation)
+        const mem = topicsCacheRef.current.get(initialAnalysisKey)
+        if (mem) {
+          setUserTopicsResult(mem.result)
+          setUserTopicsVisible(true)
+        }
+      }
+
+      // Restore emotion — try IndexedDB, then in-memory cache, then stored DB rows
+      const emotionFilteredUuids = data
+        .filter(m => {
+          const d = m.date?.slice(0, 10) ?? ''
+          if (dateFrom && d < dateFrom) return false
+          if (dateTo && d > dateTo) return false
+          return true
+        })
+        .map(m => m.msg_uuid ?? '')
+        .filter(Boolean)
+      const emotionKey = makeEmotionKey(u.username, dateFrom, dateTo)
+      const emotionCompleted = await checkEmotionCompleted(emotionKey).catch(() => false)
+      let emotionLoaded = false
+      if (emotionCompleted) {
+        const emotionMap = await getEmotionMessages(emotionFilteredUuids).catch(() => new Map())
+        if (emotionMap.size > 0) {
+          const perMessage = emotionFilteredUuids
+            .map(uuid => emotionMap.get(uuid))
+            .filter((v): v is NonNullable<typeof v> => !!v)
+          const result = buildEmotionResult(perMessage)
+          setUserEmotionResult(result)
+          emotionCacheRef.current.set(initialAnalysisKey, { result, uuids: new Set([...emotionMap.keys()]) })
+          emotionLoaded = true
+        }
+      }
+      if (!emotionLoaded) {
+        const mem = emotionCacheRef.current.get(initialAnalysisKey)
+        if (mem) {
+          setUserEmotionResult(mem.result)
+        } else {
+          const dateByUuid = new Map(data.map(m => [m.msg_uuid ?? '', m.date ?? '']))
+          const dbResult = await fetchStoredEmotionFromDB(emotionFilteredUuids, dateByUuid, emotionFilteredUuids.length)
+          if (dbResult) {
+            setUserEmotionResult(dbResult)
+            emotionCacheRef.current.set(initialAnalysisKey, { result: dbResult, uuids: new Set(emotionFilteredUuids) })
+          }
+        }
+      }
     } finally {
       setUserMsgsLoading(false)
     }
@@ -1633,7 +2274,8 @@ export default function SearchPage() {
 
   const runUserTopics = (mode: 'all' | 'remaining' = 'all') => {
     if (!selectedUser) return
-    const cached = topicsCacheRef.current.get(selectedUser.username)
+    const topicsAnalysisKey = makeAnalysisKey(selectedUser.username, userDetailDateFrom, userDetailDateTo)
+    const cached = topicsCacheRef.current.get(topicsAnalysisKey)
     const msgs = mode === 'remaining' && cached
       ? userDetailFiltered.filter(m => !cached.uuids.has(m.msg_uuid ?? ''))
       : userDetailFiltered
@@ -1654,6 +2296,7 @@ export default function SearchPage() {
     const docs = msgs.map(m => m.content)
     const msg_uuids = msgs.map(m => m.msg_uuid ?? '')
     const username = selectedUser.username
+    const topicsKey = makeBertopicKey(username, userDetailDateFrom, userDetailDateTo, scopeParam)
     topicsStopRef.current = streamEvents(
       '/user-topics/stream',
       { docs, msg_uuids },
@@ -1664,9 +2307,10 @@ export default function SearchPage() {
         if (stage === 'complete' && event.result) {
           const result = event.result as UserTopicsResult
           setUserTopicsResult(result)
-          // Mark all current filtered msgs as analyzed (old + new)
           const allUuids = new Set(userDetailFiltered.map(m => m.msg_uuid ?? ''))
-          topicsCacheRef.current.set(username, { result, uuids: allUuids })
+          topicsCacheRef.current.set(topicsAnalysisKey, { result, uuids: allUuids })
+          // Persist to IndexedDB
+          saveBertopicResult(topicsKey, result).catch(console.error)
         }
         setUserTopicsSteps(prev =>
           prev.map(s => s.stage === stage ? { ...s, status: status as TopicPipelineStep['status'], message } : s)
@@ -1685,7 +2329,8 @@ export default function SearchPage() {
 
   const runUserEmotion = async (mode: 'all' | 'remaining' = 'all') => {
     if (userDetailFiltered.length === 0 || !selectedUser) return
-    const cached = emotionCacheRef.current.get(selectedUser.username)
+    const emotionAnalysisKey = makeAnalysisKey(selectedUser.username, userDetailDateFrom, userDetailDateTo)
+    const cached = emotionCacheRef.current.get(emotionAnalysisKey)
     const msgs = mode === 'remaining' && cached
       ? userDetailFiltered.filter(m => !cached.uuids.has(m.msg_uuid ?? ''))
       : userDetailFiltered
@@ -1710,13 +2355,305 @@ export default function SearchPage() {
         finalResult = mergeEmotionResults(cached.result, result)
       }
       const allUuids = new Set(userDetailFiltered.map(m => m.msg_uuid ?? ''))
-      emotionCacheRef.current.set(username, { result: finalResult, uuids: allUuids })
+      emotionCacheRef.current.set(emotionAnalysisKey, { result: finalResult, uuids: allUuids })
       setUserEmotionResult(finalResult)
+      // Persist per-message results and mark this username|dateFrom|dateTo as completed
+      const emotionKey = makeEmotionKey(selectedUser.username, userDetailDateFrom, userDetailDateTo)
+      saveEmotionMessages(result.per_message).catch(console.error)
+      markEmotionCompleted(emotionKey).catch(console.error)
     } catch (err) {
       console.error('Emotion analysis failed:', err)
     } finally {
       setUserEmotionLoading(false)
     }
+  }
+
+  const classifyPersona = async (
+    phaseKey: string,
+    phaseLabel: string,
+    features: {
+      msg_count: number; avg_words: number; pct_weeks: number; weeks_active: number
+      dropout_status: string | null
+      sentiment_positive: number | null; sentiment_negative: number | null; sentiment_neutral: number | null
+      top_emotions: string[] | null; top_topics: string[] | null
+    },
+    sampleMessages: { content: string; date: string }[],
+    methods: ('rule_based' | 'llm')[],
+  ) => {
+    if (!selectedUser) return
+    const key = `${phaseKey}:${methods.join(',')}`
+    setPersonaClassifying(prev => new Set([...prev, key]))
+    try {
+      const result = await apiFetch<{
+        rule_based?: PersonaResult; llm?: PersonaResult
+      }>('/persona/classify', {
+        method: 'POST',
+        body: JSON.stringify({
+          username: selectedUser.username,
+          phase: phaseKey,
+          phase_label: phaseLabel,
+          features,
+          sample_messages: sampleMessages.slice(0, 15),
+          methods,
+        }),
+      })
+      setUserPersonas(prev => {
+        const next = { ...prev, [phaseKey]: { ...(prev[phaseKey] ?? {}) } }
+        if (result.rule_based) next[phaseKey].rule_based = result.rule_based
+        if (result.llm) next[phaseKey].llm = result.llm
+        return next
+      })
+    } catch (err) {
+      console.error('Persona classification failed:', err)
+    } finally {
+      setPersonaClassifying(prev => {
+        const next = new Set(prev); next.delete(key); return next
+      })
+    }
+  }
+
+  const batchClassifyPersonas = async (method: 'rule_based' | 'llm') => {
+    if (batchPersonaClassifying || filteredUsers.length === 0) return
+    // Determine the phase key from the current filter dates
+    const matched = PHASE_DEFS.find(def =>
+      def.from === filterStartDate && (def.to === filterEndDate || (!def.to && !filterEndDate))
+    )
+    const phaseKey   = matched ? matched.key   : `custom|${filterStartDate || 'start'}|${filterEndDate || 'end'}`
+    const phaseLabel = matched ? matched.label : `${filterStartDate || 'start'} → ${filterEndDate || 'present'}`
+
+    setBatchPersonaClassifying(true)
+    setBatchPersonaProgress({ done: 0, total: filteredUsers.length, errors: 0 })
+    let errors = 0
+
+    for (let i = 0; i < filteredUsers.length; i++) {
+      const u = filteredUsers[i]
+      const di = dropoutMap.get(u.username)
+      try {
+        let sampleMessages: { content: string; date: string }[] = []
+        if (method === 'llm') {
+          const params = new URLSearchParams({ username: u.username, limit: '20' })
+          if (scopeParam) params.set('upload_ids', scopeParam)
+          if (filterStartDate) params.set('date_from', filterStartDate)
+          if (filterEndDate) params.set('date_to', filterEndDate)
+          const msgs = await apiFetch<Message[]>(`/search/user-messages?${params}`).catch(() => [] as Message[])
+          sampleMessages = msgs.slice(-15).map(m => ({ content: m.content, date: m.date ?? '' }))
+        }
+        await apiFetch('/persona/classify', {
+          method: 'POST',
+          body: JSON.stringify({
+            username: u.username,
+            phase: phaseKey,
+            phase_label: phaseLabel,
+            features: {
+              msg_count: u.total_messages,
+              avg_words: u.avg_words ?? 0,
+              pct_weeks: u.pct_weeks ?? 0,
+              weeks_active: u.weeks_active ?? 0,
+              dropout_status: di?.level ?? null,
+              sentiment_positive: null,
+              sentiment_negative: null,
+              sentiment_neutral: null,
+              top_emotions: null,
+              top_topics: null,
+            },
+            sample_messages: sampleMessages,
+            methods: [method],
+          }),
+        })
+      } catch {
+        errors++
+      }
+      setBatchPersonaProgress({ done: i + 1, total: filteredUsers.length, errors })
+    }
+
+    setBatchPersonaClassifying(false)
+    // Refresh aggregate summary so Persona tab updates
+    apiFetch<typeof personaSummary>('/persona/phase-summary')
+      .then(d => setPersonaSummary(d))
+      .catch(() => {})
+    // Refresh table persona columns
+    apiFetch<{ username: string; method: string; persona: string; confidence: number; reasoning: string; created_at?: string }[]>(
+      `/persona/by-phase?phase=${encodeURIComponent(phaseKey)}`
+    )
+      .then(rows => {
+        const map: Record<string, { rule_based?: PersonaResult; llm?: PersonaResult }> = {}
+        for (const r of rows) {
+          if (!map[r.username]) map[r.username] = {}
+          const pr: PersonaResult = { persona: r.persona, confidence: r.confidence, reasoning: r.reasoning, created_at: r.created_at }
+          if (r.method === 'rule_based') map[r.username].rule_based = pr
+          else if (r.method === 'llm') map[r.username].llm = pr
+        }
+        setTablePersonas(map)
+      })
+      .catch(() => {})
+  }
+
+  const SENTIMENT_CONCURRENCY = 5 // users analyzed in parallel via SSE
+
+  const runBatchSentimentForUsers = async (
+    usernames: string[],
+    dateFrom?: string,
+    dateTo?: string,
+    uploadIds?: string,
+    analyzeNewOnly = false,
+  ) => {
+    if (usernames.length === 0) return
+    setBatchSentimentRunning(true)
+    // For "all": clear only the specific users being re-analyzed so other filter tabs
+    // (e.g. Med engagement) retain their previously loaded sentiment while this batch runs.
+    if (!analyzeNewOnly) setTableSentiments(prev => {
+      const next = { ...prev }
+      for (const u of usernames) delete next[u]
+      return next
+    })
+    // Fire the exact-count query IN PARALLEL with the SSE streams so we don't
+    // block the AI service on a 1-5s COUNT(*) before any inference can start.
+    // While in flight the progress bar shows just "X msgs" (no denominator —
+    // see the `totalMsgs > 0` guard in the render).  As soon as COUNT returns
+    // (usually well before the first user finishes) the denominator snaps in.
+    setSentimentProgress({ msgs: 0, totalMsgs: 0, users: 0, totalUsers: usernames.length })
+    const countBody: Record<string, unknown> = { usernames }
+    if (dateFrom) countBody.date_from = dateFrom
+    if (dateTo) countBody.date_to = dateTo
+    if (uploadIds) countBody.upload_ids = uploadIds
+    if (analyzeNewOnly) countBody.analyze_new_only = true
+    apiFetch<{ count: number }>(
+      '/search/sentiment-count',
+      { method: 'POST', body: JSON.stringify(countBody) },
+    )
+      .then(({ count }) => {
+        setSentimentProgress(prev => prev ? { ...prev, totalMsgs: count } : null)
+      })
+      .catch(() => { /* count is best-effort; bar just runs without denominator */ })
+
+    // Wrap a single-user SSE stream in a Promise so we can await it.
+    const analyzeOneUser = (username: string): Promise<void> =>
+      new Promise((resolve, reject) => {
+        const body: Record<string, unknown> = { usernames: [username] }
+        if (dateFrom) body.date_from = dateFrom
+        if (dateTo) body.date_to = dateTo
+        if (uploadIds) body.upload_ids = uploadIds
+        if (analyzeNewOnly) body.analyze_new_only = true
+
+        streamEvents(
+          '/search/batch-sentiment-stream',
+          body,
+          (event) => {
+            const ev = event as Record<string, unknown>
+            if (ev.type === 'progress') {
+              const delta = (ev.delta as number) ?? 0
+              setSentimentProgress(prev => prev ? { ...prev, msgs: prev.msgs + delta } : null)
+            } else if (ev.type === 'user') {
+              const result = ev.result as TableSentiment
+              setTableSentiments(prev => ({ ...prev, [ev.username as string]: result }))
+              setSentimentProgress(prev => prev ? {
+                ...prev,
+                users: prev.users + 1,
+                totalUsers: usernames.length,
+              } : null)
+            }
+          },
+          () => resolve(),
+          (err) => reject(err),
+        )
+      })
+
+    try {
+      // Process SENTIMENT_CONCURRENCY users at a time in parallel.
+      // Each SSE stream emits real-time progress events and a per-user result.
+      for (let i = 0; i < usernames.length; i += SENTIMENT_CONCURRENCY) {
+        const window = usernames.slice(i, i + SENTIMENT_CONCURRENCY)
+        await Promise.all(window.map(analyzeOneUser))
+      }
+      // After "new only" analysis, reload combined totals from DB for the analyzed users.
+      // Use a merge (not replace) so other engagement tabs keep their sentiment data.
+      if (analyzeNewOnly && usernames.length > 0) {
+        const sentBody: Record<string, unknown> = { usernames }
+        if (dateFrom) sentBody.date_from = dateFrom
+        if (dateTo) sentBody.date_to = dateTo
+        if (uploadIds) sentBody.upload_ids = uploadIds
+        apiFetch<{ results: (TableSentiment & { username: string })[] }>(
+          '/search/stored-sentiment',
+          { method: 'POST', body: JSON.stringify(sentBody) }
+        ).then(sentData => {
+          setTableSentiments(prev => {
+            const next = { ...prev }
+            for (const { username, ...rest } of sentData.results)
+              if ((rest as TableSentiment).analyzed > 0) next[username] = rest as TableSentiment
+            return next
+          })
+        }).catch(() => {})
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Sentiment analysis failed')
+    } finally {
+      setBatchSentimentRunning(false)
+      setSentimentProgress(null)
+      const detailUuids = userMsgs.map(m => m.msg_uuid).filter((u): u is string => !!u)
+      if (detailUuids.length > 0) {
+        apiFetch<Record<string, MsgEmotion>>('/messages/emotions', {
+          method: 'POST',
+          body: JSON.stringify({ msg_uuids: detailUuids }),
+        }).then(data => setMsgEmotions(prev => ({ ...prev, ...data }))).catch(() => {})
+      }
+    }
+  }
+
+  const runBatchSentimentAll = () => {
+    runBatchSentimentForUsers(filteredUsers.map(u => u.username), filterStartDate, filterEndDate, scopeParam, false)
+  }
+
+  const runBatchSentimentNew = () => {
+    runBatchSentimentForUsers(filteredUsers.map(u => u.username), filterStartDate, filterEndDate, scopeParam, true)
+  }
+
+  const runBatchTopicForUsers = async (analyzeNewOnly: boolean) => {
+    if (batchTopicRunning || filteredUsers.length === 0) return
+    setBatchTopicRunning(true)
+    setBatchTopicProgress({ done: 0, total: filteredUsers.length, errors: 0 })
+    let errors = 0
+
+    for (let i = 0; i < filteredUsers.length; i++) {
+      const u = filteredUsers[i]
+      const topicsKey = makeBertopicKey(u.username, filterStartDate, filterEndDate, scopeParam)
+      try {
+        let skip = false
+        if (analyzeNewOnly) {
+          const existing = await getBertopicResult(topicsKey)
+          if (existing) skip = true
+        }
+        if (!skip) {
+          const params = new URLSearchParams({ username: u.username, limit: '1000000' })
+          if (scopeParam) params.set('upload_ids', scopeParam)
+          if (filterStartDate) params.set('date_from', filterStartDate)
+          if (filterEndDate) params.set('date_to', filterEndDate)
+          const msgs = await apiFetch<Message[]>(`/search/user-messages?${params}`).catch(() => [] as Message[])
+          if (msgs.length > 0) {
+            await new Promise<void>((resolve) => {
+              streamEvents(
+                '/user-topics/stream',
+                { docs: msgs.map(m => m.content), msg_uuids: msgs.map(m => m.msg_uuid ?? '') },
+                (event) => {
+                  if (event.stage === 'complete' && event.result) {
+                    const result = event.result as UserTopicsResult
+                    saveBertopicResult(topicsKey, result).catch(console.error)
+                    setTableTopics(prev => ({ ...prev, [u.username]: result }))
+                  }
+                },
+                () => resolve(),
+                () => { errors++; resolve() },
+              )
+            })
+          }
+        }
+      } catch {
+        errors++
+      }
+      setBatchTopicProgress({ done: i + 1, total: filteredUsers.length, errors })
+    }
+
+    setBatchTopicRunning(false)
+    setBatchTopicProgress(null)
   }
 
   const runUserSumFollowUp = () => {
@@ -1784,10 +2721,13 @@ export default function SearchPage() {
     const visibleMsgs = userDetailFiltered.slice(userDetailPage * PAGE_SIZE, (userDetailPage + 1) * PAGE_SIZE)
     return (
       <div className="max-w-5xl mx-auto px-3 sm:px-4 py-4 space-y-4">
-        {/* Header bar */}
-        <div className="bg-indigo-700 text-white rounded-2xl shadow px-4 py-3 flex items-center gap-3">
+        {/* Header bar — sticky floating */}
+        <div className="sticky top-4 z-20 bg-indigo-700 text-white rounded-2xl shadow-xl px-4 py-3 flex items-center gap-3">
           <button
-            onClick={() => setSelectedUser(null)}
+            onClick={() => {
+              setSelectedUser(null)
+              if (routeUsername) navigate(-1)
+            }}
             className="flex items-center gap-1.5 text-sm font-semibold text-indigo-200 hover:text-white transition-colors"
           >
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
@@ -1797,16 +2737,16 @@ export default function SearchPage() {
           {(() => {
             const di = dropoutMap.get(u.username)
             if (!di) return null
-            const badge: Record<DropoutStatus, { label: string; cls: string }> = {
-              active:    { label: 'Active',   cls: 'bg-emerald-500 text-white' },
-              dropout:   { label: di.tier ? `Dropout · ${di.tier}` : 'Dropout', cls: 'bg-rose-500 text-white' },
-              transient: { label: 'Transient', cls: 'bg-amber-500 text-white' },
+            const badge: Record<EngagementLevel, { label: string; cls: string }> = {
+              high:   { label: 'High Eng.',  cls: 'bg-emerald-500 text-white' },
+              medium: { label: 'Med Eng.',   cls: 'bg-sky-500 text-white' },
+              low:    { label: 'Low Eng.',   cls: 'bg-amber-500 text-white' },
             }
-            const b = badge[di.status]
+            const b = badge[di.level]
             return (
               <span
                 className={`shrink-0 text-xs font-bold px-2.5 py-1 rounded-full ${b.cls}`}
-                title={di.silenceDays < 9999 ? `${di.silenceDays} days silent before filter end` : undefined}
+                title={`${di.pctWeeks}% of weeks active`}
               >
                 {b.label}
               </span>
@@ -1862,7 +2802,61 @@ export default function SearchPage() {
               />
             </div>
             <span className="text-sm text-gray-500 pb-1">{userDetailFiltered.length.toLocaleString()} results</span>
+            {(userDetailDateFrom || userDetailDateTo || userDetailContains.trim() || userDetailMinWords > 0) && (
+              <button
+                onClick={() => { setUserDetailDateFrom(''); setUserDetailDateTo(''); setUserDetailContains(''); setUserDetailMinWords(0) }}
+                className="text-xs text-gray-400 hover:text-gray-700 pb-1 flex items-center gap-1"
+              >
+                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                Clear all
+              </button>
+            )}
           </div>
+
+          {/* Phase date shortcuts */}
+          {(() => {
+            type PhaseKey = '1' | '2' | '3' | '3a' | '3b' | '3c' | '3d'
+            const activePhase: PhaseKey | null =
+              userDetailDateFrom === '2023-04-01' && userDetailDateTo === '2023-07-18' ? '1' :
+              userDetailDateFrom === '2023-07-19' && userDetailDateTo === '2023-09-05' ? '2' :
+              userDetailDateFrom === '2023-09-06' && userDetailDateTo === '' ? '3' :
+              userDetailDateFrom === '2023-09-06' && userDetailDateTo === '2023-12-18' ? '3a' :
+              userDetailDateFrom === '2023-12-18' && userDetailDateTo === '2024-03-17' ? '3b' :
+              userDetailDateFrom === '2024-03-17' && userDetailDateTo === '2024-05-16' ? '3c' :
+              userDetailDateFrom === '2024-05-17' && userDetailDateTo === '' ? '3d' : null
+            const applyPhase = (p: PhaseKey) => {
+              if (activePhase === p) { setUserDetailDateFrom(''); setUserDetailDateTo(''); return }
+              if (p === '1')  { setUserDetailDateFrom('2023-04-01'); setUserDetailDateTo('2023-07-18') }
+              else if (p === '2')  { setUserDetailDateFrom('2023-07-19'); setUserDetailDateTo('2023-09-05') }
+              else if (p === '3')  { setUserDetailDateFrom('2023-09-06'); setUserDetailDateTo('') }
+              else if (p === '3a') { setUserDetailDateFrom('2023-09-06'); setUserDetailDateTo('2023-12-18') }
+              else if (p === '3b') { setUserDetailDateFrom('2023-12-18'); setUserDetailDateTo('2024-03-17') }
+              else if (p === '3c') { setUserDetailDateFrom('2024-03-17'); setUserDetailDateTo('2024-05-16') }
+              else if (p === '3d') { setUserDetailDateFrom('2024-05-17'); setUserDetailDateTo('') }
+            }
+            return (
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                <span className="filter-label self-center shrink-0">Phase</span>
+                {([
+                  { key: '1',  label: 'Phase 1 — Capability Surfacing',  dates: 'Apr–18 Jul 2023',        cls: ['border-blue-400 bg-blue-100 text-blue-800',   'border-blue-300 text-blue-700 hover:bg-blue-50']   },
+                  { key: '2',  label: 'Phase 2 — Enclosure & Scrutiny',  dates: '19 Jul–5 Sep 2023',      cls: ['border-amber-400 bg-amber-100 text-amber-800', 'border-amber-300 text-amber-700 hover:bg-amber-50'] },
+                  { key: '3',  label: 'Phase 3 — Commercialization',     dates: 'Sep 2023 onward',        cls: ['border-emerald-400 bg-emerald-100 text-emerald-800', 'border-emerald-300 text-emerald-700 hover:bg-emerald-50'] },
+                  { key: '3a', label: 'Phase 3A — Early Commercialization', dates: '6 Sep–18 Dec 2023',   cls: ['border-violet-400 bg-violet-100 text-violet-800', 'border-violet-300 text-violet-700 hover:bg-violet-50'] },
+                  { key: '3b', label: 'Phase 3B — Early Wide Adoption',  dates: '18 Dec 2023–17 Mar 2024', cls: ['border-sky-400 bg-sky-100 text-sky-800',       'border-sky-300 text-sky-700 hover:bg-sky-50']     },
+                  { key: '3c', label: 'Phase 3C — Pre-Litigation',       dates: '17 Mar–16 May 2024',     cls: ['border-orange-400 bg-orange-100 text-orange-800', 'border-orange-300 text-orange-700 hover:bg-orange-50'] },
+                  { key: '3d', label: 'Phase 3D — Warning & Lawsuit',    dates: '17 May 2024 onward',     cls: ['border-rose-400 bg-rose-100 text-rose-800',   'border-rose-300 text-rose-700 hover:bg-rose-50']   },
+                ] as { key: PhaseKey; label: string; dates: string; cls: [string, string] }[]).map(({ key, label, dates, cls }) => (
+                  <button
+                    key={key}
+                    onClick={() => applyPhase(key)}
+                    className={`text-xs px-2.5 py-1 rounded-full border transition-colors font-medium ${activePhase === key ? cls[0] + ' font-semibold' : cls[1]}`}
+                  >
+                    {label} <span className="opacity-60 ml-1">{dates}</span>
+                  </button>
+                ))}
+              </div>
+            )
+          })()}
 
           <div className="mt-3 pt-3 border-t flex flex-wrap gap-x-4 gap-y-2 items-center text-sm text-gray-700">
             <span className="font-semibold text-gray-800">CONTEXT WINDOW</span>
@@ -1894,8 +2888,19 @@ export default function SearchPage() {
             </div>
             <div className="flex flex-wrap rounded-lg overflow-hidden border border-gray-200 text-[11px] font-semibold">
               <button
-                onClick={() => setUserAnalysisTab('topics')}
+                onClick={() => setUserAnalysisTab('dropout')}
                 className={`px-3 py-1.5 flex items-center gap-1.5 transition-colors ${
+                  userAnalysisTab === 'dropout' ? 'bg-rose-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'
+                }`}
+              >
+                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                </svg>
+                Phase Summary
+              </button>
+              <button
+                onClick={() => setUserAnalysisTab('topics')}
+                className={`px-3 py-1.5 flex items-center gap-1.5 transition-colors border-l border-gray-200 ${
                   userAnalysisTab === 'topics' ? 'bg-violet-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'
                 }`}
               >
@@ -1927,17 +2932,6 @@ export default function SearchPage() {
                 Timeline
               </button>
               <button
-                onClick={() => setUserAnalysisTab('dropout')}
-                className={`px-3 py-1.5 flex items-center gap-1.5 transition-colors border-l border-gray-200 ${
-                  userAnalysisTab === 'dropout' ? 'bg-rose-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'
-                }`}
-              >
-                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
-                </svg>
-                Dropout
-              </button>
-              <button
                 onClick={() => setUserAnalysisTab('strategy')}
                 className={`px-3 py-1.5 flex items-center gap-1.5 transition-colors border-l border-gray-200 ${
                   userAnalysisTab === 'strategy' ? 'bg-sky-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'
@@ -1947,6 +2941,26 @@ export default function SearchPage() {
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
                 </svg>
                 Reactions
+              </button>
+              <button
+                onClick={() => {
+                  setUserAnalysisTab('persona')
+                  if (personaSummary.length === 0 && !personaSummaryLoading) {
+                    setPersonaSummaryLoading(true)
+                    apiFetch<typeof personaSummary>('/persona/phase-summary')
+                      .then(d => setPersonaSummary(d))
+                      .catch(() => {})
+                      .finally(() => setPersonaSummaryLoading(false))
+                  }
+                }}
+                className={`px-3 py-1.5 flex items-center gap-1.5 transition-colors border-l border-gray-200 ${
+                  userAnalysisTab === 'persona' ? 'bg-emerald-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'
+                }`}
+              >
+                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z" />
+                </svg>
+                Persona
               </button>
               <button
                 onClick={() => setUserAnalysisTab('summary')}
@@ -2298,6 +3312,184 @@ export default function SearchPage() {
           </div>
         )}
 
+          {userAnalysisTab === 'persona' && (() => {
+            const PERSONA_COLORS: Record<string, string> = {
+              'Power Technical User':           'bg-blue-100 text-blue-800 border-blue-300',
+              'Community Mentor':               'bg-emerald-100 text-emerald-800 border-emerald-300',
+              'Community Moderator and Mentor': 'bg-teal-100 text-teal-800 border-teal-300',
+              'Scrutinizer':                    'bg-rose-100 text-rose-800 border-rose-300',
+              'Help-Seeker':                    'bg-amber-100 text-amber-800 border-amber-300',
+              'Casual Explorer':                'bg-gray-100 text-gray-700 border-gray-300',
+            }
+            const PersonaChip = ({ persona }: { persona: string }) => (
+              <span className={`inline-block text-[9px] font-semibold px-1.5 py-0.5 rounded border ${PERSONA_COLORS[persona] ?? 'bg-gray-100 text-gray-600 border-gray-300'}`}>
+                {persona}
+              </span>
+            )
+
+            // This user's persona across phases
+            const hasAnyPersona = Object.values(userPersonas).some(p => p.rule_based || p.llm)
+
+            // Aggregate summary — split by method
+            const summaryByPhase: Record<string, { rule_based: Record<string, number>; llm: Record<string, number> }> = {}
+            for (const row of personaSummary) {
+              if (!summaryByPhase[row.phase]) summaryByPhase[row.phase] = { rule_based: {}, llm: {} }
+              const m = row.method === 'rule_based' ? 'rule_based' : 'llm'
+              summaryByPhase[row.phase][m][row.persona] = (summaryByPhase[row.phase][m][row.persona] ?? 0) + row.count
+            }
+
+            return (
+              <div className="border-t border-gray-100 px-4 pb-4 pt-3 space-y-5">
+                {/* This user's personas */}
+                <div>
+                  <p className="text-[11px] font-semibold text-gray-500 uppercase tracking-wide mb-2">This User's Persona Per Phase</p>
+                  {!hasAnyPersona ? (
+                    <p className="text-[11px] text-gray-400">
+                      No personas classified yet. Go to <button onClick={() => { setUserAnalysisTab('dropout'); setDropoutSubTab('phases') }}
+                        className="text-indigo-600 hover:underline">Dropout → Per Phase</button> and click ⚡ or 🤖 to classify.
+                    </p>
+                  ) : (
+                    <div className="overflow-x-auto rounded-xl border border-gray-200">
+                      <table className="w-full text-xs border-collapse">
+                        <thead>
+                          <tr className="bg-gray-50 border-b border-gray-200">
+                            <th className="text-left px-3 py-2 font-semibold text-gray-600">Phase</th>
+                            <th className="text-center px-3 py-2 font-semibold text-indigo-600">⚡ Rule-Based</th>
+                            <th className="text-center px-3 py-2 font-semibold text-violet-600">🤖 LLM</th>
+                            <th className="text-center px-3 py-2 font-semibold text-gray-400">Agreement</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {PHASE_DEFS.map(def => {
+                            const p = userPersonas[def.key] ?? {}
+                            if (!p.rule_based && !p.llm) return null
+                            const agree = p.rule_based && p.llm && p.rule_based.persona === p.llm.persona
+                            return (
+                              <tr key={def.key} className="border-b border-gray-100 hover:bg-gray-50">
+                                <td className="px-3 py-2">
+                                  <span className={`inline-block px-2 py-0.5 rounded-full text-[10px] font-semibold border ${def.chipCls}`}>{def.label}</span>
+                                </td>
+                                <td className="text-center px-3 py-2">
+                                  {p.rule_based
+                                    ? <span title={p.rule_based.reasoning}><PersonaChip persona={p.rule_based.persona} /></span>
+                                    : <span className="text-[9px] text-gray-300">—</span>}
+                                </td>
+                                <td className="text-center px-3 py-2">
+                                  {p.llm
+                                    ? <span title={p.llm.reasoning}><PersonaChip persona={p.llm.persona} /></span>
+                                    : <span className="text-[9px] text-gray-300">—</span>}
+                                </td>
+                                <td className="text-center px-3 py-2">
+                                  {p.rule_based && p.llm
+                                    ? <span className={`text-[9px] font-semibold ${agree ? 'text-emerald-600' : 'text-amber-600'}`}>
+                                        {agree ? '✓ Match' : '≠ Differ'}
+                                      </span>
+                                    : <span className="text-[9px] text-gray-300">—</span>}
+                                </td>
+                              </tr>
+                            )
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+
+                {/* Phase-level aggregate from DB */}
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <p className="text-[11px] font-semibold text-gray-500 uppercase tracking-wide">Population Persona Distribution (All Classified Users)</p>
+                    <div className="flex items-center gap-2">
+                      <div className="flex rounded-lg overflow-hidden border border-gray-200 text-[10px] font-semibold">
+                        {(['rule_based', 'llm'] as const).map(m => (
+                          <button key={m} onClick={() => setPersonaSummaryMethod(m)}
+                            className={`px-2.5 py-1 transition-colors border-r border-gray-200 last:border-0 ${
+                              personaSummaryMethod === m ? 'bg-gray-800 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'
+                            }`}>
+                            {m === 'rule_based' ? '⚡ Rule' : '🤖 LLM'}
+                          </button>
+                        ))}
+                      </div>
+                      <button
+                        onClick={() => {
+                          setPersonaSummaryLoading(true)
+                          apiFetch<typeof personaSummary>('/persona/phase-summary')
+                            .then(d => setPersonaSummary(d))
+                            .catch(() => {})
+                            .finally(() => setPersonaSummaryLoading(false))
+                        }}
+                        className="text-[10px] px-2 py-1 rounded border border-gray-200 text-gray-500 hover:bg-gray-50 transition-colors"
+                      >↻ Refresh</button>
+                    </div>
+                  </div>
+
+                  {personaSummaryLoading ? (
+                    <div className="flex items-center gap-2 py-4">
+                      <div className="animate-spin w-3 h-3 border-2 border-gray-400 border-t-transparent rounded-full" />
+                      <p className="text-[11px] text-gray-400">Loading…</p>
+                    </div>
+                  ) : personaSummary.length === 0 ? (
+                    <p className="text-[11px] text-gray-400 py-2">No persona classifications saved yet. Classify users via Dropout → Per Phase first.</p>
+                  ) : (() => {
+                    const ALL_PERSONAS = [
+                      'Power Technical User', 'Community Mentor', 'Community Moderator and Mentor',
+                      'Scrutinizer', 'Help-Seeker', 'Casual Explorer',
+                    ]
+                    const phases = PHASE_DEFS.filter(def =>
+                      personaSummary.some(r => r.phase === def.key && r.method === personaSummaryMethod)
+                    )
+                    if (phases.length === 0) return (
+                      <p className="text-[11px] text-gray-400 py-2">No data for {personaSummaryMethod === 'rule_based' ? 'rule-based' : 'LLM'} method yet.</p>
+                    )
+                    return (
+                      <div className="overflow-x-auto rounded-xl border border-gray-200">
+                        <table className="w-full text-xs border-collapse">
+                          <thead>
+                            <tr className="bg-gray-50 border-b border-gray-200">
+                              <th className="text-left px-3 py-2 font-semibold text-gray-600">Phase</th>
+                              {ALL_PERSONAS.map(p => (
+                                <th key={p} className="text-center px-2 py-2 font-semibold text-gray-500 text-[9px] max-w-[80px] whitespace-nowrap">{p}</th>
+                              ))}
+                              <th className="text-right px-3 py-2 font-semibold text-gray-400 text-[9px]">Total</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {phases.map(def => {
+                              const row = summaryByPhase[def.key]?.[personaSummaryMethod] ?? {}
+                              const total = Object.values(row).reduce((s, c) => s + c, 0)
+                              return (
+                                <tr key={def.key} className="border-b border-gray-100 hover:bg-gray-50">
+                                  <td className="px-3 py-2">
+                                    <span className={`inline-block px-2 py-0.5 rounded-full text-[10px] font-semibold border ${def.chipCls}`}>{def.label}</span>
+                                  </td>
+                                  {ALL_PERSONAS.map(p => {
+                                    const count = row[p] ?? 0
+                                    const pct = total > 0 ? Math.round((count / total) * 100) : 0
+                                    return (
+                                      <td key={p} className="text-center px-2 py-2">
+                                        {count > 0 ? (
+                                          <div className="flex flex-col items-center gap-0.5">
+                                            <span className="text-[11px] font-bold text-gray-800">{count}</span>
+                                            <span className="text-[9px] text-gray-400">{pct}%</span>
+                                          </div>
+                                        ) : <span className="text-[9px] text-gray-200">—</span>}
+                                      </td>
+                                    )
+                                  })}
+                                  <td className="text-right px-3 py-2 text-[11px] font-semibold text-gray-500">{total}</td>
+                                </tr>
+                              )
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    )
+                  })()}
+                </div>
+              </div>
+            )
+          })()}
+
           {userAnalysisTab === 'summary' && (
             <div className="border-t border-gray-100 px-4 pb-4 pt-3 space-y-4">
               {/* Controls row */}
@@ -2407,15 +3599,18 @@ export default function SearchPage() {
 
           {userAnalysisTab === 'emotion' && (
             <div className="border-t border-gray-100 px-4 pb-4 pt-3 space-y-4">
+              {!userMsgsLoading && userDetailFiltered.length === 0 ? (
+                <p className="text-sm text-gray-400 text-center py-6">No posts in this view.</p>
+              ) : (<>
               {/* Run button */}
               <div className="flex items-center gap-2 flex-wrap">
                 {!userEmotionResult ? (
-                  <button onClick={() => runUserEmotion('all')} disabled={userEmotionLoading} className="search-btn">
+                  <button onClick={() => runUserEmotion('all')} disabled={userEmotionLoading || userMsgsLoading} className="search-btn">
                     {userEmotionLoading ? 'Analysing…' : 'Run Analysis'}
                   </button>
                 ) : (
                   <>
-                    <button onClick={() => runUserEmotion('all')} disabled={userEmotionLoading} className="search-btn">
+                    <button onClick={() => runUserEmotion('all')} disabled={userEmotionLoading || userMsgsLoading} className="search-btn">
                       {userEmotionLoading ? 'Analysing…' : 'Reanalyze All'}
                     </button>
                     {emotionRemainingCount > 0 && (
@@ -2491,21 +3686,21 @@ export default function SearchPage() {
                   {userEmotionResult.summary.top_emotions.length > 0 && (
                     <div>
                       <div className="flex items-center justify-between mb-2">
-                        <p className="text-[11px] font-semibold text-gray-500 uppercase tracking-wide">Top Emotions (avg score)</p>
+                        <p className="text-[11px] font-semibold text-gray-500 uppercase tracking-wide">Top Emotions (by message count)</p>
                         <span className="text-[10px] text-gray-400">Click a bar to see messages</span>
                       </div>
                       <ResponsiveContainer width="100%" height={220}>
                         <BarChart
                           data={userEmotionResult.summary.top_emotions.slice(0, 8).map(e => ({
                             name: e.label,
-                            value: Math.round(e.score * 100),
+                            value: e.score,
                           }))}
                           layout="vertical"
                           margin={{ left: 12, right: 24, top: 4, bottom: 4 }}
                         >
-                          <XAxis type="number" domain={[0, 100]} tick={{ fontSize: 10 }} tickFormatter={v => `${v}%`} />
+                          <XAxis type="number" allowDecimals={false} tick={{ fontSize: 10 }} />
                           <YAxis type="category" dataKey="name" tick={{ fontSize: 11 }} width={90} />
-                          <Tooltip formatter={(v: number) => [`${v}%`, 'Avg score']} />
+                          <Tooltip formatter={(v: number) => [v, 'Messages']} />
                           <Bar
                             dataKey="value"
                             radius={[0, 3, 3, 0]}
@@ -2602,6 +3797,7 @@ export default function SearchPage() {
               {userEmotionResult && !userEmotionLoading && userEmotionResult.analyzed_messages === 0 && (
                 <p className="text-sm text-gray-400 text-center py-6">No messages with enough content for emotion analysis.</p>
               )}
+              </>)}
             </div>
           )}
 
@@ -2880,27 +4076,113 @@ export default function SearchPage() {
           )}
 
           {userAnalysisTab === 'dropout' && (() => {
-            const dropInfo = selectedUser ? dropoutMap.get(selectedUser.username) : undefined
-            const sc = dropInfo ? STATUS_COLORS[dropInfo.status] : STATUS_COLORS.transient
+            // ── Emotion lookup map from current analysis result ───────────────
+            const emotionPerMsgMap = new Map<string, { sentiment: 'positive'|'negative'|'neutral'; top_emotions: { label: string; score: number }[] }>()
+            if (userEmotionResult) {
+              for (const m of userEmotionResult.per_message) {
+                emotionPerMsgMap.set(m.msg_uuid, { sentiment: m.sentiment, top_emotions: m.top_emotions })
+              }
+            }
 
-            // Weekly activity chart data
+            // ── Per-phase stats computed from ALL messages (not filtered) ─────
+            const allMsgsMaxDate = userMsgs.length > 0
+              ? userMsgs.reduce((mx, m) => (m.date && m.date > mx ? m.date : mx), userMsgs[0].date ?? '').slice(0, 10)
+              : ''
+            const phaseStatuses = PHASE_DEFS.map(def => {
+              const filterEnd = def.to || allMsgsMaxDate
+              const msgs = userMsgs.filter(m => {
+                const d = m.date?.slice(0, 10) ?? ''
+                return d >= def.from && (!filterEnd || d <= filterEnd)
+              })
+              if (msgs.length === 0) return { def, status: 'low' as EngagementLevel, info: null, msgCount: 0 }
+              const dates = msgs.map(m => m.date?.slice(0, 10) ?? '').filter(Boolean).sort()
+              const firstDate = dates[0]
+              const lastDate  = dates[dates.length - 1]
+              const weeksActive = new Set(msgs.map(m => m.date ? mondayKey(m.date) : '').filter(Boolean)).size
+              const avgWords = msgs.reduce((s, m) => s + m.content.split(/\s+/).filter(Boolean).length, 0) / msgs.length
+              const windowDays = Math.max(14, daysBetween(def.from, filterEnd))
+              const pctWeeks   = Math.round((weeksActive / (windowDays / 7)) * 100)
+              const u: UserInRange = {
+                username: selectedUser?.username ?? '',
+                total_messages: msgs.length,
+                first_date: firstDate,
+                last_date: lastDate,
+                avg_words: avgWords,
+                weeks_active: weeksActive,
+                pct_weeks: pctWeeks,
+              }
+              const info = classifyEngagementSingle(u, def.from, filterEnd)
+              return { def, status: info.level, info, msgCount: msgs.length }
+            })
+
+            // ── Cross-phase drop-off detection ────────────────────────────────
+            // A "drop-off" is: a phase where user was active → next phase where user is transient or absent
+            const crossPhaseEvents = phaseStatuses.map((ps, i) => {
+              const prev = i > 0 ? phaseStatuses[i - 1] : null
+              const isDropOff = prev !== null && prev.msgCount > 0 && (ps.msgCount === 0 || (prev.status === 'high' && ps.status !== 'high') || (prev.status === 'medium' && ps.status === 'low'))
+              const isReturn  = prev !== null && ps.msgCount > 0 && ((prev.msgCount === 0 && ps.status !== 'low') || (prev.status === 'low' && (ps.status === 'medium' || ps.status === 'high')) || (prev.status === 'medium' && ps.status === 'high'))
+              return { ...ps, isDropOff, isReturn }
+            })
+            // ── Current-filter stats (existing logic) ─────────────────────────
+            const derivedFirstDate = userDetailFiltered.length > 0
+              ? userDetailFiltered.reduce((mn, m) => (m.date && m.date < mn ? m.date : mn), userDetailFiltered[0].date ?? '').slice(0, 10)
+              : ''
+            const derivedLastDate = userDetailFiltered.length > 0
+              ? userDetailFiltered.reduce((mx, m) => (m.date && m.date > mx ? m.date : mx), userDetailFiltered[0].date ?? '').slice(0, 10)
+              : ''
+            const derivedWeeksActive = new Set(
+              userDetailFiltered.map(m => m.date ? mondayKey(m.date) : '').filter(Boolean)
+            ).size
+            const derivedAvgWords = userDetailFiltered.length > 0
+              ? userDetailFiltered.reduce((s, m) => s + m.content.split(/\s+/).filter(Boolean).length, 0) / userDetailFiltered.length
+              : 0
+            const detailFilterStart = userDetailDateFrom || derivedFirstDate || filterStartDate
+            const detailFilterEnd   = userDetailDateTo   || derivedLastDate  || filterEndDate
+            const detailWindowDays  = (detailFilterStart && detailFilterEnd)
+              ? Math.max(14, daysBetween(detailFilterStart, detailFilterEnd))
+              : windowDays
+            const derivedPctWeeks = detailWindowDays > 0
+              ? Math.round((derivedWeeksActive / (detailWindowDays / 7)) * 100)
+              : 0
+            const derivedUser: UserInRange = {
+              username: selectedUser?.username ?? '',
+              total_messages: userDetailFiltered.length,
+              first_date: derivedFirstDate,
+              last_date: derivedLastDate,
+              avg_words: derivedAvgWords,
+              weeks_active: derivedWeeksActive,
+              pct_weeks: derivedPctWeeks,
+            }
             const weekCounts: Record<string, number> = {}
             for (const m of userDetailFiltered) {
               if (!m.date) continue
-              const d = new Date(m.date)
-              const mon = new Date(d)
-              mon.setDate(d.getDate() - ((d.getDay() + 6) % 7))
-              const key = mon.toISOString().slice(0, 10)
-              weekCounts[key] = (weekCounts[key] || 0) + 1
+              const key = mondayKey(m.date)
+              weekCounts[key] = (weekCounts[key] ?? 0) + 1
             }
-            const weeklyData = Object.entries(weekCounts)
-              .sort(([a], [b]) => a.localeCompare(b))
-              .map(([week, count]) => ({ week, count }))
-
-            // Pre-dropout window: last 30 days of activity
-            const lastDate = selectedUser?.last_date?.slice(0, 10) ?? ''
-            const windowStart = lastDate
-              ? new Date(new Date(lastDate).getTime() - 30 * 86400000).toISOString().slice(0, 10)
+            const rangeEndRaw = detailFilterEnd || derivedLastDate
+            const firstMsgDate = derivedFirstDate
+            const toMonday = (iso: string): Date => {
+              const d = new Date(iso)
+              const diff = (d.getUTCDay() + 6) % 7
+              return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - diff))
+            }
+            const weeklyData: { week: string; count: number }[] = []
+            if (firstMsgDate && rangeEndRaw) {
+              let cur = toMonday(firstMsgDate)
+              const end = toMonday(rangeEndRaw)
+              while (cur <= end) {
+                const key = cur.toISOString().slice(0, 10)
+                weeklyData.push({ week: key, count: weekCounts[key] ?? 0 })
+                cur = new Date(cur.getTime() + 7 * 86400000)
+              }
+            }
+            const dropInfo = (selectedUser && detailFilterEnd)
+              ? classifyEngagementSingle(derivedUser, detailFilterStart, detailFilterEnd)
+              : dropoutMap.get(selectedUser?.username ?? '')
+            const sc = dropInfo ? ENGAGEMENT_COLORS[dropInfo.level] : ENGAGEMENT_COLORS.low
+            const dropoutSilenceDays = deriveThresholds(detailWindowDays).silenceDays
+            const windowStart = derivedLastDate
+              ? new Date(new Date(derivedLastDate).getTime() - dropoutSilenceDays * 86400000).toISOString().slice(0, 10)
               : ''
             const preDropoutMsgs = windowStart
               ? userDetailFiltered.filter(m => (m.date?.slice(0, 10) ?? '') >= windowStart)
@@ -2908,8 +4190,6 @@ export default function SearchPage() {
             const lastMsgs = [...userDetailFiltered]
               .sort((a, b) => (b.date ?? '').localeCompare(a.date ?? ''))
               .slice(0, 10)
-
-            // Sentiment in pre-dropout window (if emotion run)
             const preDropoutSentiment = userEmotionResult
               ? (() => {
                   const preUuids = new Set(preDropoutMsgs.map(m => m.msg_uuid).filter(Boolean))
@@ -2920,8 +4200,6 @@ export default function SearchPage() {
                   return counts
                 })()
               : null
-
-            // Topics in pre-dropout window (if BERTopic run)
             const preDropoutTopics = (userTopicsResult && preDropoutMsgs.length > 0)
               ? (() => {
                   const assignments = userTopicsResult.doc_assignments
@@ -2931,9 +4209,7 @@ export default function SearchPage() {
                     const tid = m.msg_uuid ? assignments[m.msg_uuid] : undefined
                     if (tid !== undefined) tCounts[tid] = (tCounts[tid] || 0) + 1
                   }
-                  return Object.entries(tCounts)
-                    .sort(([, a], [, b]) => b - a)
-                    .slice(0, 5)
+                  return Object.entries(tCounts).sort(([,a],[,b]) => b-a).slice(0,5)
                     .map(([tid, count]) => {
                       const id = Number(tid)
                       const topic = userTopicsResult.topics.find(t => t.id === id)
@@ -2942,184 +4218,665 @@ export default function SearchPage() {
                 })()
               : null
 
+            // ── status badge helper ───────────────────────────────────────────
+            const StatusBadge = ({ status }: { status: EngagementLevel | null }) => {
+              if (!status) return <span className="text-[10px] px-2 py-0.5 rounded-full border bg-gray-100 text-gray-400 border-gray-300">No data</span>
+              const cls = {
+                high:   'bg-emerald-100 text-emerald-700 border-emerald-300',
+                medium: 'bg-sky-100 text-sky-700 border-sky-300',
+                low:    'bg-amber-100 text-amber-700 border-amber-300',
+              }[status]
+              const label = { high: 'High Eng.', medium: 'Med Eng.', low: 'Low Eng.' }[status] ?? status
+              return <span className={`text-[10px] px-2 py-0.5 rounded-full border font-semibold ${cls}`}>{label}</span>
+            }
+
             return (
               <div className="border-t border-gray-100 px-4 pb-4 pt-3 space-y-4">
-                {/* Dropout parameters */}
-                <div className="flex flex-wrap gap-x-4 gap-y-2 items-end text-xs bg-gray-50 rounded-xl px-3 py-2.5 border border-gray-200">
-                  <span className="font-semibold text-gray-600 uppercase tracking-wide text-[10px] self-center">Transient if</span>
-                  <label className="flex items-center gap-1.5">
-                    <span className="text-gray-500">Msg &lt;</span>
-                    <input
-                      type="text" inputMode="numeric"
-                      value={String(dropoutMinMessages)}
-                      onChange={e => setDropoutMinMessages(parseInt(e.target.value.replace(/\D/g, '')) || 1)}
-                      className="w-10 border border-gray-300 rounded px-1 py-0.5 text-center text-gray-800"
-                    />
-                  </label>
-                  <label className="flex items-center gap-1.5">
-                    <span className="text-gray-500">Span &lt;</span>
-                    <input
-                      type="text" inputMode="numeric"
-                      value={String(dropoutMinActiveDays)}
-                      onChange={e => setDropoutMinActiveDays(parseInt(e.target.value.replace(/\D/g, '')) || 1)}
-                      className="w-10 border border-gray-300 rounded px-1 py-0.5 text-center text-gray-800"
-                    />
-                    <span className="text-gray-500">days</span>
-                  </label>
-                  <span className="text-gray-300 self-center">|</span>
-                  <span className="font-semibold text-gray-600 uppercase tracking-wide text-[10px] self-center">Active needs</span>
-                  <label className="flex items-center gap-1.5">
-                    <span className="text-gray-500">Msg ≥</span>
-                    <input
-                      type="text" inputMode="numeric"
-                      value={String(activeMinMessages)}
-                      onChange={e => setActiveMinMessages(parseInt(e.target.value.replace(/\D/g, '')) || 1)}
-                      className="w-10 border border-gray-300 rounded px-1 py-0.5 text-center text-gray-800"
-                    />
-                  </label>
-                  <label className="flex items-center gap-1.5">
-                    <span className="text-gray-500">Weeks ≥</span>
-                    <input
-                      type="text" inputMode="numeric"
-                      value={String(activeMinWeeks)}
-                      onChange={e => setActiveMinWeeks(parseInt(e.target.value.replace(/\D/g, '')) || 1)}
-                      className="w-10 border border-gray-300 rounded px-1 py-0.5 text-center text-gray-800"
-                    />
-                  </label>
-                  <span className="text-gray-300 self-center">|</span>
-                  <span className="font-semibold text-gray-600 uppercase tracking-wide text-[10px] self-center">Dropout if</span>
-                  <label className="flex items-center gap-1.5">
-                    <span className="text-gray-500">Silence ≥</span>
-                    <input
-                      type="text" inputMode="numeric"
-                      value={String(dropoutSilenceDays)}
-                      onChange={e => setDropoutSilenceDays(parseInt(e.target.value.replace(/\D/g, '')) || 1)}
-                      className="w-10 border border-gray-300 rounded px-1 py-0.5 text-center text-gray-800"
-                    />
-                    <span className="text-gray-500">days</span>
-                  </label>
+                {/* Sub-tab selector */}
+                <div className="flex rounded-lg overflow-hidden border border-gray-200 text-[11px] font-semibold w-fit">
+                  {([
+                    ['cross',   'Across All Phases'],
+                    ['phases',  'Per Phase'],
+                    ['current', 'Current Filter'],
+                  ] as [typeof dropoutSubTab, string][]).map(([key, label]) => (
+                    <button
+                      key={key}
+                      onClick={() => setDropoutSubTab(key)}
+                      className={`px-3 py-1.5 transition-colors border-r border-gray-200 last:border-0 ${
+                        dropoutSubTab === key ? 'bg-rose-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
                 </div>
 
-                {/* Status card */}
-                <div className={`rounded-xl px-4 py-3 flex items-start gap-3 ${sc.bg} border ${sc.border}`}>
-                  <div className={`w-2.5 h-2.5 rounded-full mt-1 shrink-0 ${sc.dot}`} />
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <span className={`text-sm font-bold capitalize ${sc.text}`}>
-                        {dropInfo?.status ?? 'Unknown'}
-                        {dropInfo?.tier ? ` · ${dropInfo.tier}` : ''}
-                      </span>
-                      {dropInfo && dropInfo.silenceDays < 9999 && (
-                        <span className="text-xs text-gray-500">
-                          {dropInfo.silenceDays} day{dropInfo.silenceDays !== 1 ? 's' : ''} silent before period end
-                        </span>
-                      )}
+                {/* ── ACROSS ALL PHASES ──────────────────────────────────────── */}
+                {dropoutSubTab === 'cross' && (
+                  <div className="space-y-4">
+                    {/* Drop-off summary banner — exhaustive analysis */}
+                    {(() => {
+                      const phasesWithData = phaseStatuses.filter(p => p.msgCount > 0)
+                      const noData = phasesWithData.length === 0
+
+                      const firstDataIdx = phaseStatuses.findIndex(p => p.msgCount > 0)
+                      const lastDataIdx  = phaseStatuses.reduce((mx, p, i) => p.msgCount > 0 ? i : mx, -1)
+
+                      const activePhases    = phasesWithData.filter(p => p.status === 'high')
+                      const transientPhases = phasesWithData.filter(p => p.status === 'low' || p.status === 'medium')
+                      const neverActive            = phasesWithData.length > 0 && activePhases.length === 0
+                      const allParticipatedActive  = phasesWithData.length > 0 && transientPhases.length === 0
+
+                      // Phases absent within the active window (gaps between first and last with data)
+                      const midGaps = firstDataIdx >= 0 && lastDataIdx > firstDataIdx
+                        ? phaseStatuses.slice(firstDataIdx + 1, lastDataIdx).filter(p => p.msgCount === 0)
+                        : []
+                      // Phases after last activity
+                      const trailingAbsent = lastDataIdx >= 0 ? phaseStatuses.slice(lastDataIdx + 1) : []
+
+                      const joinedPhase  = firstDataIdx >= 0 ? phaseStatuses[firstDataIdx].def.label : null
+                      const lastActivePh = phasesWithData[phasesWithData.length - 1]
+                      const finalStatus  = lastActivePh?.status ?? null
+                      const preJoinCount = firstDataIdx > 0 ? firstDataIdx : 0
+                      const participatedStr = `${phasesWithData.length}/${phaseStatuses.length}`
+
+                      // Transitions within the active window only (skips pre-join phases)
+                      const transitions: { from: string; to: string; fromStatus: string; toStatus: string; type: 'dropoff' | 'return' }[] = []
+                      if (firstDataIdx >= 0) {
+                        for (let i = firstDataIdx + 1; i <= lastDataIdx; i++) {
+                          const prev = phaseStatuses[i - 1]
+                          const cur  = phaseStatuses[i]
+                          if (!prev || !cur) continue
+                          const ps = prev.msgCount > 0 ? prev.status : 'absent'
+                          const cs = cur.msgCount  > 0 ? cur.status  : 'absent'
+                          if (ps === cs) continue
+                          if (ps === 'high' && (cs === 'medium' || cs === 'low' || cs === 'absent')) {
+                            transitions.push({ from: prev.def.label, to: cur.def.label, fromStatus: ps, toStatus: cs, type: 'dropoff' })
+                          } else if ((ps === 'low' || ps === 'medium' || ps === 'absent') && cs === 'high') {
+                            transitions.push({ from: prev.def.label, to: cur.def.label, fromStatus: ps, toStatus: cs, type: 'return' })
+                          }
+                        }
+                      }
+
+                      const dropOffEvents = transitions.filter(t => t.type === 'dropoff')
+                      const returnEvents  = transitions.filter(t => t.type === 'return')
+
+                      let bannerColor = 'bg-gray-50 border-gray-200'
+                      let dotColor    = 'bg-gray-400'
+                      let title       = ''
+                      const details: string[] = []
+
+                      if (noData) {
+                        title = 'No messages found across any phase'
+                      } else if (neverActive) {
+                        bannerColor = 'bg-amber-50 border-amber-200'; dotColor = 'bg-amber-400'
+                        title = 'Low/Med engagement — never reached high engagement in any phase'
+                        if (preJoinCount > 0) details.push(`No activity in first ${preJoinCount} phase${preJoinCount > 1 ? 's' : ''} — joined in ${joinedPhase}`)
+                        details.push(`Low/Med Eng. in: ${transientPhases.map(p => p.def.label).join(', ')}`)
+                        if (midGaps.length) details.push(`Absent mid-journey: ${midGaps.map(p => p.def.label).join(', ')}`)
+                        if (trailingAbsent.length) details.push(`No further activity after ${lastActivePh?.def.label} — ${trailingAbsent.map(p => p.def.label).join(', ')} absent`)
+                        details.push(`Participated in ${participatedStr} phases`)
+                      } else if (allParticipatedActive && midGaps.length === 0 && trailingAbsent.length === 0 && preJoinCount === 0) {
+                        bannerColor = 'bg-emerald-50 border-emerald-200'; dotColor = 'bg-emerald-500'
+                        title = `Consistently active across all ${phaseStatuses.length} phases from start to finish`
+                        details.push(`Active in: ${activePhases.map(p => p.def.label).join(', ')}`)
+                      } else if (allParticipatedActive) {
+                        bannerColor = 'bg-emerald-50 border-emerald-200'; dotColor = 'bg-emerald-500'
+                        title = `Active in all ${phasesWithData.length} phases participated (${participatedStr} total phases)`
+                        if (preJoinCount > 0) details.push(`Not present in first ${preJoinCount} phase${preJoinCount > 1 ? 's' : ''} — joined in ${joinedPhase}`)
+                        details.push(`Active in: ${activePhases.map(p => p.def.label).join(', ')}`)
+                        if (midGaps.length) details.push(`Absent mid-journey: ${midGaps.map(p => p.def.label).join(', ')}`)
+                        if (trailingAbsent.length) details.push(`No further activity after ${lastActivePh?.def.label} — ${trailingAbsent.map(p => p.def.label).join(', ')} absent`)
+                      } else if (dropOffEvents.length > 0) {
+                        const recovered = returnEvents.length > 0
+                        bannerColor = recovered ? 'bg-sky-50 border-sky-200'  : 'bg-rose-50 border-rose-200'
+                        dotColor    = recovered ? 'bg-sky-500'                : 'bg-rose-500'
+                        title = recovered
+                          ? `Engagement decline with recovery — ${dropOffEvents.length} drop-off, ${returnEvents.length} return event${returnEvents.length > 1 ? 's' : ''}`
+                          : `Engagement decline — ${dropOffEvents.length} drop-off event${dropOffEvents.length > 1 ? 's' : ''}, no recovery`
+                        if (preJoinCount > 0) details.push(`Joined in ${joinedPhase} — absent in first ${preJoinCount} phase${preJoinCount > 1 ? 's' : ''}`)
+                        for (const t of dropOffEvents) details.push(`Drop-off: ${t.from} (active) → ${t.to} (${t.toStatus})`)
+                        for (const t of returnEvents)  details.push(`Recovery: returned to active in ${t.to}`)
+                        if (activePhases.length)    details.push(`High Eng. in: ${activePhases.map(p => p.def.label).join(', ')}`)
+                        if (transientPhases.length) details.push(`Low/Med Eng. in: ${transientPhases.map(p => p.def.label).join(', ')}`)
+                        if (midGaps.length) details.push(`Absent mid-journey: ${midGaps.map(p => p.def.label).join(', ')}`)
+                        if (trailingAbsent.length) details.push(`No further activity after ${lastActivePh?.def.label} — ${trailingAbsent.map(p => p.def.label).join(', ')} absent`)
+                        details.push(`Final status (${lastActivePh?.def.label}): ${finalStatus === 'high' ? 'High Engagement' : finalStatus === 'medium' ? 'Med Engagement' : finalStatus === 'low' ? 'Low Engagement' : 'Absent'} · Participated in ${participatedStr} phases`)
+                      } else {
+                        const trajectory = activePhases.length >= transientPhases.length ? 'predominantly high engagement' : 'predominantly low/med engagement'
+                        bannerColor = 'bg-sky-50 border-sky-200'; dotColor = 'bg-sky-400'
+                        title = `Mixed engagement — ${trajectory} across participated phases`
+                        if (preJoinCount > 0) details.push(`Joined in ${joinedPhase} — absent in first ${preJoinCount} phase${preJoinCount > 1 ? 's' : ''}`)
+                        if (activePhases.length)    details.push(`High Eng. in: ${activePhases.map(p => p.def.label).join(', ')} (${activePhases.length} phase${activePhases.length > 1 ? 's' : ''})`)
+                        if (transientPhases.length) details.push(`Low/Med Eng. in: ${transientPhases.map(p => p.def.label).join(', ')} (${transientPhases.length} phase${transientPhases.length > 1 ? 's' : ''})`)
+                        if (midGaps.length) details.push(`Absent mid-journey: ${midGaps.map(p => p.def.label).join(', ')}`)
+                        if (trailingAbsent.length) details.push(`No further activity after ${lastActivePh?.def.label} — ${trailingAbsent.map(p => p.def.label).join(', ')} absent`)
+                        details.push(`Final status (${lastActivePh?.def.label}): ${finalStatus === 'high' ? 'High Engagement' : finalStatus === 'medium' ? 'Med Engagement' : finalStatus === 'low' ? 'Low Engagement' : 'Absent'} · Participated in ${participatedStr} phases`)
+                      }
+
+                      return (
+                        <div className={`rounded-xl border px-4 py-3 ${bannerColor}`}>
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="flex items-start gap-3 flex-1 min-w-0">
+                              <div className={`w-2.5 h-2.5 rounded-full mt-1.5 shrink-0 ${dotColor}`} />
+                              <div className="flex-1 min-w-0">
+                                <p className="text-sm font-bold text-gray-800">{title}</p>
+                                {details.map((d, i) => (
+                                  <p key={i} className="text-[11px] text-gray-600 mt-0.5">• {d}</p>
+                                ))}
+                                {crossPhaseNarrative && !narrativeLoading && (
+                                  <p className="text-[11px] text-violet-700 mt-1.5 italic border-t border-violet-100 pt-1.5">
+                                    AI: {crossPhaseNarrative}
+                                  </p>
+                                )}
+                              </div>
+                            </div>
+                            {userMsgs.length > 0 && (
+                              <button
+                                onClick={async () => {
+                                  if (!selectedUser) return
+                                  setNarrativeLoading(true)
+                                  setCrossPhaseNarrative(null)
+                                  try {
+                                    const result = await apiFetch<{ narrative: string }>('/user-engagement-narrative', {
+                                      method: 'POST',
+                                      body: JSON.stringify({
+                                        username: selectedUser.username,
+                                        phase_statuses: phaseStatuses.map(p => ({
+                                          label: p.def.label,
+                                          sub: p.def.sub,
+                                          status: p.status,
+                                          msg_count: p.msgCount,
+                                        })),
+                                      }),
+                                    })
+                                    setCrossPhaseNarrative(result.narrative)
+                                  } catch (err) {
+                                    const msg = err instanceof Error ? err.message : String(err)
+                                    setCrossPhaseNarrative(`Failed: ${msg}`)
+                                  } finally {
+                                    setNarrativeLoading(false)
+                                  }
+                                }}
+                                disabled={narrativeLoading}
+                                className="shrink-0 text-[10px] font-semibold px-2.5 py-1 rounded-lg bg-violet-100 text-violet-700 hover:bg-violet-200 disabled:opacity-50 transition-colors border border-violet-200 whitespace-nowrap"
+                                title="Generate AI narrative for this user's engagement pattern"
+                              >
+                                {narrativeLoading ? '⏳ AI…' : crossPhaseNarrative ? '↺ AI' : '✦ AI'}
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      )
+                    })()}
+
+                    {/* Phase timeline strip */}
+                    <div>
+                      <p className="text-[11px] font-semibold text-gray-500 uppercase tracking-wide mb-2">Phase-by-Phase Status</p>
+                      <div className="flex gap-0 rounded-xl overflow-hidden border border-gray-200">
+                        {crossPhaseEvents.map(({ def, status, msgCount, isDropOff, isReturn }, i) => {
+                          const isPreJoin = msgCount === 0 && !crossPhaseEvents.slice(0, i).some(p => p.msgCount > 0)
+                          const bgColor = isPreJoin ? '#f3f4f6'
+                            : msgCount === 0    ? '#ffe4e6'
+                            : status === 'high'   ? '#d1fae5'
+                            : status === 'medium' ? '#e0f2fe'
+                            : '#fef3c7'
+                          const borderColor = isPreJoin ? '#e5e7eb'
+                            : msgCount === 0    ? '#fca5a5'
+                            : status === 'high'   ? '#6ee7b7'
+                            : status === 'medium' ? '#7dd3fc'
+                            : '#fcd34d'
+                          return (
+                            <div
+                              key={def.key}
+                              className="flex-1 relative px-2 py-3 text-center border-r last:border-r-0 border-gray-200"
+                              style={{ backgroundColor: bgColor, borderTopColor: borderColor, borderTopWidth: 3 }}
+                            >
+                              {(isDropOff || isReturn) && (
+                                <div className="absolute top-0 left-0 w-full flex justify-start pl-0">
+                                  <span className={`text-[9px] font-bold px-1 py-0.5 ${isDropOff ? 'bg-rose-500 text-white' : 'bg-emerald-500 text-white'}`}>
+                                    {isDropOff ? '↓ drop-off' : '↑ return'}
+                                  </span>
+                                </div>
+                              )}
+                              <p className="text-[10px] font-bold text-gray-700 mt-3">{def.label}</p>
+                              <p className="text-[9px] text-gray-400 mb-1">{def.sub}</p>
+                              <StatusBadge status={isPreJoin ? null : status} />
+                              {msgCount > 0 && (
+                                <p className="text-[9px] text-gray-400 mt-1">{msgCount} msgs</p>
+                              )}
+                            </div>
+                          )
+                        })}
+                      </div>
                     </div>
-                    <p className="text-[11px] text-gray-400 mt-0.5">
-                      Filter end: <strong>{filterEndDate || '—'}</strong> · Last active: <strong>{lastDate || '—'}</strong>
-                      {dropInfo && <span className="ml-2">· Active span: {dropInfo.activeSpan} days</span>}
-                    </p>
-                  </div>
-                </div>
 
-                {!filterEndDate && (
-                  <p className="text-xs text-amber-600 bg-amber-50 rounded-lg px-3 py-2 border border-amber-200">
-                    Set a "To" date in the search filter for accurate dropout calculation.
-                  </p>
-                )}
-
-                {/* Weekly activity decay */}
-                {weeklyData.length > 1 && (
-                  <div>
-                    <p className="text-[11px] font-semibold text-gray-500 uppercase tracking-wide mb-2">Weekly Activity</p>
-                    <ResponsiveContainer width="100%" height={120}>
-                      <BarChart data={weeklyData} margin={{ left: -20, right: 4, top: 2, bottom: 0 }}>
-                        <XAxis dataKey="week" tick={{ fontSize: 8 }} interval="preserveStartEnd" />
-                        <YAxis tick={{ fontSize: 9 }} />
-                        <Tooltip formatter={(v: number) => [v, 'Messages']} labelFormatter={l => `Week of ${l}`} />
-                        <Bar dataKey="count" radius={[2, 2, 0, 0]}>
-                          {weeklyData.map((entry, idx) => (
-                            <Cell
-                              key={idx}
-                              fill={
-                                dropInfo?.status === 'dropout' && idx >= weeklyData.length - 4
-                                  ? '#f43f5e'
-                                  : '#6366f1'
-                              }
-                            />
+                    {/* Message count bar chart across phases */}
+                    {phaseStatuses.some(p => p.msgCount > 0) && (
+                      <div>
+                        <p className="text-[11px] font-semibold text-gray-500 uppercase tracking-wide mb-2">Message Volume per Phase</p>
+                        <ResponsiveContainer width="100%" height={140}>
+                          <BarChart
+                            data={phaseStatuses.map(p => ({ phase: p.def.label, Messages: p.msgCount, status: p.status }))}
+                            margin={{ left: -20, right: 4, top: 2, bottom: 0 }}
+                          >
+                            <XAxis dataKey="phase" tick={{ fontSize: 9 }} />
+                            <YAxis tick={{ fontSize: 9 }} />
+                            <Tooltip contentStyle={{ fontSize: 11 }} formatter={(v: number) => [v, 'Messages']} />
+                            <Bar dataKey="Messages" radius={[3, 3, 0, 0]}>
+                              {phaseStatuses.map((p, i) => (
+                                <Cell
+                                  key={i}
+                                  fill={
+                                    p.status === 'high'   ? '#10b981'
+                                    : p.status === 'medium' ? '#0ea5e9'
+                                    : p.status === 'low'    ? '#f59e0b'
+                                    : '#d1d5db'
+                                  }
+                                />
+                              ))}
+                            </Bar>
+                          </BarChart>
+                        </ResponsiveContainer>
+                        <div className="flex gap-4 justify-center mt-1">
+                          {[['#10b981','High Eng.'],['#0ea5e9','Med Eng.'],['#f59e0b','Low Eng.'],['#d1d5db','No data']].map(([c,l]) => (
+                            <span key={l} className="flex items-center gap-1 text-[10px] text-gray-400">
+                              <span className="w-2.5 h-2.5 rounded-sm inline-block" style={{ backgroundColor: c }} />{l}
+                            </span>
                           ))}
-                        </Bar>
-                      </BarChart>
-                    </ResponsiveContainer>
-                    {dropInfo?.status === 'dropout' && (
-                      <p className="text-[10px] text-rose-500 mt-0.5">● Last 4 weeks highlighted in red</p>
+                        </div>
+                      </div>
+                    )}
+
+
+                    {userMsgs.length === 0 && (
+                      <p className="text-sm text-gray-400 text-center py-6">No messages loaded for this user.</p>
                     )}
                   </div>
                 )}
 
-                {/* Pre-dropout sentiment */}
-                {preDropoutSentiment && preDropoutMsgs.length > 0 && (
-                  <div>
-                    <p className="text-[11px] font-semibold text-gray-500 uppercase tracking-wide mb-2">
-                      Sentiment in Final 30 Days ({preDropoutMsgs.length} messages)
+                {/* ── PER PHASE ──────────────────────────────────────────────── */}
+                {dropoutSubTab === 'phases' && (
+                  <div className="space-y-3">
+                    {/* Classify all phases button */}
+                    <div className="flex items-center justify-between">
+                      <p className="text-[10px] text-gray-400">Status and persona computed from all messages within each phase's date window.</p>
+                      <div className="flex gap-1.5">
+                        {(['rule_based', 'llm'] as const).map(method => {
+                          const anyClassifying = phaseStatuses.some(ps =>
+                            personaClassifying.has(`${ps.def.key}:${method}`) ||
+                            personaClassifying.has(`${ps.def.key}:rule_based,llm`)
+                          )
+                          return (
+                            <button
+                              key={method}
+                              disabled={anyClassifying}
+                              onClick={async () => {
+                                for (const ps of phaseStatuses) {
+                                  if (ps.msgCount === 0) continue
+                                  const filterEnd = ps.def.to || allMsgsMaxDate
+                                  const phaseMsgs = userMsgs.filter(m => {
+                                    const d = m.date?.slice(0, 10) ?? ''
+                                    return d >= ps.def.from && (!filterEnd || d <= filterEnd)
+                                  })
+                                  // Compute per-phase emotion from emotionPerMsgMap
+                                  const phaseUuids = new Set(phaseMsgs.map(m => m.msg_uuid).filter(Boolean))
+                                  const phaseEmo = [...phaseUuids].flatMap(uuid => {
+                                    const e = uuid ? emotionPerMsgMap.get(uuid) : undefined
+                                    return e ? [e] : []
+                                  })
+                                  const emoTotal = phaseEmo.length || 1
+                                  const negSent = phaseEmo.filter(e => e.sentiment === 'negative').length / emoTotal
+                                  const posSent = phaseEmo.filter(e => e.sentiment === 'positive').length / emoTotal
+                                  const neuSent = phaseEmo.filter(e => e.sentiment === 'neutral').length / emoTotal
+                                  const emoCount: Record<string, number> = {}
+                                  for (const e of phaseEmo) for (const em of e.top_emotions) {
+                                    emoCount[em.label] = (emoCount[em.label] ?? 0) + 1
+                                  }
+                                  const topEmotions = Object.entries(emoCount).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([l])=>l)
+                                  // Top topics
+                                  const topTopics: string[] = []
+                                  if (userTopicsResult?.doc_assignments) {
+                                    const tCounts: Record<number, number> = {}
+                                    for (const m of phaseMsgs) {
+                                      const tid = m.msg_uuid ? userTopicsResult.doc_assignments[m.msg_uuid] : undefined
+                                      if (tid !== undefined) tCounts[tid] = (tCounts[tid] ?? 0) + 1
+                                    }
+                                    Object.entries(tCounts).sort(([,a],[,b])=>b-a).slice(0,3).forEach(([tid]) => {
+                                      const topic = userTopicsResult.topics.find(t => t.id === Number(tid))
+                                      if (topic) topTopics.push(topic.label)
+                                    })
+                                  }
+                                  const phaseAvgWords = phaseMsgs.length > 0
+                                    ? phaseMsgs.reduce((s, m) => s + m.content.split(/\s+/).filter(Boolean).length, 0) / phaseMsgs.length
+                                    : 0
+                                  const phaseWeeksActive = new Set(phaseMsgs.map(m => m.date ? mondayKey(m.date) : '').filter(Boolean)).size
+                                  await classifyPersona(
+                                    ps.def.key, ps.def.label,
+                                    {
+                                      msg_count: ps.msgCount,
+                                      avg_words: phaseAvgWords,
+                                      pct_weeks: ps.info?.pctWeeks ?? 0,
+                                      weeks_active: phaseWeeksActive,
+                                      dropout_status: ps.status,
+                                      sentiment_positive: phaseEmo.length > 0 ? posSent : null,
+                                      sentiment_negative: phaseEmo.length > 0 ? negSent : null,
+                                      sentiment_neutral: phaseEmo.length > 0 ? neuSent : null,
+                                      top_emotions: topEmotions.length > 0 ? topEmotions : null,
+                                      top_topics: topTopics.length > 0 ? topTopics : null,
+                                    },
+                                    phaseMsgs.slice(-15).map(m => ({ content: m.content, date: m.date ?? '' })),
+                                    [method],
+                                  )
+                                }
+                              }}
+                              className="text-[10px] font-semibold px-2.5 py-1 rounded-lg border disabled:opacity-50 transition-colors
+                                bg-white text-gray-600 border-gray-300 hover:bg-gray-50"
+                            >
+                              {anyClassifying ? '⏳' : method === 'rule_based' ? '⚡ All (Rule)' : '🤖 All (LLM)'}
+                            </button>
+                          )
+                        })}
+                      </div>
+                    </div>
+
+                    <div className="overflow-x-auto rounded-xl border border-gray-200">
+                      <table className="w-full text-xs border-collapse">
+                        <thead>
+                          <tr className="bg-gray-50 border-b border-gray-200">
+                            <th className="text-left px-3 py-2 font-semibold text-gray-600">Phase</th>
+                            <th className="text-right px-3 py-2 font-semibold text-gray-600">Status</th>
+                            <th className="text-center px-3 py-2 font-semibold text-sky-600">Flow</th>
+                            <th className="text-right px-3 py-2 font-semibold text-gray-600">Msgs</th>
+                            <th className="text-right px-3 py-2 font-semibold text-gray-600">% Wks</th>
+                            <th className="text-center px-3 py-2 font-semibold text-indigo-600">Rule Persona</th>
+                            <th className="text-center px-3 py-2 font-semibold text-violet-600">LLM Persona</th>
+                            <th className="text-center px-2 py-2 font-semibold text-gray-400">Classify</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {phaseStatuses.map(({ def, status, info, msgCount }, idx) => {
+                            // Flow label — compare against the last phase that had messages
+                            const priorPhases = phaseStatuses.slice(0, idx)
+                            const hasAnyPrior = priorPhases.some(p => p.msgCount > 0)
+                            const lastWithData = [...priorPhases].reverse().find(p => p.msgCount > 0)
+                            let flowLabel: string; let flowCls: string
+                            if (msgCount === 0 && !hasAnyPrior) {
+                              flowLabel = 'Not Present'; flowCls = 'bg-gray-100 text-gray-400 border-gray-200'
+                            } else if (msgCount > 0 && !hasAnyPrior) {
+                              flowLabel = 'New Joiner'; flowCls = 'bg-sky-100 text-sky-700 border-sky-300'
+                            } else if (msgCount === 0) {
+                              flowLabel = lastWithData ? 'Dropout' : 'Absent'
+                              flowCls   = lastWithData
+                                ? 'bg-rose-100 text-rose-700 border-rose-300'
+                                : 'bg-gray-100 text-gray-500 border-gray-200'
+                            } else if (!lastWithData) {
+                              flowLabel = 'New Joiner'; flowCls = 'bg-sky-100 text-sky-700 border-sky-300'
+                            } else if (lastWithData.status === 'high') {
+                              flowLabel = status === 'high' ? 'Retained (High)' : status === 'medium' ? 'Decreased H→M' : 'Decreased H→L'
+                              flowCls   = status === 'high'
+                                ? 'bg-emerald-100 text-emerald-700 border-emerald-300'
+                                : 'bg-orange-100 text-orange-700 border-orange-300'
+                            } else if (lastWithData.status === 'medium') {
+                              flowLabel = status === 'high' ? 'Increased M→H' : status === 'medium' ? 'Continued (Med)' : 'Decreased M→L'
+                              flowCls   = status === 'high'
+                                ? 'bg-teal-100 text-teal-700 border-teal-300'
+                                : status === 'medium'
+                                  ? 'bg-sky-100 text-sky-700 border-sky-300'
+                                  : 'bg-orange-100 text-orange-700 border-orange-300'
+                            } else {
+                              flowLabel = status === 'high' ? 'Increased L→H' : status === 'medium' ? 'Increased L→M' : 'Continued (Low)'
+                              flowCls   = status !== 'low'
+                                ? 'bg-teal-100 text-teal-700 border-teal-300'
+                                : 'bg-slate-100 text-slate-500 border-slate-200'
+                            }
+
+                            const filterEnd = def.to || allMsgsMaxDate
+                            const phaseMsgs = userMsgs.filter(m => {
+                              const d = m.date?.slice(0, 10) ?? ''
+                              return d >= def.from && (!filterEnd || d <= filterEnd)
+                            })
+                            // Per-phase emotion from emotionPerMsgMap
+                            const phaseUuids = new Set(phaseMsgs.map(m => m.msg_uuid).filter(Boolean))
+                            const phaseEmo = [...phaseUuids].flatMap(uuid => {
+                              const e = uuid ? emotionPerMsgMap.get(uuid) : undefined
+                              return e ? [e] : []
+                            })
+                            const emoTotal = phaseEmo.length || 1
+                            const negSent = phaseEmo.filter(e => e.sentiment === 'negative').length / emoTotal
+                            const posSent = phaseEmo.filter(e => e.sentiment === 'positive').length / emoTotal
+                            const neuSent = phaseEmo.filter(e => e.sentiment === 'neutral').length / emoTotal
+                            const emoCount: Record<string, number> = {}
+                            for (const e of phaseEmo) for (const em of e.top_emotions) {
+                              emoCount[em.label] = (emoCount[em.label] ?? 0) + 1
+                            }
+                            const topEmotions = Object.entries(emoCount).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([l])=>l)
+                            const topTopics: string[] = []
+                            if (userTopicsResult?.doc_assignments) {
+                              const tCounts: Record<number, number> = {}
+                              for (const m of phaseMsgs) {
+                                const tid = m.msg_uuid ? userTopicsResult.doc_assignments[m.msg_uuid] : undefined
+                                if (tid !== undefined) tCounts[tid] = (tCounts[tid] ?? 0) + 1
+                              }
+                              Object.entries(tCounts).sort(([,a],[,b])=>b-a).slice(0,3).forEach(([tid]) => {
+                                const topic = userTopicsResult.topics.find(t => t.id === Number(tid))
+                                if (topic) topTopics.push(topic.label)
+                              })
+                            }
+                            const phaseAvgWords = phaseMsgs.length > 0
+                              ? phaseMsgs.reduce((s, m) => s + m.content.split(/\s+/).filter(Boolean).length, 0) / phaseMsgs.length
+                              : 0
+                            const phaseWeeksActive = new Set(phaseMsgs.map(m => m.date ? mondayKey(m.date) : '').filter(Boolean)).size
+                            const features = {
+                              msg_count: msgCount,
+                              avg_words: phaseAvgWords,
+                              pct_weeks: info?.pctWeeks ?? 0,
+                              weeks_active: phaseWeeksActive,
+                              dropout_status: status,
+                              sentiment_positive: phaseEmo.length > 0 ? posSent : null,
+                              sentiment_negative: phaseEmo.length > 0 ? negSent : null,
+                              sentiment_neutral: phaseEmo.length > 0 ? neuSent : null,
+                              top_emotions: topEmotions.length > 0 ? topEmotions : null,
+                              top_topics: topTopics.length > 0 ? topTopics : null,
+                            }
+                            const sample = phaseMsgs.slice(-15).map(m => ({ content: m.content, date: m.date ?? '' }))
+                            const saved = userPersonas[def.key] ?? {}
+                            const ruleKey = `${def.key}:rule_based`
+                            const llmKey = `${def.key}:llm`
+                            const bothKey = `${def.key}:rule_based,llm`
+                            const ruleLoading = personaClassifying.has(ruleKey) || personaClassifying.has(bothKey)
+                            const llmLoading  = personaClassifying.has(llmKey)  || personaClassifying.has(bothKey)
+
+                            const PersonaBadge = ({ result, color }: { result?: PersonaResult; color: 'indigo' | 'violet' }) => {
+                              if (!result) return <span className="text-[9px] text-gray-300">—</span>
+                              const bg = color === 'indigo' ? 'bg-indigo-50 text-indigo-700 border-indigo-200' : 'bg-violet-50 text-violet-700 border-violet-200'
+                              const pct = Math.round(result.confidence * 100)
+                              return (
+                                <span title={result.reasoning} className={`inline-block text-[9px] font-semibold px-1.5 py-0.5 rounded border ${bg} cursor-help`}>
+                                  {result.persona} <span className="opacity-60">{pct}%</span>
+                                </span>
+                              )
+                            }
+
+                            return (
+                              <tr key={def.key} className="border-b border-gray-100 hover:bg-gray-50">
+                                <td className="px-3 py-2">
+                                  <span className={`inline-block px-2 py-0.5 rounded-full text-[10px] font-semibold border ${def.chipCls}`}>{def.label}</span>
+                                  <span className="ml-1.5 text-gray-400 text-[9px] hidden sm:inline">{def.sub}</span>
+                                </td>
+                                <td className="text-right px-3 py-2"><StatusBadge status={(msgCount === 0 && !hasAnyPrior) ? null : status} /></td>
+                                <td className="text-center px-3 py-2">
+                                  <span className={`inline-block text-[9px] font-semibold px-1.5 py-0.5 rounded-full border ${flowCls}`}>{flowLabel}</span>
+                                </td>
+                                <td className="text-right px-3 py-2 text-gray-700">{msgCount > 0 ? msgCount : '—'}</td>
+                                <td className="text-right px-3 py-2 text-gray-600">{info ? `${info.pctWeeks}%` : '—'}</td>
+                                <td className="text-center px-2 py-2">
+                                  {ruleLoading
+                                    ? <span className="text-[9px] text-indigo-400">⏳</span>
+                                    : <PersonaBadge result={saved.rule_based} color="indigo" />
+                                  }
+                                </td>
+                                <td className="text-center px-2 py-2">
+                                  {llmLoading
+                                    ? <span className="text-[9px] text-violet-400">⏳</span>
+                                    : <PersonaBadge result={saved.llm} color="violet" />
+                                  }
+                                </td>
+                                <td className="text-center px-2 py-1.5">
+                                  {msgCount > 0 ? (
+                                    <div className="flex items-center justify-center gap-1">
+                                      <button
+                                        disabled={ruleLoading}
+                                        title="Rule-based classification"
+                                        onClick={() => classifyPersona(def.key, def.label, features, sample, ['rule_based'])}
+                                        className="text-[9px] px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700 hover:bg-indigo-200 disabled:opacity-40 transition-colors font-semibold"
+                                      >⚡</button>
+                                      <button
+                                        disabled={llmLoading}
+                                        title="LLM classification (requires OpenAI key)"
+                                        onClick={() => classifyPersona(def.key, def.label, features, sample, ['llm'])}
+                                        className="text-[9px] px-1.5 py-0.5 rounded bg-violet-100 text-violet-700 hover:bg-violet-200 disabled:opacity-40 transition-colors font-semibold"
+                                      >🤖</button>
+                                    </div>
+                                  ) : <span className="text-[9px] text-gray-300">—</span>}
+                                </td>
+                              </tr>
+                            )
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                    <p className="text-[9px] text-gray-400">
+                      <span className="font-medium text-indigo-600">⚡ Rule</span> = deterministic rules (no API key).&nbsp;
+                      <span className="font-medium text-violet-600">🤖 LLM</span> = GPT-4o-mini (requires OpenAI key). Hover persona badge to see reasoning.
                     </p>
-                    <div className="flex gap-4">
-                      {([['positive', '#10b981'], ['negative', '#f43f5e'], ['neutral', '#9ca3af']] as [string, string][]).map(([key, color]) => {
-                        const val = preDropoutSentiment[key as keyof typeof preDropoutSentiment]
-                        const total = preDropoutSentiment.positive + preDropoutSentiment.negative + preDropoutSentiment.neutral
-                        const pct = total > 0 ? Math.round(val / total * 100) : 0
-                        return (
-                          <div key={key} className="flex items-center gap-1.5">
-                            <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: color }} />
-                            <span className="text-xs text-gray-600 capitalize">{key}</span>
-                            <span className="text-xs font-bold text-gray-800">{pct}%</span>
-                          </div>
-                        )
-                      })}
+
+                    {/* Criteria reference */}
+                    <div className="flex flex-wrap gap-x-5 gap-y-0.5 text-[10px] text-gray-400">
+                      <span><span className="text-emerald-600 font-medium">High</span> — ≥50% weeks active</span>
+                      <span><span className="text-sky-600 font-medium">Medium</span> — 20–49% weeks active</span>
+                      <span><span className="text-amber-600 font-medium">Low</span> — &lt;20% weeks active</span>
+                      <span><span className="text-rose-500 font-medium">Dropout</span> — absent in this phase</span>
                     </div>
                   </div>
                 )}
 
-                {/* Pre-dropout topics */}
-                {preDropoutTopics && preDropoutTopics.length > 0 && (
-                  <div>
-                    <p className="text-[11px] font-semibold text-gray-500 uppercase tracking-wide mb-2">
-                      Topics in Final 30 Days
-                    </p>
-                    <div className="flex flex-wrap gap-1.5">
-                      {preDropoutTopics.map((t, i) => (
-                        <span
-                          key={t.id}
-                          className="text-[11px] px-2 py-0.5 rounded-full font-medium text-white"
-                          style={{ backgroundColor: TOPIC_COLORS[i % TOPIC_COLORS.length] }}
-                          title={`${t.count} messages`}
-                        >
-                          {t.label.length > 24 ? t.label.slice(0, 22) + '…' : t.label} ({t.count})
-                        </span>
-                      ))}
+                {/* ── CURRENT FILTER ─────────────────────────────────────────── */}
+                {dropoutSubTab === 'current' && (
+                  <div className="space-y-4">
+                    {/* Criteria legend */}
+                    <div className="flex flex-wrap gap-x-5 gap-y-0.5 text-[10px] text-gray-400">
+                      <span><span className="text-emerald-600 font-medium">High</span> — ≥50% weeks active</span>
+                      <span><span className="text-sky-600 font-medium">Medium</span> — 20–49% weeks active</span>
+                      <span><span className="text-amber-600 font-medium">Low</span> — &lt;20% weeks active</span>
                     </div>
-                  </div>
-                )}
 
-                {/* Last messages */}
-                {lastMsgs.length > 0 && (
-                  <div>
-                    <p className="text-[11px] font-semibold text-gray-500 uppercase tracking-wide mb-2">
-                      Last {lastMsgs.length} Messages{dropInfo?.status === 'dropout' ? ' Before Dropout' : ''}
-                    </p>
-                    <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
-                      {lastMsgs.map((m, i) => (
-                        <div key={m.id ?? i} className="bg-gray-50 rounded-lg px-3 py-2 border border-gray-100">
-                          <p className="text-[10px] text-gray-400 mb-0.5">{m.date?.slice(0, 19).replace('T', ' ')}</p>
-                          <p className="text-xs text-gray-700 leading-relaxed break-words">{m.content}</p>
+                    {/* Status card */}
+                    <div className={`rounded-xl px-4 py-3 flex items-start gap-3 ${sc.bg} border ${sc.border}`}>
+                      <div className={`w-2.5 h-2.5 rounded-full mt-1 shrink-0 ${sc.dot}`} />
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className={`text-sm font-bold capitalize ${sc.text}`}>
+                            {{ high: 'High Eng.', medium: 'Med Eng.', low: 'Low Eng.' }[dropInfo?.level ?? 'low'] ?? 'Unknown'}
+                          </span>
                         </div>
-                      ))}
+                        <p className="text-[11px] text-gray-400 mt-0.5">
+                          Period: <strong>{detailFilterStart || '—'}</strong> → <strong>{detailFilterEnd || '—'}</strong>
+                          {' '}· {userDetailFiltered.length} msgs · {derivedWeeksActive} active wks ({derivedPctWeeks}% of period)
+                        </p>
+                      </div>
                     </div>
-                  </div>
-                )}
 
-                {userDetailFiltered.length === 0 && (
-                  <p className="text-sm text-gray-400 text-center py-6">No messages loaded for this user.</p>
+                    {!detailFilterEnd && (
+                      <p className="text-xs text-amber-600 bg-amber-50 rounded-lg px-3 py-2 border border-amber-200">
+                        Set a "To" date in the phase filter above for accurate dropout calculation.
+                      </p>
+                    )}
+
+                    {/* Weekly activity decay */}
+                    {weeklyData.length > 1 && (
+                      <div>
+                        <p className="text-[11px] font-semibold text-gray-500 uppercase tracking-wide mb-2">Weekly Activity</p>
+                        <ResponsiveContainer width="100%" height={120}>
+                          <BarChart data={weeklyData} margin={{ left: -20, right: 4, top: 2, bottom: 0 }}>
+                            <XAxis dataKey="week" tick={{ fontSize: 8 }} interval="preserveStartEnd" />
+                            <YAxis tick={{ fontSize: 9 }} />
+                            <Tooltip formatter={(v: number) => [v, 'Messages']} labelFormatter={l => `Week of ${l}`} />
+                            <Bar dataKey="count" radius={[2, 2, 0, 0]}>
+                              {weeklyData.map((_, idx) => (
+                                <Cell key={idx} fill='#6366f1' />
+                              ))}
+                            </Bar>
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </div>
+                    )}
+
+                    {/* Pre-dropout sentiment */}
+                    {preDropoutSentiment && preDropoutMsgs.length > 0 && (
+                      <div>
+                        <p className="text-[11px] font-semibold text-gray-500 uppercase tracking-wide mb-2">
+                          Sentiment in Final {dropoutSilenceDays} Days ({preDropoutMsgs.length} messages)
+                        </p>
+                        <div className="flex gap-4">
+                          {([['positive', '#10b981'], ['negative', '#f43f5e'], ['neutral', '#9ca3af']] as [string, string][]).map(([key, color]) => {
+                            const val = preDropoutSentiment[key as keyof typeof preDropoutSentiment]
+                            const total = preDropoutSentiment.positive + preDropoutSentiment.negative + preDropoutSentiment.neutral
+                            const pct = total > 0 ? Math.round(val / total * 100) : 0
+                            return (
+                              <div key={key} className="flex items-center gap-1.5">
+                                <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: color }} />
+                                <span className="text-xs text-gray-600 capitalize">{key}</span>
+                                <span className="text-xs font-bold text-gray-800">{pct}%</span>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Pre-dropout topics */}
+                    {preDropoutTopics && preDropoutTopics.length > 0 && (
+                      <div>
+                        <p className="text-[11px] font-semibold text-gray-500 uppercase tracking-wide mb-2">
+                          Topics in Final {dropoutSilenceDays} Days
+                        </p>
+                        <div className="flex flex-wrap gap-1.5">
+                          {preDropoutTopics.map((t, i) => (
+                            <span
+                              key={t.id}
+                              className="text-[11px] px-2 py-0.5 rounded-full font-medium text-white"
+                              style={{ backgroundColor: TOPIC_COLORS[i % TOPIC_COLORS.length] }}
+                              title={`${t.count} messages`}
+                            >
+                              {t.label.length > 24 ? t.label.slice(0, 22) + '…' : t.label} ({t.count})
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Last messages */}
+                    {lastMsgs.length > 0 && (
+                      <div>
+                        <p className="text-[11px] font-semibold text-gray-500 uppercase tracking-wide mb-2">
+                          Last {lastMsgs.length} Messages
+                        </p>
+                        <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+                          {lastMsgs.map((m, i) => (
+                            <div key={m.id ?? i} className="bg-gray-50 rounded-lg px-3 py-2 border border-gray-100">
+                              <p className="text-[10px] text-gray-400 mb-0.5">{m.date?.slice(0, 19).replace('T', ' ')}</p>
+                              <p className="text-xs text-gray-700 leading-relaxed break-words">{m.content}</p>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {userDetailFiltered.length === 0 && (
+                      <p className="text-sm text-gray-400 text-center py-6">No messages loaded for this user.</p>
+                    )}
+                  </div>
                 )}
               </div>
             )
@@ -3330,6 +5087,7 @@ export default function SearchPage() {
                   onSelectToggle={toggleSelected}
                   ctxBefore={userDetailCtxBefore}
                   ctxAfter={userDetailCtxAfter}
+                  emotion={msg.msg_uuid ? msgEmotions[msg.msg_uuid] : undefined}
                 />
               ))
             )}
@@ -3438,6 +5196,24 @@ export default function SearchPage() {
               <button onClick={() => handleCatSwitch('users')} className={`subtab-btn${searchCat === 'users' ? ' subtab-btn-active' : ''}`}>Users Data</button>
             </div>
 
+            {/* Users Data sub-tab toggle */}
+            {searchCat === 'users' && (
+              <div className="flex border-b mb-4">
+                <button
+                  onClick={() => setUsersDataTab('search')}
+                  className={`search-tab${usersDataTab === 'search' ? ' tab-active' : ''}`}
+                >
+                  Users Stats Search
+                </button>
+                <button
+                  onClick={() => { setUsersDataTab('phases'); setUserStats([]) }}
+                  className={`search-tab${usersDataTab === 'phases' ? ' tab-active' : ''}`}
+                >
+                  User Summary Per Phases
+                </button>
+              </div>
+            )}
+
             {/* Chat search */}
             {searchCat === 'chat' && (
               <>
@@ -3493,7 +5269,7 @@ export default function SearchPage() {
                         </div>
                         <div className="flex flex-col gap-1">
                           <label className="filter-label">Limit</label>
-                          <input type="text" inputMode="numeric" value={String(maxResults)} onChange={(e) => { const d = e.target.value.replace(/\D/g, ''); setMaxResults(d ? parseInt(d) : 10000) }} className={inputCls} />
+                          <input type="text" inputMode="numeric" value={String(maxResults)} onChange={(e) => { const d = e.target.value.replace(/\D/g, ''); setMaxResults(d ? parseInt(d) : 1000000) }} className={inputCls} />
                         </div>
                         <div className="flex flex-col gap-1">
                           <label className="filter-label">Min Words</label>
@@ -3541,7 +5317,7 @@ export default function SearchPage() {
                         </div>
                         <div className="flex flex-col gap-1">
                           <label className="filter-label">Limit</label>
-                          <input type="text" inputMode="numeric" value={String(maxResults)} onChange={(e) => { const d = e.target.value.replace(/\D/g, ''); setMaxResults(d ? parseInt(d) : 10000) }} className={inputCls} />
+                          <input type="text" inputMode="numeric" value={String(maxResults)} onChange={(e) => { const d = e.target.value.replace(/\D/g, ''); setMaxResults(d ? parseInt(d) : 1000000) }} className={inputCls} />
                         </div>
                         <div className="flex flex-col gap-1">
                           <label className="filter-label">Min Words</label>
@@ -3594,7 +5370,7 @@ export default function SearchPage() {
                         </div>
                         <div className="flex flex-col gap-1">
                           <label className="filter-label">Limit</label>
-                          <input type="text" inputMode="numeric" value={String(maxResults)} onChange={(e) => { const d = e.target.value.replace(/\D/g, ''); setMaxResults(d ? parseInt(d) : 10000) }} className={inputCls} />
+                          <input type="text" inputMode="numeric" value={String(maxResults)} onChange={(e) => { const d = e.target.value.replace(/\D/g, ''); setMaxResults(d ? parseInt(d) : 1000000) }} className={inputCls} />
                         </div>
                         <div className="flex flex-col gap-1">
                           <label className="filter-label">Min Words</label>
@@ -3606,6 +5382,51 @@ export default function SearchPage() {
                   </>
                 )}
 
+                {/* Phase shortcuts — shared by keyword / semantic / username tabs (all use dateFrom/dateTo) */}
+                {(activeTab === 'keyword' || activeTab === 'semantic' || activeTab === 'username') && showOptions && (() => {
+                  type PhaseKey = '1' | '2' | '3' | '3a' | '3b' | '3c' | '3d'
+                  const ap: PhaseKey | null =
+                    dateFrom === '2023-04-01' && dateTo === '2023-07-18' ? '1' :
+                    dateFrom === '2023-07-19' && dateTo === '2023-09-05' ? '2' :
+                    dateFrom === '2023-09-06' && dateTo === '' ? '3' :
+                    dateFrom === '2023-09-06' && dateTo === '2023-12-18' ? '3a' :
+                    dateFrom === '2023-12-18' && dateTo === '2024-03-17' ? '3b' :
+                    dateFrom === '2024-03-17' && dateTo === '2024-05-16' ? '3c' :
+                    dateFrom === '2024-05-17' && dateTo === '' ? '3d' : null
+                  const set = (p: PhaseKey) => {
+                    if (ap === p) { setDateFrom(''); setDateTo(''); return }
+                    if (p === '1')       { setDateFrom('2023-04-01'); setDateTo('2023-07-18') }
+                    else if (p === '2')  { setDateFrom('2023-07-19'); setDateTo('2023-09-05') }
+                    else if (p === '3')  { setDateFrom('2023-09-06'); setDateTo('') }
+                    else if (p === '3a') { setDateFrom('2023-09-06'); setDateTo('2023-12-18') }
+                    else if (p === '3b') { setDateFrom('2023-12-18'); setDateTo('2024-03-17') }
+                    else if (p === '3c') { setDateFrom('2024-03-17'); setDateTo('2024-05-16') }
+                    else if (p === '3d') { setDateFrom('2024-05-17'); setDateTo('') }
+                  }
+                  return (
+                    <div className="mt-2 mb-1 flex flex-wrap gap-1.5">
+                      <span className="filter-label self-center shrink-0">Phase</span>
+                      {([
+                        { key: '1',  label: 'Phase 1 — Capability Surfacing',     dates: 'Apr–18 Jul 2023',         cls: ['border-blue-400 bg-blue-100 text-blue-800',         'border-blue-300 text-blue-700 hover:bg-blue-50']         },
+                        { key: '2',  label: 'Phase 2 — Enclosure & Scrutiny',     dates: '19 Jul–5 Sep 2023',       cls: ['border-amber-400 bg-amber-100 text-amber-800',       'border-amber-300 text-amber-700 hover:bg-amber-50']       },
+                        { key: '3',  label: 'Phase 3 — Commercialization',        dates: 'Sep 2023 onward',         cls: ['border-emerald-400 bg-emerald-100 text-emerald-800', 'border-emerald-300 text-emerald-700 hover:bg-emerald-50'] },
+                        { key: '3a', label: 'Phase 3A — Early Commercialization', dates: '6 Sep–18 Dec 2023',       cls: ['border-violet-400 bg-violet-100 text-violet-800',    'border-violet-300 text-violet-700 hover:bg-violet-50']    },
+                        { key: '3b', label: 'Phase 3B — Early Wide Adoption',     dates: '18 Dec 2023–17 Mar 2024', cls: ['border-sky-400 bg-sky-100 text-sky-800',             'border-sky-300 text-sky-700 hover:bg-sky-50']             },
+                        { key: '3c', label: 'Phase 3C — Pre-Litigation',          dates: '17 Mar–16 May 2024',      cls: ['border-orange-400 bg-orange-100 text-orange-800',    'border-orange-300 text-orange-700 hover:bg-orange-50']    },
+                        { key: '3d', label: 'Phase 3D — Warning & Lawsuit',       dates: '17 May 2024 onward',      cls: ['border-rose-400 bg-rose-100 text-rose-800',          'border-rose-300 text-rose-700 hover:bg-rose-50']          },
+                      ] as { key: PhaseKey; label: string; dates: string; cls: [string, string] }[]).map(({ key, label, dates, cls }) => (
+                        <button
+                          key={key}
+                          onClick={() => set(key)}
+                          className={`text-xs px-2.5 py-1 rounded-full border transition-colors font-medium ${ap === key ? cls[0] + ' font-semibold' : cls[1]}`}
+                        >
+                          {label} <span className="opacity-60 ml-1">{dates}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )
+                })()}
+
                 {/* Time Range tab */}
                 {activeTab === 'range' && (
                   <>
@@ -3616,19 +5437,28 @@ export default function SearchPage() {
 
                     {/* Phase template shortcuts */}
                     {(() => {
-                      const rangeActivePhase =
-                        rangeDateFrom === '2023-04-01' && rangeDateTo === '2023-07-18' ? 1 :
-                        rangeDateFrom === '2023-07-19' && rangeDateTo === '2023-09-05' ? 2 :
-                        rangeDateFrom === '2023-09-06' && rangeDateTo === '' ? 3 : null
+                      type PhaseKey = '1' | '2' | '3' | '3a' | '3b' | '3c' | '3d'
+                      const rangeActivePhase: PhaseKey | null =
+                        rangeDateFrom === '2023-04-01' && rangeDateTo === '2023-07-18' ? '1' :
+                        rangeDateFrom === '2023-07-19' && rangeDateTo === '2023-09-05' ? '2' :
+                        rangeDateFrom === '2023-09-06' && rangeDateTo === '' ? '3' :
+                        rangeDateFrom === '2023-09-06' && rangeDateTo === '2023-12-18' ? '3a' :
+                        rangeDateFrom === '2023-12-18' && rangeDateTo === '2024-03-17' ? '3b' :
+                        rangeDateFrom === '2024-03-17' && rangeDateTo === '2024-05-16' ? '3c' :
+                        rangeDateFrom === '2024-05-17' && rangeDateTo === '' ? '3d' : null
 
-                      const applyPhase = (p: 1 | 2 | 3) => {
+                      const applyPhase = (p: PhaseKey) => {
                         if (rangeActivePhase === p) {
                           setRangeDateFrom(''); setRangeDateTo('')
                         } else {
                           setRangeMode('exact')
-                          if (p === 1) { setRangeDateFrom('2023-04-01'); setRangeDateTo('2023-07-18') }
-                          else if (p === 2) { setRangeDateFrom('2023-07-19'); setRangeDateTo('2023-09-05') }
-                          else { setRangeDateFrom('2023-09-06'); setRangeDateTo('') }
+                          if (p === '1')  { setRangeDateFrom('2023-04-01'); setRangeDateTo('2023-07-18') }
+                          else if (p === '2')  { setRangeDateFrom('2023-07-19'); setRangeDateTo('2023-09-05') }
+                          else if (p === '3')  { setRangeDateFrom('2023-09-06'); setRangeDateTo('') }
+                          else if (p === '3a') { setRangeDateFrom('2023-09-06'); setRangeDateTo('2023-12-18') }
+                          else if (p === '3b') { setRangeDateFrom('2023-12-18'); setRangeDateTo('2024-03-17') }
+                          else if (p === '3c') { setRangeDateFrom('2024-03-17'); setRangeDateTo('2024-05-16') }
+                          else if (p === '3d') { setRangeDateFrom('2024-05-17'); setRangeDateTo('') }
                         }
                       }
 
@@ -3636,22 +5466,46 @@ export default function SearchPage() {
                         <div className="flex flex-wrap gap-2 mb-3">
                           <span className="filter-label self-center shrink-0">Phase</span>
                           <button
-                            onClick={() => applyPhase(1)}
-                            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${rangeActivePhase === 1 ? 'border-blue-400 bg-blue-100 text-blue-800 font-semibold' : 'border-blue-300 text-blue-700 hover:bg-blue-50'}`}
+                            onClick={() => applyPhase('1')}
+                            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${rangeActivePhase === '1' ? 'border-blue-400 bg-blue-100 text-blue-800 font-semibold' : 'border-blue-300 text-blue-700 hover:bg-blue-50'}`}
                           >
                             Phase 1 — Capability Surfacing <span className="opacity-60 ml-1">Apr–18 Jul 2023</span>
                           </button>
                           <button
-                            onClick={() => applyPhase(2)}
-                            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${rangeActivePhase === 2 ? 'border-amber-400 bg-amber-100 text-amber-800 font-semibold' : 'border-amber-300 text-amber-700 hover:bg-amber-50'}`}
+                            onClick={() => applyPhase('2')}
+                            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${rangeActivePhase === '2' ? 'border-amber-400 bg-amber-100 text-amber-800 font-semibold' : 'border-amber-300 text-amber-700 hover:bg-amber-50'}`}
                           >
                             Phase 2 — Enclosure &amp; Scrutiny <span className="opacity-60 ml-1">19 Jul–5 Sep 2023</span>
                           </button>
                           <button
-                            onClick={() => applyPhase(3)}
-                            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${rangeActivePhase === 3 ? 'border-emerald-400 bg-emerald-100 text-emerald-800 font-semibold' : 'border-emerald-300 text-emerald-700 hover:bg-emerald-50'}`}
+                            onClick={() => applyPhase('3')}
+                            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${rangeActivePhase === '3' ? 'border-emerald-400 bg-emerald-100 text-emerald-800 font-semibold' : 'border-emerald-300 text-emerald-700 hover:bg-emerald-50'}`}
                           >
                             Phase 3 — Commercialization <span className="opacity-60 ml-1">Sep 2023 onward</span>
+                          </button>
+                          <button
+                            onClick={() => applyPhase('3a')}
+                            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${rangeActivePhase === '3a' ? 'border-violet-400 bg-violet-100 text-violet-800 font-semibold' : 'border-violet-300 text-violet-700 hover:bg-violet-50'}`}
+                          >
+                            Phase 3A — Early Commercialization <span className="opacity-60 ml-1">6 Sep–18 Dec 2023</span>
+                          </button>
+                          <button
+                            onClick={() => applyPhase('3b')}
+                            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${rangeActivePhase === '3b' ? 'border-sky-400 bg-sky-100 text-sky-800 font-semibold' : 'border-sky-300 text-sky-700 hover:bg-sky-50'}`}
+                          >
+                            Phase 3B — Early Wide Adoption <span className="opacity-60 ml-1">18 Dec 2023–17 Mar 2024</span>
+                          </button>
+                          <button
+                            onClick={() => applyPhase('3c')}
+                            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${rangeActivePhase === '3c' ? 'border-orange-400 bg-orange-100 text-orange-800 font-semibold' : 'border-orange-300 text-orange-700 hover:bg-orange-50'}`}
+                          >
+                            Phase 3C — Pre-Litigation <span className="opacity-60 ml-1">17 Mar–16 May 2024</span>
+                          </button>
+                          <button
+                            onClick={() => applyPhase('3d')}
+                            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${rangeActivePhase === '3d' ? 'border-rose-400 bg-rose-100 text-rose-800 font-semibold' : 'border-rose-300 text-rose-700 hover:bg-rose-50'}`}
+                          >
+                            Phase 3D — Warning &amp; Lawsuit <span className="opacity-60 ml-1">17 May 2024 onward</span>
                           </button>
                         </div>
                       )
@@ -3696,7 +5550,7 @@ export default function SearchPage() {
                       </div>
                       <div className="flex flex-col gap-1">
                         <label className="filter-label">Limit</label>
-                        <input type="text" inputMode="numeric" value={String(maxResults)} onChange={(e) => { const d = e.target.value.replace(/\D/g, ''); setMaxResults(d ? parseInt(d) : 10000) }} className={inputCls} />
+                        <input type="text" inputMode="numeric" value={String(maxResults)} onChange={(e) => { const d = e.target.value.replace(/\D/g, ''); setMaxResults(d ? parseInt(d) : 1000000) }} className={inputCls} />
                       </div>
                     </div>
                     <button onClick={doSearch} disabled={searching} className="search-btn">{searching ? 'Searching…' : 'Search'}</button>
@@ -3711,8 +5565,8 @@ export default function SearchPage() {
               </>
             )}
 
-            {/* Users search */}
-            {searchCat === 'users' && (
+            {/* Users Stats Search */}
+            {searchCat === 'users' && usersDataTab === 'search' && (
               <div className="space-y-3">
                 <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-4 gap-y-3 mb-3">
                   <div className="flex flex-col gap-1">
@@ -3732,57 +5586,865 @@ export default function SearchPage() {
                     </select>
                   </div>
                   <div className="flex flex-col gap-1">
-                    <label className="filter-label">Min Words</label>
-                    <input type="text" inputMode="numeric" value={String(minWords)} onChange={(e) => { const d = e.target.value.replace(/\D/g, ''); setMinWords(d ? parseInt(d) : 0) }} className={inputCls} />
+                    <label className="filter-label">Min Words / Msg</label>
+                    <input type="text" inputMode="numeric" placeholder="0" value={minWords === 0 ? '' : String(minWords)} onChange={(e) => { const d = e.target.value.replace(/\D/g, ''); setMinWords(d ? parseInt(d) : 0) }} className={inputCls} />
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label className="filter-label">Min Messages</label>
+                    <input type="text" inputMode="numeric" placeholder="0" value={minMessages === 0 ? '' : String(minMessages)} onChange={(e) => { const d = e.target.value.replace(/\D/g, ''); setMinMessages(d ? parseInt(d) : 0) }} className={inputCls} />
                   </div>
                 </div>
 
                 {/* Phase template shortcuts */}
                 {(() => {
-                  const usersActivePhase =
-                    dateFrom === '2023-04-01' && dateTo === '2023-07-18' ? 1 :
-                    dateFrom === '2023-07-19' && dateTo === '2023-09-05' ? 2 :
-                    dateFrom === '2023-09-06' && dateTo === '' ? 3 : null
+                  type PhaseKey = '1' | '2' | '3' | '3a' | '3b' | '3c' | '3d'
+                  const usersActivePhase: PhaseKey | null =
+                    dateFrom === '2023-04-01' && dateTo === '2023-07-18' ? '1' :
+                    dateFrom === '2023-07-19' && dateTo === '2023-09-05' ? '2' :
+                    dateFrom === '2023-09-06' && dateTo === '' ? '3' :
+                    dateFrom === '2023-09-06' && dateTo === '2023-12-18' ? '3a' :
+                    dateFrom === '2023-12-18' && dateTo === '2024-03-17' ? '3b' :
+                    dateFrom === '2024-03-17' && dateTo === '2024-05-16' ? '3c' :
+                    dateFrom === '2024-05-17' && dateTo === '' ? '3d' : null
 
-                  const applyPhase = (p: 1 | 2 | 3) => {
-                    if (usersActivePhase === p) {
-                      setDateFrom(''); setDateTo('')
-                    } else {
-                      if (p === 1) { setDateFrom('2023-04-01'); setDateTo('2023-07-18') }
-                      else if (p === 2) { setDateFrom('2023-07-19'); setDateTo('2023-09-05') }
-                      else { setDateFrom('2023-09-06'); setDateTo('') }
+                  const applyPhase = (p: PhaseKey) => {
+                    let newFrom = ''
+                    let newTo = ''
+                    if (usersActivePhase !== p) {
+                      if (p === '1')       { newFrom = '2023-04-01'; newTo = '2023-07-18' }
+                      else if (p === '2')  { newFrom = '2023-07-19'; newTo = '2023-09-05' }
+                      else if (p === '3')  { newFrom = '2023-09-06'; newTo = '' }
+                      else if (p === '3a') { newFrom = '2023-09-06'; newTo = '2023-12-18' }
+                      else if (p === '3b') { newFrom = '2023-12-18'; newTo = '2024-03-17' }
+                      else if (p === '3c') { newFrom = '2024-03-17'; newTo = '2024-05-16' }
+                      else if (p === '3d') { newFrom = '2024-05-17'; newTo = '' }
                     }
+                    setDateFrom(newFrom)
+                    setDateTo(newTo)
+                    // Trigger search immediately with the new dates — state hasn't re-rendered yet
+                    // so we pass the new values explicitly rather than relying on stale closure state
+                    doUserSearch({ from: newFrom, to: newTo })
                   }
 
                   return (
-                    <div className="flex flex-wrap gap-2 mb-1">
+                    <div className="flex flex-wrap gap-1.5 mb-1">
                       <span className="filter-label self-center shrink-0">Phase</span>
-                      <button
-                        onClick={() => applyPhase(1)}
-                        className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${usersActivePhase === 1 ? 'border-blue-400 bg-blue-100 text-blue-800 font-semibold' : 'border-blue-300 text-blue-700 hover:bg-blue-50'}`}
-                      >
-                        Phase 1 — Capability Surfacing <span className="opacity-60 ml-1">Apr–18 Jul 2023</span>
-                      </button>
-                      <button
-                        onClick={() => applyPhase(2)}
-                        className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${usersActivePhase === 2 ? 'border-amber-400 bg-amber-100 text-amber-800 font-semibold' : 'border-amber-300 text-amber-700 hover:bg-amber-50'}`}
-                      >
-                        Phase 2 — Enclosure &amp; Scrutiny <span className="opacity-60 ml-1">19 Jul–5 Sep 2023</span>
-                      </button>
-                      <button
-                        onClick={() => applyPhase(3)}
-                        className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${usersActivePhase === 3 ? 'border-emerald-400 bg-emerald-100 text-emerald-800 font-semibold' : 'border-emerald-300 text-emerald-700 hover:bg-emerald-50'}`}
-                      >
-                        Phase 3 — Commercialization <span className="opacity-60 ml-1">Sep 2023 onward</span>
-                      </button>
+                      {([
+                        { key: '1',  label: 'Phase 1 — Capability Surfacing',     dates: 'Apr–18 Jul 2023',          cls: ['border-blue-400 bg-blue-100 text-blue-800',       'border-blue-300 text-blue-700 hover:bg-blue-50']       },
+                        { key: '2',  label: 'Phase 2 — Enclosure & Scrutiny',     dates: '19 Jul–5 Sep 2023',        cls: ['border-amber-400 bg-amber-100 text-amber-800',    'border-amber-300 text-amber-700 hover:bg-amber-50']    },
+                        { key: '3',  label: 'Phase 3 — Commercialization',        dates: 'Sep 2023 onward',          cls: ['border-emerald-400 bg-emerald-100 text-emerald-800', 'border-emerald-300 text-emerald-700 hover:bg-emerald-50'] },
+                        { key: '3a', label: 'Phase 3A — Early Commercialization', dates: '6 Sep–18 Dec 2023',        cls: ['border-violet-400 bg-violet-100 text-violet-800', 'border-violet-300 text-violet-700 hover:bg-violet-50'] },
+                        { key: '3b', label: 'Phase 3B — Early Wide Adoption',     dates: '18 Dec 2023–17 Mar 2024',  cls: ['border-sky-400 bg-sky-100 text-sky-800',          'border-sky-300 text-sky-700 hover:bg-sky-50']          },
+                        { key: '3c', label: 'Phase 3C — Pre-Litigation',          dates: '17 Mar–16 May 2024',       cls: ['border-orange-400 bg-orange-100 text-orange-800', 'border-orange-300 text-orange-700 hover:bg-orange-50'] },
+                        { key: '3d', label: 'Phase 3D — Warning & Lawsuit',       dates: '17 May 2024 onward',       cls: ['border-rose-400 bg-rose-100 text-rose-800',       'border-rose-300 text-rose-700 hover:bg-rose-50']       },
+                      ] as { key: PhaseKey; label: string; dates: string; cls: [string, string] }[]).map(({ key, label, dates, cls }) => (
+                        <button
+                          key={key}
+                          onClick={() => applyPhase(key)}
+                          className={`text-xs px-2.5 py-1 rounded-full border transition-colors font-medium ${usersActivePhase === key ? cls[0] + ' font-semibold' : cls[1]}`}
+                        >
+                          {label} <span className="opacity-60 ml-1">{dates}</span>
+                        </button>
+                      ))}
                     </div>
                   )
                 })()}
 
-                <button onClick={doUserSearch} disabled={searching} className="search-btn mb-4">{searching ? 'Searching…' : 'Search'}</button>
+                <button onClick={() => doUserSearch()} disabled={searching} className="search-btn mb-4">{searching ? 'Searching…' : 'Search'}</button>
                 <p className="text-xs text-gray-500 mb-4">Returns all users active in the selected date range with message statistics. Leave dates empty to include all data.</p>
               </div>
             )}
+
+            {/* User Summary Per Phases */}
+            {searchCat === 'users' && usersDataTab === 'phases' && (() => {
+              const pendingFetch = [...selectedPhases].filter((k) => !(k in phaseData))
+
+              const phaseFilterEnd = (key: string) => {
+                const def = PHASE_DEFS.find((p) => p.key === key)!
+                if (def.to) return def.to
+                return (phaseData[key] ?? []).reduce((max, u) =>
+                  u.last_date && u.last_date > max ? u.last_date.slice(0, 10) : max, '')
+              }
+
+              const computePhaseCounts = (key: string) => {
+                const users = phaseData[key] ?? []
+                if (users.length === 0) return null
+                const def = PHASE_DEFS.find((p) => p.key === key)!
+                const filterEnd = phaseFilterEnd(key)
+                const counts = { high: 0, medium: 0, low: 0 }
+                for (const u of users) {
+                  const info = classifyEngagement(u, def.from, filterEnd)
+                  counts[info.level as keyof typeof counts]++
+                }
+                return { total: users.length, ...counts }
+              }
+
+              // Newcomers-only chart data: per phase, only count users not present in any earlier loaded phase
+              const loadedSorted = [...selectedPhases]
+                .filter(k => k in phaseData)
+                .sort((a, b) => PHASE_DEFS.findIndex(d => d.key === a) - PHASE_DEFS.findIndex(d => d.key === b))
+
+              const chartData = loadedSorted.map((key) => {
+                const def = PHASE_DEFS.find((p) => p.key === key)
+                if (!def || !phaseData[key]) return null
+                const c = computePhaseCounts(key)
+                if (!c) return null
+                return {
+                  phase: def.label,
+                  High: c.high,
+                  Medium: c.medium,
+                  Low: c.low,
+                  total: c.total,
+                }
+              }).filter(Boolean) as { phase: string; High: number; Medium: number; Low: number; total: number }[]
+
+              const pctData = chartData.map((d) => ({
+                phase: d.phase,
+                High:   d.total > 0 ? Math.round((d.High   / d.total) * 100) : 0,
+                Medium: d.total > 0 ? Math.round((d.Medium / d.total) * 100) : 0,
+                Low:    d.total > 0 ? Math.round((d.Low    / d.total) * 100) : 0,
+              }))
+
+
+              const hasData = chartData.length > 0
+
+              return (
+                <div className="space-y-4">
+                  {/* Phase selector chips */}
+                  <div>
+                    <div className="flex flex-wrap items-center gap-2 mb-2">
+                      <span className="filter-label shrink-0">Select Phases</span>
+                      <button
+                        onClick={() => {
+                          const all = new Set(PHASE_DEFS.map((p) => p.key))
+                          setSelectedPhases(all)
+                          fetchPhaseSummary(all, { minWords, minMessages })
+                        }}
+                        className="text-xs px-2 py-0.5 rounded border border-gray-300 text-gray-600 hover:bg-gray-50 transition-colors"
+                      >
+                        All
+                      </button>
+                      <button
+                        onClick={() => setSelectedPhases(new Set())}
+                        className="text-xs px-2 py-0.5 rounded border border-gray-300 text-gray-600 hover:bg-gray-50 transition-colors"
+                      >
+                        Clear
+                      </button>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {PHASE_DEFS.map((def) => {
+                        const selected = selectedPhases.has(def.key)
+                        const loaded = def.key in phaseData
+                        return (
+                          <button
+                            key={def.key}
+                            onClick={() => {
+                              const next = new Set(selectedPhases)
+                              if (next.has(def.key)) next.delete(def.key)
+                              else next.add(def.key)
+                              setSelectedPhases(next)
+                            }}
+                            className={`text-xs px-3 py-1.5 rounded-full border transition-colors font-medium ${
+                              selected ? def.chipCls + ' ring-2 ring-offset-1 ring-gray-400' : 'border-gray-300 text-gray-500 hover:bg-gray-50'
+                            }`}
+                          >
+                            {def.label}
+                            <span className="opacity-60 ml-1.5 font-normal">{def.sub}</span>
+                            <span className="opacity-40 ml-1.5 font-normal text-[10px]">· {def.to ? daysBetween(def.from, def.to) : '?'}d</span>
+                            {phaseLoadingSet.has(def.key) && (
+                              <span className="ml-1.5 inline-block w-2.5 h-2.5 border border-current border-t-transparent rounded-full animate-spin opacity-60" />
+                            )}
+                            {selected && !loaded && !phaseLoadingSet.has(def.key) && <span className="ml-1 opacity-40 text-[10px]">—</span>}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Phase filters */}
+                  <div className="flex flex-wrap gap-x-4 gap-y-2 items-end">
+                    <div className="flex flex-col gap-1">
+                      <label className="filter-label">Min Words / Msg</label>
+                      <input type="text" inputMode="numeric" placeholder="0" value={minWords === 0 ? '' : String(minWords)} onChange={(e) => { const d = e.target.value.replace(/\D/g, ''); setMinWords(d ? parseInt(d) : 0) }} className={inputCls} />
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      <label className="filter-label">Min Messages</label>
+                      <input type="text" inputMode="numeric" placeholder="0" value={minMessages === 0 ? '' : String(minMessages)} onChange={(e) => { const d = e.target.value.replace(/\D/g, ''); setMinMessages(d ? parseInt(d) : 0) }} className={inputCls} />
+                    </div>
+                  </div>
+
+                  {/* Load button */}
+                  {selectedPhases.size > 0 && pendingFetch.length > 0 && (
+                    <button
+                      onClick={() => fetchPhaseSummary(selectedPhases, { minWords, minMessages })}
+                      disabled={phaseLoadingSet.size > 0}
+                      className="search-btn"
+                    >
+                      {phaseLoadingSet.size > 0 ? `Loading ${phaseLoadingSet.size} phase${phaseLoadingSet.size > 1 ? 's' : ''}…` : `Load ${pendingFetch.length} Phase${pendingFetch.length > 1 ? 's' : ''}`}
+                    </button>
+                  )}
+
+                  {hasData && (
+                    <div className="space-y-6">
+                      {/* User Flow Analysis — dropout, newcomers, resurgence per phase */}
+                      {(() => {
+                        const loadedKeys = [...selectedPhases]
+                          .filter(k => k in phaseData)
+                          .sort((a, b) => PHASE_DEFS.findIndex(d => d.key === a) - PHASE_DEFS.findIndex(d => d.key === b))
+                        if (loadedKeys.length === 0) return null
+
+                        // Build per-phase status maps
+                        const phaseStatusMaps: Record<string, Map<string, EngagementLevel>> = {}
+                        const phaseUserSets: Record<string, Set<string>> = {}
+                        for (const key of loadedKeys) {
+                          const def = PHASE_DEFS.find(p => p.key === key)!
+                          const filterEnd = phaseFilterEnd(key)
+                          phaseStatusMaps[key] = new Map()
+                          phaseUserSets[key] = new Set()
+                          for (const u of phaseData[key]) {
+                            const info = classifyEngagement(u, def.from, filterEnd)
+                            phaseStatusMaps[key].set(u.username, info.level)
+                            phaseUserSets[key].add(u.username)
+                          }
+                        }
+
+                        type FlowRow = {
+                          key: string; label: string; sub: string; chipCls: string
+                          periodDays: number | null; totalWeeks: number
+                          total: number;           totalUsers: string[]
+                          highInPhase: number;     highUsers: string[]
+                          medInPhase: number;      medUsers: string[]
+                          lowInPhase: number;      lowUsers: string[]
+                          newComers: number;       newComerUsers: string[]
+                          dropoutHigh: number | null; dropoutHighUsers: string[]
+                          dropoutMed:  number | null; dropoutMedUsers:  string[]
+                          dropoutLow:  number | null; dropoutLowUsers:  string[]
+                          decHM: number | null; decHMUsers: string[]
+                          decHL: number | null; decHLUsers: string[]
+                          decML: number | null; decMLUsers: string[]
+                        }
+
+                        const flowRows: FlowRow[] = loadedKeys.map((key, i) => {
+                          const def = PHASE_DEFS.find(p => p.key === key)!
+                          const periodDays = def.to ? daysBetween(def.from, def.to) : null
+                          const statusMap = phaseStatusMaps[key]
+                          const userSet = phaseUserSets[key]
+                          const totalUsers = [...userSet].sort()
+                          const highUsers = [...statusMap.entries()].filter(([,s]) => s === 'high').map(([u]) => u).sort()
+                          const medUsers  = [...statusMap.entries()].filter(([,s]) => s === 'medium').map(([u]) => u).sort()
+                          const lowUsers  = [...statusMap.entries()].filter(([,s]) => s === 'low').map(([u]) => u).sort()
+                          const earlierKeys = loadedKeys.slice(0, i)
+                          const newComerUsers = totalUsers.filter(u => !earlierKeys.some(k => phaseUserSets[k].has(u)))
+                          let dropoutHigh: number | null = null, dropoutHighUsers: string[] = []
+                          let dropoutMed:  number | null = null, dropoutMedUsers:  string[] = []
+                          let dropoutLow:  number | null = null, dropoutLowUsers:  string[] = []
+                          let decHM: number | null = null, decHMUsers: string[] = []
+                          let decHL: number | null = null, decHLUsers: string[] = []
+                          let decML: number | null = null, decMLUsers: string[] = []
+                          if (i > 0) {
+                            const prevKey = loadedKeys[i - 1]
+                            const prevStatus = phaseStatusMaps[prevKey]
+                            const prevUsers = phaseUserSets[prevKey]
+                            decHMUsers = [...prevUsers].filter(u => prevStatus.get(u) === 'high'   && statusMap.get(u) === 'medium').sort()
+                            decHM = decHMUsers.length
+                            decHLUsers = [...prevUsers].filter(u => prevStatus.get(u) === 'high'   && statusMap.get(u) === 'low').sort()
+                            decHL = decHLUsers.length
+                            decMLUsers = [...prevUsers].filter(u => prevStatus.get(u) === 'medium' && statusMap.get(u) === 'low').sort()
+                            decML = decMLUsers.length
+                            dropoutHighUsers = [...prevUsers].filter(u => prevStatus.get(u) === 'high'   && !userSet.has(u)).sort()
+                            dropoutHigh = dropoutHighUsers.length
+                            dropoutMedUsers  = [...prevUsers].filter(u => prevStatus.get(u) === 'medium' && !userSet.has(u)).sort()
+                            dropoutMed  = dropoutMedUsers.length
+                            dropoutLowUsers  = [...prevUsers].filter(u => prevStatus.get(u) === 'low'    && !userSet.has(u)).sort()
+                            dropoutLow  = dropoutLowUsers.length
+                          }
+                          const totalWeeks = Math.ceil(Math.max(14, periodDays ?? 90) / 7)
+                          return { key, label: def.label, sub: def.sub, chipCls: def.chipCls, periodDays, totalWeeks, total: totalUsers.length, totalUsers, highInPhase: highUsers.length, highUsers, medInPhase: medUsers.length, medUsers, lowInPhase: lowUsers.length, lowUsers, newComers: newComerUsers.length, newComerUsers, dropoutHigh, dropoutHighUsers, dropoutMed, dropoutMedUsers, dropoutLow, dropoutLowUsers, decHM, decHMUsers, decHL, decHLUsers, decML, decMLUsers }
+                        })
+
+                        const pct = (n: number, d: number) => d > 0 ? `${Math.round(n / d * 100)}%` : '—'
+
+                        const makeModalUsers = (usernames: string[], srcKey: string, statusOverride?: EngagementLevel | 'no-data'): FlowModalUser[] =>
+                          usernames.map(u => {
+                            const data = (phaseData[srcKey] ?? []).find(x => x.username === u)
+                            const hasData = statusOverride !== 'no-data'
+                            return {
+                              username: u,
+                              total_messages: hasData ? (data?.total_messages ?? 0) : 0,
+                              weeks_active: hasData ? (data?.weeks_active ?? null) : null,
+                              pct_weeks: hasData ? (data?.pct_weeks ?? null) : null,
+                              avg_words: hasData ? (data?.avg_words ?? null) : null,
+                              status: statusOverride !== undefined ? statusOverride : (phaseStatusMaps[srcKey]?.get(u) ?? null),
+                            }
+                          })
+
+                        return (
+                          <div className="overflow-x-auto rounded-xl border border-gray-200">
+                            <div className="px-4 py-3 bg-gray-50 border-b border-gray-200 flex items-center justify-between">
+                              <div>
+                                <h3 className="text-xs font-semibold text-gray-700 uppercase tracking-wide">User Flow Analysis</h3>
+                                <p className="text-[10px] text-gray-400 mt-0.5">Dropout, newcomers and engagement changes across phases</p>
+                              </div>
+                              <button
+                                onClick={() => {
+                                  const p = (n: number | null, d: number) => n !== null && d > 0 ? `${Math.round(n / d * 100)}%` : '—'
+                                  const csvHeaders = ['Phase', 'Sub', 'Days', 'Total', 'New Joiners', 'New %', 'High', 'High %', 'Medium', 'Med %', 'Low', 'Low %', '↓H→M', '↓H→M %', '↓H→L', '↓H→L %', '↓M→L', '↓M→L %', '↓Out(High)', '↓Out(High) %', '↓Out(Med)', '↓Out(Med) %', '↓Out(Low)', '↓Out(Low) %']
+                                  const csvRows: (string | number | null)[][] = flowRows.map((fr, ri) => {
+                                    const pt = ri > 0 ? phaseUserSets[loadedKeys[ri - 1]].size : 0
+                                    return [fr.label, fr.sub, fr.periodDays ?? '', fr.total, fr.newComers, p(fr.newComers, fr.total), fr.highInPhase, p(fr.highInPhase, fr.total), fr.medInPhase, p(fr.medInPhase, fr.total), fr.lowInPhase, p(fr.lowInPhase, fr.total), fr.decHM ?? '—', p(fr.decHM, pt), fr.decHL ?? '—', p(fr.decHL, pt), fr.decML ?? '—', p(fr.decML, pt), fr.dropoutHigh ?? '—', p(fr.dropoutHigh, pt), fr.dropoutMed ?? '—', p(fr.dropoutMed, pt), fr.dropoutLow ?? '—', p(fr.dropoutLow, pt)]
+                                  })
+                                  downloadTableAsCSV(csvHeaders, csvRows, 'user-flow-analysis.csv')
+                                }}
+                                className="flex items-center gap-1.5 text-[10px] text-gray-500 hover:text-gray-700 px-2 py-1 rounded border border-gray-200 hover:border-gray-300 hover:bg-white transition-colors"
+                                title="Export as CSV"
+                              >
+                                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                                CSV
+                              </button>
+                            </div>
+                            <table className="w-full text-xs border-collapse">
+                              <thead>
+                                <tr className="bg-gray-50 border-b border-gray-200 text-left text-[11px]">
+                                  <th className="px-3 py-2.5 font-semibold text-gray-700">Phase</th>
+                                  <th className="px-3 py-2.5 font-semibold text-gray-700 text-right">Total</th>
+                                  <th className="px-3 py-2.5 font-semibold text-blue-600 text-right" title="Users whose first message across all loaded phases is in this phase">New Joiners</th>
+                                  <th className="px-3 py-2.5 font-semibold text-emerald-700 text-right" title="Users with high engagement (≥50% weeks AND msgs ≥ 20×⌈50% of phase weeks⌉)">High Eng.</th>
+                                  <th className="px-3 py-2.5 font-semibold text-sky-700 text-right" title="Users with medium engagement in this phase">Med Eng.</th>
+                                  <th className="px-3 py-2.5 font-semibold text-amber-700 text-right" title="Users with low engagement (&lt;20% weeks) in this phase">Low Eng.</th>
+                                  <th className="px-3 py-2.5 font-semibold text-orange-600 text-right" title="High → Medium engagement decrease from previous phase">↓ H→M</th>
+                                  <th className="px-3 py-2.5 font-semibold text-red-600 text-right" title="High → Low engagement decrease from previous phase">↓ H→L</th>
+                                  <th className="px-3 py-2.5 font-semibold text-orange-700 text-right" title="Medium → Low engagement decrease from previous phase">↓ M→L</th>
+                                  <th className="px-3 py-2.5 font-semibold text-rose-700 text-right" title="High engagement in prev phase → absent in current phase">↓ Out (High)</th>
+                                  <th className="px-3 py-2.5 font-semibold text-rose-600 text-right" title="Medium engagement in prev phase → absent in current phase">↓ Out (Med)</th>
+                                  <th className="px-3 py-2.5 font-semibold text-rose-500 text-right" title="Low engagement in prev phase → absent in current phase">↓ Out (Low)</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {flowRows.map((row, i) => {
+                                  const prevTotal = i > 0 ? phaseUserSets[loadedKeys[i - 1]].size : 0
+                                  const prevKey = i > 0 ? loadedKeys[i - 1] : row.key
+                                  const prevRowTotalWeeks = i > 0 ? flowRows[i - 1].totalWeeks : 0
+                                  const crossCell = (val: number | null, users: string[], color: string, pctColor: string, title: string, src: string, wks: number, override?: EngagementLevel | 'no-data') =>
+                                    val !== null ? (
+                                      <div className="flex flex-col items-end">
+                                        <button onClick={() => { setFlowModalSortCol('total_messages'); setFlowModalSortDir('desc'); setFlowModal({ title: `${title} in ${row.label}`, users: makeModalUsers(users, src, override), totalWeeks: wks }) }} className={`hover:underline font-semibold tabular-nums ${color}`}>
+                                          {val}
+                                        </button>
+                                        <span className={`text-[10px] ${pctColor}`}>{pct(val, prevTotal)}</span>
+                                      </div>
+                                    ) : <span className="text-gray-300">—</span>
+                                  return (
+                                    <tr key={row.key} className="border-b border-gray-100 hover:bg-gray-50">
+                                      <td className="px-3 py-2.5 min-w-[130px]">
+                                        <div className="flex flex-col gap-0.5">
+                                          <span className={`inline-block self-start px-2 py-0.5 rounded-full text-[10px] font-bold border ${row.chipCls}`}>{row.label}</span>
+                                          <span className="text-gray-700 text-[11px] font-medium leading-tight">{row.sub}</span>
+                                          <span className="text-gray-400 text-[10px]">{row.periodDays ?? '?'}d</span>
+                                        </div>
+                                      </td>
+                                      <td className="px-3 py-2.5 text-right">
+                                        <button onClick={() => { setFlowModalSortCol('total_messages'); setFlowModalSortDir('desc'); setFlowModal({ title: `All users in ${row.label}`, users: makeModalUsers(row.totalUsers, row.key), totalWeeks: row.totalWeeks }) }} className="font-bold text-gray-800 hover:underline tabular-nums text-sm">{row.total}</button>
+                                      </td>
+                                      <td className="px-3 py-2.5 text-right tabular-nums">
+                                        <div className="flex flex-col items-end">
+                                          <button onClick={() => { setFlowModalSortCol('total_messages'); setFlowModalSortDir('desc'); setFlowModal({ title: `New joiners in ${row.label}`, users: makeModalUsers(row.newComerUsers, row.key), totalWeeks: row.totalWeeks }) }} className="font-semibold text-blue-600 hover:underline">{row.newComers}</button>
+                                          <span className="text-[10px] text-blue-400">{pct(row.newComers, row.total)}</span>
+                                        </div>
+                                      </td>
+                                      <td className="px-3 py-2.5 text-right tabular-nums">
+                                        <div className="flex flex-col items-end">
+                                          <button onClick={() => { setFlowModalSortCol('total_messages'); setFlowModalSortDir('desc'); setFlowModal({ title: `High Engagement in ${row.label}`, users: makeModalUsers(row.highUsers, row.key), totalWeeks: row.totalWeeks }) }} className="font-semibold text-emerald-700 hover:underline">{row.highInPhase}</button>
+                                          <span className="text-[10px] text-emerald-500">{pct(row.highInPhase, row.total)}</span>
+                                        </div>
+                                      </td>
+                                      <td className="px-3 py-2.5 text-right tabular-nums">
+                                        <div className="flex flex-col items-end">
+                                          <button onClick={() => { setFlowModalSortCol('total_messages'); setFlowModalSortDir('desc'); setFlowModal({ title: `Med Engagement in ${row.label}`, users: makeModalUsers(row.medUsers, row.key), totalWeeks: row.totalWeeks }) }} className="font-semibold text-sky-700 hover:underline">{row.medInPhase}</button>
+                                          <span className="text-[10px] text-sky-500">{pct(row.medInPhase, row.total)}</span>
+                                        </div>
+                                      </td>
+                                      <td className="px-3 py-2.5 text-right tabular-nums">
+                                        <div className="flex flex-col items-end">
+                                          <button onClick={() => { setFlowModalSortCol('total_messages'); setFlowModalSortDir('desc'); setFlowModal({ title: `Low Engagement in ${row.label}`, users: makeModalUsers(row.lowUsers, row.key), totalWeeks: row.totalWeeks }) }} className="font-semibold text-amber-700 hover:underline">{row.lowInPhase}</button>
+                                          <span className="text-[10px] text-amber-500">{pct(row.lowInPhase, row.total)}</span>
+                                        </div>
+                                      </td>
+                                      <td className="px-3 py-2.5 text-right tabular-nums">{crossCell(row.decHM, row.decHMUsers, 'text-orange-600', 'text-orange-400', '↓ H→M', row.key, row.totalWeeks)}</td>
+                                      <td className="px-3 py-2.5 text-right tabular-nums">{crossCell(row.decHL, row.decHLUsers, 'text-red-600', 'text-red-400', '↓ H→L', row.key, row.totalWeeks)}</td>
+                                      <td className="px-3 py-2.5 text-right tabular-nums">{crossCell(row.decML, row.decMLUsers, 'text-orange-700', 'text-orange-500', '↓ M→L', row.key, row.totalWeeks)}</td>
+                                      <td className="px-3 py-2.5 text-right tabular-nums">{crossCell(row.dropoutHigh, row.dropoutHighUsers, 'text-rose-700', 'text-rose-400', '↓ Out (High)', prevKey, prevRowTotalWeeks, 'no-data')}</td>
+                                      <td className="px-3 py-2.5 text-right tabular-nums">{crossCell(row.dropoutMed,  row.dropoutMedUsers,  'text-rose-600', 'text-rose-400', '↓ Out (Med)',  prevKey, prevRowTotalWeeks, 'no-data')}</td>
+                                      <td className="px-3 py-2.5 text-right tabular-nums">{crossCell(row.dropoutLow,  row.dropoutLowUsers,  'text-rose-500', 'text-rose-300', '↓ Out (Low)',  prevKey, prevRowTotalWeeks, 'no-data')}</td>
+                                    </tr>
+                                  )
+                                })}
+                              </tbody>
+                            </table>
+                            <p className="text-[10px] text-gray-400 px-4 py-2 border-t border-gray-100 italic">
+                              "↓ H→M/H→L/M→L": engagement tier dropped but user still present. "↓ Out (High/Med/Low)": user absent from current phase, counted by their prior tier. All cross-phase metrics compare against the immediately preceding loaded phase.
+                            </p>
+                          </div>
+                        )
+                      })()}
+
+                      {/* Status toggles shared across all charts */}
+                      {(() => {
+                        const STATUSES = [
+                          { key: 'High',   label: 'High Eng.', color: '#10b981', activeCls: 'bg-emerald-100 text-emerald-700 border-emerald-400 ring-emerald-300', inactiveCls: 'bg-gray-100 text-gray-400 border-gray-300' },
+                          { key: 'Medium', label: 'Med Eng.',  color: '#0ea5e9', activeCls: 'bg-sky-100 text-sky-700 border-sky-400 ring-sky-300',                 inactiveCls: 'bg-gray-100 text-gray-400 border-gray-300' },
+                          { key: 'Low',    label: 'Low Eng.',  color: '#f59e0b', activeCls: 'bg-amber-100 text-amber-700 border-amber-400 ring-amber-300',         inactiveCls: 'bg-gray-100 text-gray-400 border-gray-300' },
+                        ]
+                        const toggle = (key: string) => setPhaseChartStatuses((prev) => {
+                          const next = new Set(prev)
+                          if (next.has(key)) { if (next.size > 1) next.delete(key) }
+                          else next.add(key)
+                          return next
+                        })
+                        const show = phaseChartStatuses
+                        return (
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-[10px] text-gray-400 font-medium uppercase tracking-wide">Show:</span>
+                            {STATUSES.map(({ key, label, activeCls, inactiveCls }) => (
+                              <button
+                                key={key}
+                                onClick={() => toggle(key)}
+                                className={`text-xs px-3 py-1 rounded-full border font-semibold transition-colors ${show.has(key) ? `${activeCls} ring-2 ring-offset-1` : inactiveCls}`}
+                              >
+                                {label}
+                              </button>
+                            ))}
+                            <button
+                              onClick={() => setPhaseChartStatuses(new Set(['High', 'Medium', 'Low']))}
+                              className="text-[10px] text-gray-400 hover:text-gray-600 underline ml-1"
+                            >
+                              reset
+                            </button>
+                          </div>
+                        )
+                      })()}
+
+                      {/* Grouped bar chart — absolute counts */}
+                      <div>
+                        <div className="flex items-center justify-between mb-2">
+                          <h3 className="text-xs font-semibold text-gray-600 uppercase tracking-wide">User Counts by Status per Phase</h3>
+                          <button onClick={() => downloadChartAsPNG(chartCountsRef.current, 'user-counts-per-phase.png')} className="flex items-center gap-1.5 text-[10px] text-gray-500 hover:text-gray-700 px-2 py-1 rounded border border-gray-200 hover:border-gray-300 hover:bg-gray-50 transition-colors" title="Export as PNG">
+                            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                            PNG
+                          </button>
+                        </div>
+                        <div ref={chartCountsRef}>
+                          <ResponsiveContainer width="100%" height={220}>
+                            <BarChart data={chartData} barGap={2} barCategoryGap="25%">
+                              <XAxis dataKey="phase" tick={{ fontSize: 10 }} />
+                              <YAxis tick={{ fontSize: 10 }} />
+                              <Tooltip contentStyle={{ fontSize: 11 }} />
+                              {phaseChartStatuses.has('High')   && <Bar dataKey="High"   fill="#10b981" radius={[3, 3, 0, 0]} />}
+                              {phaseChartStatuses.has('Medium') && <Bar dataKey="Medium" fill="#0ea5e9" radius={[3, 3, 0, 0]} />}
+                              {phaseChartStatuses.has('Low')    && <Bar dataKey="Low"    fill="#f59e0b" radius={[3, 3, 0, 0]} />}
+                            </BarChart>
+                          </ResponsiveContainer>
+                          <div className="flex gap-4 justify-center mt-1">
+                            {([['#10b981', 'High', 'High Eng.'], ['#0ea5e9', 'Medium', 'Med Eng.'], ['#f59e0b', 'Low', 'Low Eng.']] as [string,string,string][]).filter(([, k]) => phaseChartStatuses.has(k)).map(([color,, label]) => (
+                              <span key={label} className="flex items-center gap-1 text-[10px] text-gray-500">
+                                <span className="inline-block w-3 h-2.5 rounded-sm" style={{ backgroundColor: color }} />
+                                {label}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Trend lines (%) */}
+                      {chartData.length > 1 && (
+                        <div>
+                          <div className="flex items-center justify-between mb-2">
+                            <h3 className="text-xs font-semibold text-gray-600 uppercase tracking-wide">Status Trends (%) Across Phases</h3>
+                            <button onClick={() => downloadChartAsPNG(chartTrendsRef.current, 'status-trends-pct.png')} className="flex items-center gap-1.5 text-[10px] text-gray-500 hover:text-gray-700 px-2 py-1 rounded border border-gray-200 hover:border-gray-300 hover:bg-gray-50 transition-colors" title="Export as PNG">
+                              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                              PNG
+                            </button>
+                          </div>
+                          <div ref={chartTrendsRef}>
+                            <ResponsiveContainer width="100%" height={200}>
+                              <AreaChart data={pctData}>
+                                <XAxis dataKey="phase" tick={{ fontSize: 10 }} />
+                                <YAxis tick={{ fontSize: 10 }} unit="%" domain={[0, 100]} />
+                                <Tooltip contentStyle={{ fontSize: 11 }} formatter={(v: number) => `${v}%`} />
+                                {phaseChartStatuses.has('High')   && <Area type="monotone" dataKey="High"   stroke="#10b981" fill="none" strokeWidth={2} dot={{ r: 4, fill: '#10b981' }} />}
+                                {phaseChartStatuses.has('Medium') && <Area type="monotone" dataKey="Medium" stroke="#0ea5e9" fill="none" strokeWidth={2} dot={{ r: 4, fill: '#0ea5e9' }} />}
+                                {phaseChartStatuses.has('Low')    && <Area type="monotone" dataKey="Low"    stroke="#f59e0b" fill="none" strokeWidth={2} dot={{ r: 4, fill: '#f59e0b' }} />}
+                              </AreaChart>
+                            </ResponsiveContainer>
+                            <div className="flex gap-4 justify-center mt-1">
+                              {([['#10b981', 'High', 'High Eng.'], ['#0ea5e9', 'Medium', 'Med Eng.'], ['#f59e0b', 'Low', 'Low Eng.']] as [string,string,string][]).filter(([, k]) => phaseChartStatuses.has(k)).map(([color,, label]) => (
+                                <span key={label} className="flex items-center gap-1 text-[10px] text-gray-500">
+                                  <span className="inline-block w-4 h-0.5 rounded" style={{ backgroundColor: color }} />
+                                  {label}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Stacked % breakdown */}
+                      {chartData.length > 1 && (
+                        <div>
+                          <div className="flex items-center justify-between mb-2">
+                            <h3 className="text-xs font-semibold text-gray-600 uppercase tracking-wide">Status Distribution (%) — Stacked</h3>
+                            <button onClick={() => downloadChartAsPNG(chartStackedRef.current, 'status-distribution-stacked.png')} className="flex items-center gap-1.5 text-[10px] text-gray-500 hover:text-gray-700 px-2 py-1 rounded border border-gray-200 hover:border-gray-300 hover:bg-gray-50 transition-colors" title="Export as PNG">
+                              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                              PNG
+                            </button>
+                          </div>
+                          <div ref={chartStackedRef}>
+                            <ResponsiveContainer width="100%" height={180}>
+                              <BarChart data={pctData} barCategoryGap="30%">
+                                <XAxis dataKey="phase" tick={{ fontSize: 10 }} />
+                                <YAxis tick={{ fontSize: 10 }} unit="%" domain={[0, 100]} />
+                                <Tooltip contentStyle={{ fontSize: 11 }} formatter={(v: number) => `${v}%`} />
+                                {phaseChartStatuses.has('High')   && <Bar dataKey="High"   stackId="s" fill="#10b981" />}
+                                {phaseChartStatuses.has('Medium') && <Bar dataKey="Medium" stackId="s" fill="#0ea5e9" />}
+                                {phaseChartStatuses.has('Low')    && <Bar dataKey="Low"    stackId="s" fill="#f59e0b" radius={[3, 3, 0, 0]} />}
+                              </BarChart>
+                            </ResponsiveContainer>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Section A: Users active across phases */}
+                      {(() => {
+                        const loadedKeys = [...selectedPhases].filter((k) => k in phaseData)
+                        if (loadedKeys.length === 0) return null
+
+                        // Per-phase active sets
+                        const phaseActiveMaps = loadedKeys.map((key) => {
+                          const def = PHASE_DEFS.find((p) => p.key === key)!
+                          const filterEnd = phaseFilterEnd(key)
+                          const map = new Map<string, UserInRange>()
+                          for (const u of phaseData[key]) {
+                            if (classifyEngagement(u, def.from, filterEnd).level === 'high') map.set(u.username, u)
+                          }
+                          return { key, map }
+                        })
+
+                        // Intersection: users who are active in ALL loaded phases
+                        const baseMap = phaseActiveMaps[0].map
+                        const crossActiveUsernames = [...baseMap.keys()].filter((name) =>
+                          phaseActiveMaps.every(({ map }) => map.has(name))
+                        )
+                        crossActiveUsernames.sort((a, b) => {
+                          const totalA = loadedKeys.reduce((s, k) => s + (phaseData[k].find((u) => u.username === a)?.total_messages ?? 0), 0)
+                          const totalB = loadedKeys.reduce((s, k) => s + (phaseData[k].find((u) => u.username === b)?.total_messages ?? 0), 0)
+                          return totalB - totalA
+                        })
+
+                        const isExpanded = expandedPhaseSections.has('cross-active')
+                        const toggleSection = () => setExpandedPhaseSections((prev) => {
+                          const next = new Set(prev)
+                          if (next.has('cross-active')) next.delete('cross-active')
+                          else next.add('cross-active')
+                          return next
+                        })
+
+                        const label = loadedKeys.length === 1
+                          ? `Active users in ${PHASE_DEFS.find((p) => p.key === loadedKeys[0])?.label}`
+                          : `Users active across all ${loadedKeys.length} selected phases`
+
+                        return (
+                          <div className="rounded-xl border border-gray-200 overflow-hidden">
+                            <div className="flex items-center justify-between px-4 py-3 bg-gray-50 hover:bg-gray-100 transition-colors cursor-pointer" onClick={toggleSection}>
+                              <div className="flex items-center gap-3">
+                                <span className="text-xs font-semibold text-gray-700">{label}</span>
+                                <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 font-semibold border border-emerald-300">{crossActiveUsernames.length} users</span>
+                              </div>
+                              <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
+                                <button
+                                  onClick={() => {
+                                    const csvHeaders = ['Username', ...loadedKeys.map((k) => PHASE_DEFS.find((p) => p.key === k)?.label ?? k), 'Total Msgs']
+                                    const csvRows: (string | number | null)[][] = crossActiveUsernames.map((name) => {
+                                      const phaseMsgs = loadedKeys.map((k) => phaseData[k].find((u) => u.username === name)?.total_messages ?? null)
+                                      const totalMsgs = phaseMsgs.reduce((s: number, v) => s + (v ?? 0), 0)
+                                      return [name, ...phaseMsgs, totalMsgs]
+                                    })
+                                    downloadTableAsCSV(csvHeaders, csvRows, 'cross-phase-active-users.csv')
+                                  }}
+                                  className="flex items-center gap-1.5 text-[10px] text-gray-500 hover:text-gray-700 px-2 py-1 rounded border border-gray-200 hover:border-gray-300 hover:bg-white transition-colors"
+                                  title="Export as CSV"
+                                >
+                                  <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                                  CSV
+                                </button>
+                                <svg className={`w-3.5 h-3.5 text-gray-400 transition-transform duration-150 ${isExpanded ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M19 9l-7 7-7-7" />
+                                </svg>
+                              </div>
+                            </div>
+
+                            {isExpanded && (
+                              <div className="overflow-auto" style={{ maxHeight: '360px' }}>
+                                <table className="w-full text-xs border-collapse">
+                                  <thead className="sticky top-0 bg-white border-b border-gray-200 z-10">
+                                    <tr>
+                                      <th className="text-left px-3 py-2 font-semibold text-gray-500">Username</th>
+                                      {loadedKeys.map((k) => {
+                                        const def = PHASE_DEFS.find((p) => p.key === k)!
+                                        return (
+                                          <th key={k} className="text-right px-2 py-2 font-semibold text-gray-500 whitespace-nowrap">
+                                            <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] border ${def.chipCls}`}>{def.label}</span>
+                                            <span className="block text-[9px] text-gray-400 font-normal">msgs</span>
+                                          </th>
+                                        )
+                                      })}
+                                      <th className="text-right px-3 py-2 font-semibold text-gray-500">Total Msgs</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {crossActiveUsernames.map((name) => {
+                                      const totalMsgs = loadedKeys.reduce((s, k) => s + (phaseData[k].find((u) => u.username === name)?.total_messages ?? 0), 0)
+                                      return (
+                                        <tr
+                                          key={name}
+                                          className="border-b border-gray-50 hover:bg-gray-50 cursor-pointer"
+                                          onClick={() => navigate(`/discord/users/${encodeURIComponent(name)}`)}
+                                        >
+                                          <td className="px-3 py-1.5 font-medium text-indigo-700 max-w-[140px] truncate">{name}</td>
+                                          {loadedKeys.map((k) => {
+                                            const u = phaseData[k].find((u) => u.username === name)
+                                            return (
+                                              <td key={k} className="text-right px-2 py-1.5 text-gray-600">{u?.total_messages ?? '—'}</td>
+                                            )
+                                          })}
+                                          <td className="text-right px-3 py-1.5 font-semibold text-gray-700">{totalMsgs}</td>
+                                        </tr>
+                                      )
+                                    })}
+                                    {crossActiveUsernames.length === 0 && (
+                                      <tr><td colSpan={loadedKeys.length + 2} className="text-center py-4 text-xs text-gray-400">No users found active across all selected phases.</td></tr>
+                                    )}
+                                  </tbody>
+                                </table>
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })()}
+
+                      {/* Section B: Username trend across phases */}
+                      {(() => {
+                        const loadedKeys = [...selectedPhases].filter((k) => k in phaseData)
+                        if (loadedKeys.length === 0) return null
+
+                        const isExpanded = expandedPhaseSections.has('username-trend')
+                        const toggleSection = () => setExpandedPhaseSections((prev) => {
+                          const next = new Set(prev)
+                          if (next.has('username-trend')) next.delete('username-trend')
+                          else next.add('username-trend')
+                          return next
+                        })
+
+                        // Autocomplete candidates from all loaded phases
+                        const allUsernames = [...new Set(loadedKeys.flatMap((k) => phaseData[k].map((u) => u.username)))].sort()
+                        const query = phaseUsernameSearch.trim().toLowerCase()
+                        const suggestions = query.length >= 1
+                          ? allUsernames.filter((n) => n.toLowerCase().includes(query)).slice(0, 8)
+                          : []
+
+                        // Per-phase data for the searched username
+                        const exactMatch = allUsernames.find((n) => n.toLowerCase() === query)
+                        const trendRows = exactMatch
+                          ? loadedKeys.map((key) => {
+                              const def = PHASE_DEFS.find((p) => p.key === key)!
+                              const u = phaseData[key].find((u) => u.username === exactMatch)
+                              const filterEnd = def.to || phaseFilterEnd(key)
+                              const info = u ? classifyEngagement(u, def.from, filterEnd) : null
+                              return { key, def, u: u ?? null, info }
+                            })
+                          : []
+
+                        const trendChartData = trendRows
+                          .filter(({ u }) => u !== null)
+                          .map(({ def, u, info }) => ({
+                            phase: def.label,
+                            Messages: u!.total_messages,
+                            'Avg Words': Math.round(u!.avg_words ?? 0),
+                            'Weeks Active': u!.weeks_active ?? 0,
+                            '% Weeks': Math.round(u!.pct_weeks ?? 0),
+                            status: info?.level ?? 'low',
+                          }))
+
+                        return (
+                          <div className="rounded-xl border border-gray-200 overflow-hidden">
+                            <button onClick={toggleSection} className="w-full flex items-center justify-between px-4 py-3 bg-gray-50 hover:bg-gray-100 transition-colors text-left">
+                              <span className="text-xs font-semibold text-gray-700">Username Trend Across Phases</span>
+                              <svg className={`w-3.5 h-3.5 text-gray-400 transition-transform duration-150 ${isExpanded ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M19 9l-7 7-7-7" />
+                              </svg>
+                            </button>
+
+                            {isExpanded && (
+                              <div className="px-4 py-3 space-y-3 bg-white">
+                                {/* Search input */}
+                                <div className="relative">
+                                  <input
+                                    type="text"
+                                    value={phaseUsernameSearch}
+                                    onChange={(e) => setPhaseUsernameSearch(e.target.value)}
+                                    placeholder="Type a username…"
+                                    className="search-input w-full text-xs"
+                                  />
+                                  {suggestions.length > 0 && !exactMatch && (
+                                    <div className="absolute top-full left-0 right-0 z-20 bg-white border border-gray-200 rounded-lg shadow-lg mt-0.5 overflow-hidden">
+                                      {suggestions.map((name) => (
+                                        <button
+                                          key={name}
+                                          onClick={() => setPhaseUsernameSearch(name)}
+                                          className="w-full text-left px-3 py-1.5 text-xs hover:bg-gray-50 text-gray-700 border-b border-gray-100 last:border-0"
+                                        >
+                                          {name}
+                                        </button>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+
+                                {/* Trend table */}
+                                {exactMatch && trendRows.length > 0 && (
+                                  <div className="space-y-3">
+                                    <div className="flex items-center justify-between">
+                                      <span className="text-xs font-semibold text-gray-600">{exactMatch}</span>
+                                      <div className="flex items-center gap-2">
+                                        <button
+                                          onClick={() => {
+                                            const csvHeaders = ['Phase', 'Messages', 'Avg Words', 'Weeks Active', '% Weeks', 'Engagement']
+                                            const csvRows: (string | number | null)[][] = trendRows.map(({ def, u, info }) => [
+                                              def.label,
+                                              u?.total_messages ?? null,
+                                              u?.avg_words != null ? Math.round(u.avg_words) : null,
+                                              u?.weeks_active ?? null,
+                                              u?.pct_weeks != null ? Math.round(u.pct_weeks) : null,
+                                              info?.level ?? null,
+                                            ])
+                                            downloadTableAsCSV(csvHeaders, csvRows, `${exactMatch}-phase-trend.csv`)
+                                          }}
+                                          className="flex items-center gap-1.5 text-[10px] text-gray-500 hover:text-gray-700 px-2 py-1 rounded border border-gray-200 hover:border-gray-300 hover:bg-gray-50 transition-colors"
+                                          title="Export as CSV"
+                                        >
+                                          <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                                          CSV
+                                        </button>
+                                        <button
+                                          onClick={() => navigate(`/discord/users/${encodeURIComponent(exactMatch)}`)}
+                                          className="text-xs text-indigo-600 hover:text-indigo-800 hover:underline font-medium"
+                                        >
+                                          View Full Detail →
+                                        </button>
+                                      </div>
+                                    </div>
+                                    <div className="overflow-x-auto rounded-lg border border-gray-100">
+                                      <table className="w-full text-xs border-collapse">
+                                        <thead className="bg-gray-50 border-b border-gray-200">
+                                          <tr>
+                                            <th className="text-left px-3 py-2 font-semibold text-gray-500">Phase</th>
+                                            <th className="text-right px-3 py-2 font-semibold text-gray-500">Messages</th>
+                                            <th className="text-right px-3 py-2 font-semibold text-gray-500">Avg Words</th>
+                                            <th className="text-right px-3 py-2 font-semibold text-gray-500">Weeks</th>
+                                            <th className="text-right px-3 py-2 font-semibold text-gray-500">% Weeks</th>
+                                            <th className="text-right px-3 py-2 font-semibold text-gray-500">Status</th>
+                                          </tr>
+                                        </thead>
+                                        <tbody>
+                                          {trendRows.map(({ key, def, u, info }) => {
+                                            const sc = info ? ENGAGEMENT_COLORS[info.level] : null
+                                            return (
+                                              <tr
+                                                key={key}
+                                                className="border-b border-gray-50 hover:bg-gray-50 cursor-pointer"
+                                                onClick={() => navigate(`/discord/users/${encodeURIComponent(exactMatch)}`)}
+                                              >
+                                                <td className="px-3 py-2">
+                                                  <span className={`inline-block px-2 py-0.5 rounded-full text-[10px] font-semibold border ${def.chipCls}`}>{def.label}</span>
+                                                </td>
+                                                <td className="text-right px-3 py-2 text-gray-600">{u?.total_messages ?? <span className="text-gray-300">—</span>}</td>
+                                                <td className="text-right px-3 py-2 text-gray-600">{u?.avg_words != null ? u.avg_words.toFixed(1) : <span className="text-gray-300">—</span>}</td>
+                                                <td className="text-right px-3 py-2 text-gray-600">{u?.weeks_active ?? <span className="text-gray-300">—</span>}</td>
+                                                <td className="text-right px-3 py-2 text-gray-600">{u?.pct_weeks != null ? `${Math.round(u.pct_weeks)}%` : <span className="text-gray-300">—</span>}</td>
+                                                <td className="text-right px-3 py-2">
+                                                  {sc && info ? (
+                                                    <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold border ${sc.bg} ${sc.text} ${sc.border}`}>
+                                                      <span className={`w-1.5 h-1.5 rounded-full ${sc.dot}`} />
+                                                      {{ high: 'High Eng.', medium: 'Med Eng.', low: 'Low Eng.' }[info.level] ?? info.level}
+                                                    </span>
+                                                  ) : <span className="text-gray-300 text-[10px]">not found</span>}
+                                                </td>
+                                              </tr>
+                                            )
+                                          })}
+                                        </tbody>
+                                      </table>
+                                    </div>
+
+                                    {/* Mini trend charts */}
+                                    {trendChartData.length > 1 && (
+                                      <div>
+                                        <div className="flex items-center justify-between mb-2">
+                                          <span className="text-[10px] text-gray-500 font-medium uppercase tracking-wide">Trend Charts</span>
+                                          <button
+                                            onClick={() => downloadChartAsPNG(chartUserTrendRef.current, `${exactMatch}-trend-charts.png`)}
+                                            className="flex items-center gap-1.5 text-[10px] text-gray-500 hover:text-gray-700 px-2 py-1 rounded border border-gray-200 hover:border-gray-300 hover:bg-gray-50 transition-colors"
+                                            title="Export as PNG"
+                                          >
+                                            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                                            PNG
+                                          </button>
+                                        </div>
+                                        <div ref={chartUserTrendRef} className="grid grid-cols-2 gap-3">
+                                          {([
+                                            { key: 'Messages',     color: '#6366f1', label: 'Messages per Phase' },
+                                            { key: 'Avg Words',    color: '#f59e0b', label: 'Avg Words per Phase' },
+                                            { key: '% Weeks',      color: '#10b981', label: '% Weeks Active per Phase' },
+                                          ] as { key: string; color: string; label: string }[]).map(({ key: dKey, color, label }) => (
+                                            <div key={dKey}>
+                                              <p className="text-[10px] text-gray-500 font-medium mb-1">{label}</p>
+                                              <ResponsiveContainer width="100%" height={100}>
+                                                <AreaChart data={trendChartData}>
+                                                  <XAxis dataKey="phase" tick={{ fontSize: 8 }} />
+                                                  <YAxis tick={{ fontSize: 8 }} width={28} />
+                                                  <Tooltip contentStyle={{ fontSize: 10 }} />
+                                                  <Area type="monotone" dataKey={dKey} stroke={color} fill={color + '22'} strokeWidth={1.5} dot={{ r: 3, fill: color }} />
+                                                </AreaChart>
+                                              </ResponsiveContainer>
+                                            </div>
+                                          ))}
+                                        </div>
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
+
+                                {query && !exactMatch && (
+                                  <p className="text-xs text-gray-400 text-center py-2">No exact match — select a username from the suggestions above.</p>
+                                )}
+                                {!query && (
+                                  <p className="text-xs text-gray-400 text-center py-2">Type a username to see their activity trend across selected phases.</p>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })()}
+                    </div>
+                  )}
+
+                  {selectedPhases.size > 0 && phaseLoadingSet.size === 0 && pendingFetch.length === 0 && !hasData && (
+                    <p className="text-xs text-gray-400 text-center py-4">No data returned for selected phases.</p>
+                  )}
+                  {selectedPhases.size === 0 && (
+                    <p className="text-xs text-gray-400 text-center py-6">Select one or more phases above, then click Load to see user status breakdowns and trends.</p>
+                  )}
+                </div>
+              )
+            })()}
 
             {/* Context window */}
             {activeTab !== 'browse' && searchCat === 'chat' && (
@@ -3832,20 +6494,26 @@ export default function SearchPage() {
 
       {/* Users results table */}
       {searchCat === 'users' && userStats.length > 0 && (
-        <section className="bg-white rounded-2xl shadow p-5 flex flex-col" style={{ maxHeight: 'calc(100vh - 180px)' }}>
+        <section className="bg-white rounded-2xl shadow p-5 flex flex-col" style={{ height: 'calc(100vh - 80px)', minHeight: '900px' }}>
           {/* Dropout summary bar */}
           {dropoutMap.size > 0 && (() => {
-            const counts = { active: 0, dropout: 0, transient: 0 }
-            for (const info of dropoutMap.values()) counts[info.status]++
+            const counts = { high: 0, medium: 0, low: 0 }
+            for (const info of dropoutMap.values()) counts[info.level as keyof typeof counts]++
+            const decreasedCount = [...crossPhaseMap.values()].filter(v => v.startsWith('dec-')).length
+            const dropoutCrossCount = [...crossPhaseMap.values()].filter(v => v.startsWith('dropout-')).length
             return (
               <div className="shrink-0 mb-3 space-y-2">
                 {/* Status chips */}
                 <div className="flex flex-wrap items-center gap-2">
                   {([
-                    ['all',       `All  ${userStats.length}`,    'bg-gray-100 text-gray-700 border-gray-300'],
-                    ['active',    `Active  ${counts.active}`,    'bg-emerald-100 text-emerald-700 border-emerald-300'],
-                    ['dropout',   `Dropout  ${counts.dropout}`,  'bg-rose-100 text-rose-700 border-rose-300'],
-                    ['transient', `Transient  ${counts.transient}`, 'bg-amber-100 text-amber-700 border-amber-300'],
+                    ['all',       `All  ${userStats.length}`,            'bg-gray-100 text-gray-700 border-gray-300'],
+                    ['high',      `High Eng.  ${counts.high}`,           'bg-emerald-100 text-emerald-700 border-emerald-300'],
+                    ['medium',    `Med Eng.  ${counts.medium}`,          'bg-sky-100 text-sky-700 border-sky-300'],
+                    ['low',       `Low Eng.  ${counts.low}`,             'bg-amber-100 text-amber-700 border-amber-300'],
+                    ...(crossPhaseMap.size > 0 ? [
+                      ['decreased', `Decreased  ${decreasedCount}`,  'bg-orange-100 text-orange-700 border-orange-300'] as [string, string, string],
+                      ['dropout',   `Dropout  ${dropoutCrossCount}`,     'bg-rose-100 text-rose-700 border-rose-300'] as [string, string, string],
+                    ] : []),
                   ] as [string, string, string][]).map(([status, label, cls]) => (
                     <button
                       key={status}
@@ -3861,62 +6529,44 @@ export default function SearchPage() {
                     end: {filterEndDate || '(max last_date)'}
                   </span>
                 </div>
-                {/* Threshold params — two rows: transient floor + active bar */}
-                <div className="flex flex-wrap gap-x-4 gap-y-1.5 items-center text-xs text-gray-500">
-                  <span className="font-semibold text-[10px] uppercase tracking-wide text-gray-400">Transient if</span>
-                  <label className="flex items-center gap-1">
-                    Msg &lt;
-                    <input
-                      type="text" inputMode="numeric"
-                      value={String(dropoutMinMessages)}
-                      onChange={e => setDropoutMinMessages(parseInt(e.target.value.replace(/\D/g, '')) || 1)}
-                      className="w-11 ml-1 border border-gray-300 rounded px-1 py-0.5 text-center text-gray-800 text-xs"
-                    />
-                  </label>
-                  <span className="text-gray-400">or</span>
-                  <label className="flex items-center gap-1">
-                    Span &lt;
-                    <input
-                      type="text" inputMode="numeric"
-                      value={String(dropoutMinActiveDays)}
-                      onChange={e => setDropoutMinActiveDays(parseInt(e.target.value.replace(/\D/g, '')) || 1)}
-                      className="w-11 ml-1 border border-gray-300 rounded px-1 py-0.5 text-center text-gray-800 text-xs"
-                    />
-                    days
-                  </label>
-                  <span className="mx-1 text-gray-300">|</span>
-                  <span className="font-semibold text-[10px] uppercase tracking-wide text-gray-400">Active needs</span>
-                  <label className="flex items-center gap-1">
-                    Msg ≥
-                    <input
-                      type="text" inputMode="numeric"
-                      value={String(activeMinMessages)}
-                      onChange={e => setActiveMinMessages(parseInt(e.target.value.replace(/\D/g, '')) || 1)}
-                      className="w-11 ml-1 border border-gray-300 rounded px-1 py-0.5 text-center text-gray-800 text-xs"
-                    />
-                  </label>
-                  <label className="flex items-center gap-1">
-                    Weeks ≥
-                    <input
-                      type="text" inputMode="numeric"
-                      value={String(activeMinWeeks)}
-                      onChange={e => setActiveMinWeeks(parseInt(e.target.value.replace(/\D/g, '')) || 1)}
-                      className="w-11 ml-1 border border-gray-300 rounded px-1 py-0.5 text-center text-gray-800 text-xs"
-                    />
-                  </label>
+                {/* Criteria legend */}
+                <div className="flex flex-wrap gap-x-5 gap-y-0.5 text-[10px] text-gray-400">
+                  <span><span className="text-emerald-600 font-medium">High</span> — ≥50% weeks active · msgs ≥ 20 × ⌈50% of phase weeks⌉</span>
+                  <span><span className="text-sky-600 font-medium">Medium</span> — 20–49% weeks, or ≥50% weeks but below msg floor</span>
+                  <span><span className="text-amber-600 font-medium">Low</span> — &lt;20% weeks active (regardless of message count)</span>
+                  <span><span className="text-rose-500 font-medium">Dropout</span> — absent in current window vs prev phase</span>
                 </div>
-                <div className="flex flex-wrap gap-x-4 gap-y-1.5 items-center text-xs text-gray-500">
-                  <span className="font-semibold text-[10px] uppercase tracking-wide text-gray-400">Dropout if</span>
-                  <label className="flex items-center gap-1">
-                    Silence ≥
-                    <input
-                      type="text" inputMode="numeric"
-                      value={String(dropoutSilenceDays)}
-                      onChange={e => setDropoutSilenceDays(parseInt(e.target.value.replace(/\D/g, '')) || 1)}
-                      className="w-11 ml-1 border border-gray-300 rounded px-1 py-0.5 text-center text-gray-800 text-xs"
-                    />
-                    days
-                  </label>
+              </div>
+            )
+          })()}
+
+          {/* Dropout users — active in prev loaded phase but absent in current window */}
+          {dropoutUsersFromPrev.length > 0 && (() => {
+            const cidx = PHASE_DEFS.findIndex((d) => d.key === currentBatchPhaseKey)
+            const pd = cidx > 0 ? (phaseData[PHASE_DEFS[cidx - 1].key] ?? []) : []
+            return (
+              <div className="shrink-0 mb-3 bg-rose-50 border border-rose-200 rounded-xl px-4 py-2.5">
+                <div className="flex items-center gap-2 mb-1.5">
+                  <span className="text-[10px] font-semibold text-rose-600 uppercase tracking-wide">
+                    ↓ Dropout from prev phase ({dropoutUsersFromPrev.length})
+                  </span>
+                  <span className="text-[10px] text-rose-400">— were active in previous phase, no messages in current window</span>
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {dropoutUsersFromPrev.map(username => {
+                    const u = pd.find(x => x.username === username)
+                    return (
+                      <button
+                        key={username}
+                        onClick={() => { if (u) openUserDetail(u) }}
+                        className="text-[10px] font-semibold px-2 py-0.5 rounded-full border bg-rose-100 text-rose-700 border-rose-300 hover:bg-rose-200 transition-colors"
+                        style={getUserStyle(username)}
+                        title={`${username} — was active in prev phase, absent in current window`}
+                      >
+                        {username}
+                      </button>
+                    )
+                  })}
                 </div>
               </div>
             )
@@ -3942,6 +6592,10 @@ export default function SearchPage() {
                 <input type="text" inputMode="numeric" value={refineMinMessages} onChange={(e) => setRefineMinMessages(e.target.value.replace(/\D/g, ''))} placeholder="any" className="search-input text-xs py-1 w-20" />
               </div>
               <div className="flex flex-col gap-1">
+                <label className="filter-label">Max messages</label>
+                <input type="text" inputMode="numeric" value={refineMaxMessages} onChange={(e) => setRefineMaxMessages(e.target.value.replace(/\D/g, ''))} placeholder="any" className="search-input text-xs py-1 w-20" />
+              </div>
+              <div className="flex flex-col gap-1">
                 <label className="filter-label">Min weeks</label>
                 <input type="text" inputMode="numeric" value={refineMinWeeks} onChange={(e) => setRefineMinWeeks(e.target.value.replace(/\D/g, ''))} placeholder="any" className="search-input text-xs py-1 w-20" />
               </div>
@@ -3956,7 +6610,7 @@ export default function SearchPage() {
               <span className="self-end pb-1 text-xs text-gray-500 ml-1">
                 {filteredUsers.length.toLocaleString()}{filteredUsers.length !== userStats.length ? ` / ${userStats.length.toLocaleString()}` : ''} users
               </span>
-              {(userNameFilter || refineFirstMsgIn || refineLastMsgFrom || refineMinMessages || refineMinWeeks || refineAvgWordsMin || refineAvgWordsMax) && (
+              {(userNameFilter || refineFirstMsgIn || refineLastMsgFrom || refineMinMessages || refineMaxMessages || refineMinWeeks || refineAvgWordsMin || refineAvgWordsMax) && (
                 <button
                   onClick={clearRefine}
                   className="self-end pb-1 text-xs text-gray-400 hover:text-red-500 transition-colors flex items-center gap-1"
@@ -3968,7 +6622,127 @@ export default function SearchPage() {
             </div>
           </div>
 
-          <div className="flex-1 overflow-auto">
+          {/* Batch persona classification toolbar */}
+          {filteredUsers.length > 0 && (
+            <div className="px-3 py-2 border-b border-gray-100 bg-gray-50 flex items-center justify-between gap-3 flex-wrap">
+              <div className="flex items-center gap-1.5">
+                <span className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide">Persona</span>
+                <span className="text-[10px] text-gray-400">
+                  {(() => {
+                    const matched = PHASE_DEFS.find(def =>
+                      def.from === filterStartDate && (def.to === filterEndDate || (!def.to && !filterEndDate))
+                    )
+                    return matched
+                      ? <span className={`font-semibold px-1.5 py-0.5 rounded border text-[9px] ${matched.chipCls}`}>{matched.label}</span>
+                      : <span className="italic">{filterStartDate || 'all'} → {filterEndDate || 'present'}</span>
+                  })()}
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                {batchSentimentRunning && (
+                  <div className="flex items-center gap-1.5">
+                    <div className="animate-spin w-3 h-3 border-2 border-emerald-400 border-t-transparent rounded-full" />
+                    {sentimentProgress ? (
+                      <span className="text-[10px] text-gray-500 tabular-nums">
+                        <span className="font-semibold text-emerald-600">{sentimentProgress.msgs.toLocaleString()}</span>
+                        {sentimentProgress.totalMsgs > 0
+                          ? <span>/{sentimentProgress.totalMsgs.toLocaleString()}</span>
+                          : null}
+                        {' msgs · '}
+                        <span className="font-semibold">{sentimentProgress.users}</span>/<span>{sentimentProgress.totalUsers}</span> users
+                      </span>
+                    ) : (
+                      <span className="text-[10px] text-gray-500">Preparing…</span>
+                    )}
+                  </div>
+                )}
+                {batchPersonaClassifying && batchPersonaProgress && (
+                  <div className="flex items-center gap-1.5">
+                    <div className="animate-spin w-3 h-3 border-2 border-gray-400 border-t-transparent rounded-full" />
+                    <span className="text-[10px] text-gray-500">
+                      {batchPersonaProgress.done}/{batchPersonaProgress.total}
+                      {batchPersonaProgress.errors > 0 && <span className="text-rose-500 ml-1">{batchPersonaProgress.errors} errors</span>}
+                    </span>
+                    {batchPersonaProgress.total > 1 && (
+                      <div className="w-24 h-1.5 bg-gray-200 rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-indigo-500 rounded-full transition-all"
+                          style={{ width: `${(batchPersonaProgress.done / batchPersonaProgress.total) * 100}%` }}
+                        />
+                      </div>
+                    )}
+                  </div>
+                )}
+                {batchTopicRunning && batchTopicProgress && (
+                  <div className="flex items-center gap-1.5">
+                    <div className="animate-spin w-3 h-3 border-2 border-amber-400 border-t-transparent rounded-full" />
+                    <span className="text-[10px] text-gray-500">
+                      {batchTopicProgress.done}/{batchTopicProgress.total} topics
+                      {batchTopicProgress.errors > 0 && <span className="text-rose-500 ml-1">{batchTopicProgress.errors} errors</span>}
+                    </span>
+                    {batchTopicProgress.total > 1 && (
+                      <div className="w-24 h-1.5 bg-gray-200 rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-amber-400 rounded-full transition-all"
+                          style={{ width: `${(batchTopicProgress.done / batchTopicProgress.total) * 100}%` }}
+                        />
+                      </div>
+                    )}
+                  </div>
+                )}
+                <div className="flex items-center gap-0.5">
+                  <button
+                    disabled={batchSentimentRunning || batchPersonaClassifying}
+                    onClick={runBatchSentimentAll}
+                    className="text-[10px] font-semibold px-2.5 py-1 rounded-l-lg bg-emerald-100 text-emerald-700 hover:bg-emerald-200 disabled:opacity-50 transition-colors border border-emerald-200"
+                    title={`Re-analyse all messages for ${filteredUsers.length} users`}
+                  >
+                    {batchSentimentRunning ? '⏳ ' : ''}All Sentiment ({filteredUsers.length})
+                  </button>
+                  <button
+                    disabled={batchSentimentRunning || batchPersonaClassifying}
+                    onClick={runBatchSentimentNew}
+                    className="text-[10px] font-semibold px-2.5 py-1 rounded-r-lg bg-emerald-50 text-emerald-600 hover:bg-emerald-100 disabled:opacity-50 transition-colors border border-emerald-200 border-l-0"
+                    title={`Analyse only messages not yet in the database for ${filteredUsers.length} users`}
+                  >
+                    Sentiment (New Only)
+                  </button>
+                </div>
+                <button
+                  disabled={batchPersonaClassifying || batchSentimentRunning}
+                  onClick={() => {
+                    if (window.confirm(`Run persona analysis for ${filteredUsers.length} users?\nThis will make ${filteredUsers.length} OpenAI API calls and may take a while.`)) {
+                      batchClassifyPersonas('llm')
+                    }
+                  }}
+                  className="text-[10px] font-semibold px-2.5 py-1 rounded-lg bg-violet-100 text-violet-700 hover:bg-violet-200 disabled:opacity-50 transition-colors border border-violet-200"
+                  title={`Persona analysis for all ${filteredUsers.length} filtered users (requires OpenAI key)`}
+                >
+                  Persona Analysis ({filteredUsers.length})
+                </button>
+                <div className="flex items-center gap-0.5">
+                  <button
+                    disabled={batchTopicRunning || batchSentimentRunning || batchPersonaClassifying}
+                    onClick={() => runBatchTopicForUsers(false)}
+                    className="text-[10px] font-semibold px-2.5 py-1 rounded-l-lg bg-amber-100 text-amber-700 hover:bg-amber-200 disabled:opacity-50 transition-colors border border-amber-200"
+                    title={`Run BERTopic analysis for all ${filteredUsers.length} users`}
+                  >
+                    {batchTopicRunning ? '⏳ ' : ''}All Topic ({filteredUsers.length})
+                  </button>
+                  <button
+                    disabled={batchTopicRunning || batchSentimentRunning || batchPersonaClassifying}
+                    onClick={() => runBatchTopicForUsers(true)}
+                    className="text-[10px] font-semibold px-2.5 py-1 rounded-r-lg bg-amber-50 text-amber-600 hover:bg-amber-100 disabled:opacity-50 transition-colors border border-amber-200 border-l-0"
+                    title={`Run BERTopic only for users not yet analyzed`}
+                  >
+                    Topic (New Only)
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <div ref={userTableScrollRef} className="flex-1 overflow-auto">
             <table className="w-full text-sm border-collapse">
               <thead className="sticky top-0 z-10">
                 <tr className="bg-gray-50 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide select-none">
@@ -3994,11 +6768,35 @@ export default function SearchPage() {
                   {dropoutMap.size > 0 && (
                     <th className="px-3 py-2 border-b border-gray-200 bg-gray-50">Status</th>
                   )}
+                  <th className="px-3 py-2 border-b border-gray-200 bg-gray-50 text-center text-emerald-600 whitespace-nowrap">
+                    Sentiment
+                    {batchSentimentRunning && (
+                      <span className="ml-1.5 inline-flex items-center gap-1 text-[9px] font-normal text-gray-400 align-middle">
+                        <span className="inline-block w-2 h-2 border border-emerald-400 border-t-transparent rounded-full animate-spin" />
+                        {sentimentProgress
+                          ? sentimentProgress.totalMsgs > 0
+                            ? `${sentimentProgress.msgs.toLocaleString()}/${sentimentProgress.totalMsgs.toLocaleString()} msgs`
+                            : `${sentimentProgress.msgs.toLocaleString()} msgs`
+                          : '…'}
+                      </span>
+                    )}
+                  </th>
+                  <th className="px-3 py-2 border-b border-gray-200 bg-gray-50 text-center text-amber-600 whitespace-nowrap">
+                    Topics
+                    {batchTopicRunning && (
+                      <span className="ml-1.5 inline-flex items-center gap-1 text-[9px] font-normal text-gray-400 align-middle">
+                        <span className="inline-block w-2 h-2 border border-amber-400 border-t-transparent rounded-full animate-spin" />
+                        {batchTopicProgress ? `${batchTopicProgress.done}/${batchTopicProgress.total}` : '…'}
+                      </span>
+                    )}
+                  </th>
+                  <th className="px-3 py-2 border-b border-gray-200 bg-gray-50 text-center text-violet-600">Persona</th>
                 </tr>
               </thead>
               <tbody>
-                {sortedUsers.map((u) => (
-                  <tr key={u.username} className="border-b border-gray-100 hover:bg-gray-50">
+                {sortedUsers.slice(0, visibleUserCount).map((u) => (
+                  <Fragment key={u.username}>
+                  <tr className="border-b border-gray-100 hover:bg-gray-50">
                     <td className="px-3 py-2">
                       <button
                         onClick={() => openUserDetail(u)}
@@ -4021,29 +6819,232 @@ export default function SearchPage() {
                     <td className="px-3 py-2 text-right text-gray-600 tabular-nums">{u.pct_weeks?.toFixed(1) ?? '—'}%</td>
                     {dropoutMap.size > 0 && (() => {
                       const di = dropoutMap.get(u.username)
-                      if (!di) return <td className="px-3 py-2" />
-                      const sc = STATUS_COLORS[di.status]
+                      const cp = crossPhaseMap.get(u.username)
+                      if (!di && !cp) return <td className="px-3 py-2" />
                       return (
-                        <td className="px-3 py-2 whitespace-nowrap">
-                          <span
-                            className={`inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full ${sc.bg} ${sc.text} border ${sc.border}`}
-                            title={di.silenceDays < 9999 ? `${di.silenceDays}d silent` : undefined}
+                        <td className="px-3 py-2">
+                          <div className="flex flex-col gap-0.5 items-start">
+                            {di && (() => {
+                              const sc = ENGAGEMENT_COLORS[di.level]
+                              return (
+                                <span
+                                  className={`inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full ${sc.bg} ${sc.text} border ${sc.border}`}
+                                  title={`${di.pctWeeks}% of weeks active`}
+                                >
+                                  <span className={`w-1.5 h-1.5 rounded-full ${sc.dot}`} />
+                                  {{ high: 'High Eng.', medium: 'Med Eng.', low: 'Low Eng.' }[di.level] ?? di.level}
+                                </span>
+                              )
+                            })()}
+                            {cp === 'dec-hm' && <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-orange-100 text-orange-700 border border-orange-300 whitespace-nowrap" title="High → Medium engagement">↓ H→M</span>}
+                            {cp === 'dec-hl' && <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-orange-100 text-orange-700 border border-orange-300 whitespace-nowrap" title="High → Low engagement">↓ H→L</span>}
+                            {cp === 'dec-ml' && <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-600 border border-amber-300 whitespace-nowrap" title="Medium → Low engagement">↓ M→L</span>}
+                            {cp === 'dropout-high' && <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-rose-100 text-rose-700 border border-rose-300 whitespace-nowrap" title="Was high-engagement in previous phase, now absent">↓ Out (High)</span>}
+                            {cp === 'dropout-med'  && <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-rose-100 text-rose-600 border border-rose-300 whitespace-nowrap" title="Was medium-engagement in previous phase, now absent">↓ Out (Med)</span>}
+                            {cp === 'dropout-low'  && <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-rose-50 text-rose-500 border border-rose-200 whitespace-nowrap" title="Was low-engagement in previous phase, now absent">↓ Out (Low)</span>}
+                          </div>
+                        </td>
+                      )
+                    })()}
+                    {(() => {
+                      const s = tableSentiments[u.username]
+                      if (!s) return (
+                        <td className="px-2 py-2 text-center">
+                          {batchSentimentRunning
+                            ? <span className="inline-block w-3 h-3 border-2 border-emerald-300 border-t-transparent rounded-full animate-spin" />
+                            : <span className="text-gray-300 text-[10px]">—</span>}
+                        </td>
+                      )
+                      const isOpen = sentimentDetailUser === u.username
+                      const dominant = s.positive >= s.negative && s.positive >= s.neutral ? 'positive'
+                        : s.negative >= s.neutral ? 'negative' : 'neutral'
+                      const domColor = dominant === 'positive' ? '#10b981' : dominant === 'negative' ? '#f43f5e' : '#9ca3af'
+                      const domBg = dominant === 'positive' ? '#d1fae5' : dominant === 'negative' ? '#ffe4e6' : '#f3f4f6'
+                      const pos = Math.round(s.positive * 100)
+                      const neg = Math.round(s.negative * 100)
+                      const neu = 100 - pos - neg
+                      const topLabel = s.top_emotions?.[0]?.label ?? null
+                      return (
+                        <td className="px-2 py-2 min-w-[96px]">
+                          {/* Sentiment breakdown bar */}
+                          <div className="flex h-2 w-full rounded-full overflow-hidden mb-1">
+                            {pos > 0 && <div style={{ width: `${pos}%` }} className="bg-emerald-400" />}
+                            {neg > 0 && <div style={{ width: `${neg}%` }} className="bg-rose-400" />}
+                            {neu > 0 && <div style={{ width: `${neu}%` }} className="bg-gray-300" />}
+                          </div>
+                          {/* Percentage row */}
+                          <div className="flex justify-between text-[9px] tabular-nums mb-1">
+                            <span className="text-emerald-600">{pos}%</span>
+                            <span className="text-rose-500">{neg}%</span>
+                            <span className="text-gray-400">{neu}%</span>
+                          </div>
+                          {/* Dominant badge + top emotion — clickable to expand */}
+                          <button
+                            onClick={() => setSentimentDetailUser(prev => prev === u.username ? null : u.username)}
+                            className="flex items-center gap-1 cursor-pointer hover:opacity-80 transition-opacity w-full"
+                            title={`Click to ${isOpen ? 'collapse' : 'expand'} sentiment detail`}
                           >
-                            <span className={`w-1.5 h-1.5 rounded-full ${sc.dot}`} />
-                            {di.status === 'dropout' && di.tier ? `Dropout · ${di.tier}` : di.status}
-                          </span>
+                            <span
+                              className="text-[9px] font-semibold px-1.5 py-0.5 rounded-full capitalize whitespace-nowrap"
+                              style={{ color: domColor, backgroundColor: domBg }}
+                            >
+                              {dominant}
+                            </span>
+                            {topLabel && (
+                              <span
+                                className="text-[9px] truncate"
+                                style={{ color: emotionSentimentColor(topLabel) }}
+                              >
+                                {topLabel}
+                              </span>
+                            )}
+                          </button>
+                        </td>
+                      )
+                    })()}
+                    {(() => {
+                      const t = tableTopics[u.username]
+                      if (!t) return (
+                        <td className="px-2 py-2 text-center">
+                          {batchTopicRunning
+                            ? <span className="inline-block w-3 h-3 border-2 border-amber-300 border-t-transparent rounded-full animate-spin" />
+                            : <span className="text-gray-300 text-[10px]">—</span>}
+                        </td>
+                      )
+                      const nonOutlier = t.topics.filter(tp => tp.id !== -1)
+                      const topicCount = nonOutlier.length
+                      const topLabel = nonOutlier[0]?.label ?? null
+                      const isOpen = topicDetailUser === u.username
+                      return (
+                        <td className="px-2 py-2 text-center">
+                          <button
+                            onClick={() => setTopicDetailUser(prev => prev === u.username ? null : u.username)}
+                            className="flex flex-col items-center gap-0.5 cursor-pointer hover:opacity-80 transition-opacity w-full"
+                            title={`${topicCount} topic${topicCount !== 1 ? 's' : ''} · click to ${isOpen ? 'collapse' : 'expand'}`}
+                          >
+                            <span className="text-[11px] font-semibold text-amber-700 tabular-nums">
+                              {topicCount} topic{topicCount !== 1 ? 's' : ''}
+                            </span>
+                            {topLabel && (
+                              <span className="text-[9px] text-amber-500 truncate max-w-[80px]">{topLabel}</span>
+                            )}
+                          </button>
+                        </td>
+                      )
+                    })()}
+                    {(() => {
+                      const l = tablePersonas[u.username]?.llm
+                      return (
+                        <td className="px-2 py-2 text-center">
+                          {l ? (
+                            <span
+                              className="inline-block text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-violet-100 text-violet-700 cursor-help whitespace-nowrap leading-tight"
+                              title={`${(l.confidence * 100).toFixed(0)}% confidence\n${l.reasoning}`}
+                            >
+                              {l.persona}
+                            </span>
+                          ) : (
+                            <span className="text-gray-300 text-[10px]">—</span>
+                          )}
                         </td>
                       )
                     })()}
                   </tr>
+                  {sentimentDetailUser === u.username && tableSentiments[u.username] && (() => {
+                    const s = tableSentiments[u.username]
+                    return (
+                      <tr className="bg-emerald-50/30 border-b border-emerald-100">
+                        <td colSpan={20} className="px-4 py-3">
+                          <div className="grid grid-cols-3 gap-3">
+                            {(['positive', 'negative', 'neutral'] as const).map(bucket => {
+                              const b = s.by_sentiment?.[bucket]
+                              const count = b?.count ?? 0
+                              const total = s.analyzed
+                              const pct = total > 0 ? Math.round(count / total * 100) : 0
+                              const color = bucket === 'positive' ? '#10b981' : bucket === 'negative' ? '#f43f5e' : '#9ca3af'
+                              const bgCls = bucket === 'positive' ? 'bg-emerald-50' : bucket === 'negative' ? 'bg-rose-50' : 'bg-gray-50'
+                              return (
+                                <div key={bucket} className={`${bgCls} rounded-lg p-2.5 border`} style={{ borderColor: color + '40' }}>
+                                  <div className="flex items-center justify-between mb-1.5">
+                                    <span className="text-[11px] font-semibold capitalize" style={{ color }}>{bucket}</span>
+                                    <span className="text-[10px] text-gray-500">{count} msgs · {pct}%</span>
+                                  </div>
+                                  {(b?.top_emotions ?? []).length > 0 ? (
+                                    <div className="flex flex-wrap gap-1">
+                                      {(b?.top_emotions ?? []).map(e => (
+                                        <span
+                                          key={e.label}
+                                          className="text-[9px] px-1.5 py-0.5 rounded-full text-white"
+                                          style={{ backgroundColor: emotionSentimentColor(e.label) }}
+                                        >
+                                          {e.label} {Math.round(e.score * 100)}%
+                                        </span>
+                                      ))}
+                                    </div>
+                                  ) : (
+                                    <span className="text-[9px] text-gray-300">—</span>
+                                  )}
+                                </div>
+                              )
+                            })}
+                          </div>
+                          <div className="mt-1.5 text-[9px] text-gray-400">{s.analyzed} messages analyzed · click badge to collapse</div>
+                        </td>
+                      </tr>
+                    )
+                  })()}
+                  {topicDetailUser === u.username && tableTopics[u.username] && (() => {
+                    const t = tableTopics[u.username]
+                    const visibleTopics = t.topics.filter(tp => tp.id !== -1)
+                    return (
+                      <tr className="bg-amber-50/30 border-b border-amber-100">
+                        <td colSpan={20} className="px-4 py-3">
+                          <div className="flex items-center gap-2 mb-2">
+                            <span className="text-[11px] font-semibold text-amber-700">
+                              {visibleTopics.length} topic{visibleTopics.length !== 1 ? 's' : ''} · {t.filtered_docs} / {t.total_docs} messages assigned
+                            </span>
+                            {t.warning && (
+                              <span className="text-[10px] text-amber-500 italic">{t.warning}</span>
+                            )}
+                          </div>
+                          <div className="grid grid-cols-2 gap-2 max-h-64 overflow-y-auto pr-1">
+                            {visibleTopics.map(tp => (
+                              <div key={tp.id} className="bg-white rounded-lg p-2 border border-amber-100 flex flex-col gap-1">
+                                <div className="flex items-center justify-between">
+                                  <span className="text-[11px] font-semibold text-amber-800 truncate">{tp.label}</span>
+                                  <span className="text-[10px] text-gray-400 ml-2 shrink-0">{tp.message_count} msgs</span>
+                                </div>
+                                <div className="flex flex-wrap gap-1">
+                                  {tp.keywords.slice(0, 8).map(kw => (
+                                    <span key={kw} className="text-[9px] px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700">{kw}</span>
+                                  ))}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                          <div className="mt-1.5 text-[9px] text-gray-400">click topic count to collapse</div>
+                        </td>
+                      </tr>
+                    )
+                  })()}
+                  </Fragment>
                 ))}
               </tbody>
             </table>
             {sortedUsers.length === 0 && (
               <p className="text-center text-sm text-gray-400 py-6">No users match the current filters.</p>
             )}
+            {visibleUserCount < sortedUsers.length && (
+              <div ref={setUserTableSentinelEl} className="h-8 flex items-center justify-center">
+                <span className="text-xs text-gray-300">↓ scroll to load more</span>
+              </div>
+            )}
           </div>
-          <p className="text-xs text-gray-500 mt-3">Click a username to open their message detail view.</p>
+          <p className="text-xs text-gray-500 mt-3">
+            {sortedUsers.length > 0
+              ? <>Showing {Math.min(visibleUserCount, sortedUsers.length).toLocaleString()} of {sortedUsers.length.toLocaleString()} users · scroll to load more · Click a username to open their message detail view.</>
+              : 'Click a username to open their message detail view.'}
+          </p>
         </section>
       )}
 
@@ -4425,6 +7426,7 @@ export default function SearchPage() {
                     ctxBefore={ctxBefore}
                     ctxAfter={ctxAfter}
                     isGrouped={isGrouped && !showDateSep}
+                    emotion={msg.msg_uuid ? msgEmotions[msg.msg_uuid] : undefined}
                   />
                 </div>
               )
@@ -4498,11 +7500,31 @@ export default function SearchPage() {
                   Clear
                 </button>
               )}
-              <span className="self-end pb-1 ml-auto text-xs text-gray-400">
-                {filteredBrowseMessages.length !== browseMessages.length
-                  ? `${filteredBrowseMessages.length.toLocaleString()} / ${browseMessages.length.toLocaleString()} loaded`
-                  : `${browseMessages.length.toLocaleString()} loaded`}
-              </span>
+              <div className="self-end pb-1 ml-auto flex items-center gap-3">
+                <button
+                  onClick={handleBrowseDownloadCsv}
+                  disabled={browseExporting}
+                  className="flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-lg border border-indigo-200 text-indigo-600 hover:bg-indigo-50 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+                  title="Download all messages as CSV (ignores pagination)"
+                >
+                  {browseExporting ? (
+                    <svg className="w-3.5 h-3.5 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                    </svg>
+                  ) : (
+                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                    </svg>
+                  )}
+                  {browseExporting ? 'Exporting…' : 'Download CSV'}
+                </button>
+                <span className="text-xs text-gray-400">
+                  {filteredBrowseMessages.length !== browseMessages.length
+                    ? `${filteredBrowseMessages.length.toLocaleString()} / ${browseMessages.length.toLocaleString()} loaded`
+                    : `${browseMessages.length.toLocaleString()} loaded`}
+                </span>
+              </div>
             </div>
           </div>
 
@@ -4557,6 +7579,114 @@ export default function SearchPage() {
           </div>
         </div>
       )}
+
+      {/* Flow Analysis user detail modal */}
+      {flowModal && (() => {
+        const cols: { key: typeof flowModalSortCol; label: string }[] = [
+          { key: 'username',       label: 'Username'     },
+          { key: 'total_messages', label: 'Messages'     },
+          { key: 'weeks_active',   label: 'Active Weeks' },
+          { key: 'pct_weeks',      label: '% Weeks'      },
+          { key: 'avg_words',      label: 'Avg Words'    },
+        ]
+        const sorted = [...flowModal.users].sort((a, b) => {
+          const av = a[flowModalSortCol] ?? (flowModalSortCol === 'username' ? '' : -1)
+          const bv = b[flowModalSortCol] ?? (flowModalSortCol === 'username' ? '' : -1)
+          if (typeof av === 'string' && typeof bv === 'string')
+            return flowModalSortDir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av)
+          return flowModalSortDir === 'asc' ? (av as number) - (bv as number) : (bv as number) - (av as number)
+        })
+        const toggleSort = (col: typeof flowModalSortCol) => {
+          if (flowModalSortCol === col) setFlowModalSortDir(d => d === 'asc' ? 'desc' : 'asc')
+          else { setFlowModalSortCol(col); setFlowModalSortDir(col === 'username' ? 'asc' : 'desc') }
+        }
+        const SortIcon = ({ col }: { col: typeof flowModalSortCol }) =>
+          flowModalSortCol === col
+            ? <span className="ml-0.5 opacity-60">{flowModalSortDir === 'asc' ? '↑' : '↓'}</span>
+            : <span className="ml-0.5 opacity-20">↕</span>
+        const statusBadge = (s: EngagementLevel | 'no-data' | null) => {
+          if (!s) return <span className="text-[10px] text-gray-400">—</span>
+          if (s === 'no-data') return <span className="text-[10px] px-1.5 py-0.5 rounded-full font-semibold bg-gray-100 text-gray-400">No Data</span>
+          const cls = { high: 'bg-emerald-100 text-emerald-700', medium: 'bg-sky-100 text-sky-700', low: 'bg-amber-100 text-amber-700' }[s]
+          const label = { high: 'High Eng.', medium: 'Med Eng.', low: 'Low Eng.' }[s] ?? s
+          return <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-semibold ${cls}`}>{label}</span>
+        }
+        return (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
+            onClick={() => setFlowModal(null)}
+          >
+            <div
+              className="bg-white rounded-2xl shadow-xl w-full max-w-2xl mx-4 flex flex-col overflow-hidden"
+              style={{ maxHeight: '80vh' }}
+              onClick={e => e.stopPropagation()}
+            >
+              {/* Header */}
+              <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100 shrink-0">
+                <div>
+                  <h3 className="font-semibold text-gray-800 text-sm">{flowModal.title}</h3>
+                  <p className="text-[10px] text-gray-400 mt-0.5">{flowModal.users.length} user{flowModal.users.length !== 1 ? 's' : ''}</p>
+                </div>
+                <button onClick={() => setFlowModal(null)} className="text-gray-400 hover:text-gray-600 transition-colors p-1 rounded-lg hover:bg-gray-100">
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+              {/* Table */}
+              <div className="overflow-y-auto">
+                {flowModal.users.length === 0
+                  ? <p className="text-sm text-gray-400 italic text-center py-8">No users</p>
+                  : (
+                    <table className="w-full text-xs border-collapse">
+                      <thead className="sticky top-0 bg-gray-50 z-10">
+                        <tr className="border-b border-gray-200 text-[11px]">
+                          <th className="px-3 py-2 text-left text-gray-500 font-semibold w-6 tabular-nums">#</th>
+                          {cols.map(c => (
+                            <th
+                              key={c.key}
+                              className={`px-3 py-2 font-semibold text-gray-600 cursor-pointer select-none hover:bg-gray-100 ${c.key === 'username' ? 'text-left' : 'text-right'}`}
+                              onClick={() => toggleSort(c.key)}
+                            >
+                              {c.label}<SortIcon col={c.key} />
+                            </th>
+                          ))}
+                          <th className="px-3 py-2 font-semibold text-gray-600 text-center">Status</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {sorted.map((u, idx) => (
+                          <tr key={u.username} className="border-b border-gray-100 hover:bg-gray-50">
+                            <td className="px-3 py-2 text-gray-400 tabular-nums text-[10px]">{idx + 1}</td>
+                            <td className="px-3 py-2">
+                              <button
+                                onClick={() => {
+                                  const found = [...Object.values(phaseData)].flat().find(x => x.username === u.username)
+                                  if (found) openUserDetail(found)
+                                  setFlowModal(null)
+                                }}
+                                className="font-semibold hover:underline text-left"
+                                style={getUserStyle(u.username)}
+                              >
+                                {u.username}
+                              </button>
+                            </td>
+                            <td className="px-3 py-2 text-right tabular-nums text-gray-700 font-semibold">{u.status === 'no-data' ? <span className="text-gray-300">—</span> : u.total_messages}</td>
+                            <td className="px-3 py-2 text-right tabular-nums text-gray-600">{u.status === 'no-data' ? <span className="text-gray-300">—</span> : u.weeks_active != null ? <span>{u.weeks_active}<span className="text-gray-400">/{flowModal.totalWeeks ?? '?'}</span></span> : '—'}</td>
+                            <td className="px-3 py-2 text-right tabular-nums text-gray-600">{u.status === 'no-data' ? <span className="text-gray-300">—</span> : (u.pct_weeks != null ? `${u.pct_weeks}%` : '—')}</td>
+                            <td className="px-3 py-2 text-right tabular-nums text-gray-500">{u.status === 'no-data' ? <span className="text-gray-300">—</span> : (u.avg_words != null ? u.avg_words.toFixed(1) : '—')}</td>
+                            <td className="px-3 py-2 text-center">{statusBadge(u.status)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )
+                }
+              </div>
+            </div>
+          </div>
+        )
+      })()}
 
     </div>
   )

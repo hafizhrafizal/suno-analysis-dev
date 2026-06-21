@@ -53,6 +53,8 @@ interface CodeCardProps {
   excerpts: BookmarkCode[] | undefined
   filteredBmIds: Set<number>
   bookmarks: Bookmark[]
+  interviewBmIds: Set<number>
+  newsBmIds: Set<number>
   mergeMode: boolean
   mergeSelected: boolean
   onMergeToggle: (id: number) => void
@@ -64,7 +66,8 @@ interface CodeCardProps {
   activeExcerptKey: string | null
 }
 
-function CodeCard({ code, depth, expanded, excerpts, filteredBmIds, bookmarks, mergeMode, mergeSelected, onMergeToggle, isActive, onToggle, dnd, onOpenExcerpt, onDeleteExcerptCode, activeExcerptKey }: CodeCardProps) {
+function CodeCard({ code, depth, expanded, excerpts, filteredBmIds, bookmarks, interviewBmIds, newsBmIds, mergeMode, mergeSelected, onMergeToggle, isActive, onToggle, dnd, onOpenExcerpt, onDeleteExcerptCode, activeExcerptKey }: CodeCardProps) {
+  const navigate = useNavigate()
   const tc = labelTextColor(code.color)
   const quoteCount = (excerpts || []).length
   const isDragOver = dnd.dragOverCodeId === code.id
@@ -165,7 +168,15 @@ function CodeCard({ code, depth, expanded, excerpts, filteredBmIds, bookmarks, m
                         )}
                         <div className="flex items-center gap-2 mt-0.5">
                           <p className="text-[10px] text-gray-400">
-                            {bm?.username || ''}{bm?.date ? ' · ' + bm.date.substring(0, 10) : ''}
+                            {bm?.username && !interviewBmIds.has(bc.bookmark_id) && !newsBmIds.has(bc.bookmark_id) ? (
+                              <button
+                                onClick={e => { e.stopPropagation(); sessionStorage.setItem('codingPage.scrollY', String(window.scrollY)); navigate(`/discord/users/${encodeURIComponent(bm.username!)}`) }}
+                                className="text-indigo-600 hover:underline font-medium"
+                              >
+                                {bm.username}
+                              </button>
+                            ) : (bm?.username || '')}
+                            {bm?.date ? ' · ' + bm.date.substring(0, 10) : ''}
                           </p>
                         </div>
                       </div>
@@ -218,6 +229,8 @@ interface CatNodeProps {
   onToggleCode: (code: CodeExt) => void
   filteredBmIds: Set<number>
   bookmarks: Bookmark[]
+  interviewBmIds: Set<number>
+  newsBmIds: Set<number>
   bookmarkCodes: BookmarkCode[]
   mergeMode: boolean
   mergeSelected: Set<number>
@@ -234,7 +247,7 @@ interface CatNodeProps {
 
 function CatNode({
   node, depth, collapsedCats, onToggleCollapse, expandedCodes, onToggleCode,
-  filteredBmIds, bookmarks, bookmarkCodes, mergeMode, mergeSelected, onMergeToggle,
+  filteredBmIds, bookmarks, interviewBmIds, newsBmIds, bookmarkCodes, mergeMode, mergeSelected, onMergeToggle,
   activeCodeId, activeCatId, onOpenCat, dnd, filterActive, onOpenExcerpt, onDeleteExcerptCode, activeExcerptKey,
 }: CatNodeProps) {
   const codeHasFilteredExcerpts = (code: CodeExt) =>
@@ -301,6 +314,8 @@ function CatNode({
               onToggleCode={onToggleCode}
               filteredBmIds={filteredBmIds}
               bookmarks={bookmarks}
+              interviewBmIds={interviewBmIds}
+              newsBmIds={newsBmIds}
               bookmarkCodes={bookmarkCodes}
               mergeMode={mergeMode}
               mergeSelected={mergeSelected}
@@ -327,6 +342,8 @@ function CatNode({
                   excerpts={codeExcerpts}
                   filteredBmIds={filteredBmIds}
                   bookmarks={bookmarks}
+                  interviewBmIds={interviewBmIds}
+                  newsBmIds={newsBmIds}
                   mergeMode={mergeMode}
                   mergeSelected={mergeSelected.has(code.id)}
                   onMergeToggle={onMergeToggle}
@@ -390,14 +407,12 @@ type CodingSource = 'all' | 'discord' | 'interview' | 'news'
 export default function CodingPage() {
   const { pathname } = useLocation()
   const navigate = useNavigate()
-  const [searchParams] = useSearchParams()
+  const [searchParams, setSearchParams] = useSearchParams()
   const pageTab: PageTab = pathname.endsWith('/table') ? 'table' : 'manager'
   const setPageTab = (tab: PageTab) => {
     localStorage.setItem('coding_tab', tab)
-    // Preserve source query param when switching tabs
-    const source = searchParams.get('source')
-    const suffix = source ? `?source=${source}` : ''
-    navigate(`../${tab}${suffix}`, { relative: 'path' })
+    const qs = searchParams.toString()
+    navigate(`../${tab}${qs ? `?${qs}` : ''}`, { relative: 'path' })
   }
 
   const module = pathname.split('/')[1] // 'discord', 'coding', 'interview', 'news'
@@ -486,6 +501,13 @@ export default function CodingPage() {
   useEffect(() => { if (_codes) setCodes(_codes) }, [_codes])
   useEffect(() => { if (_categories) setCategories(_categories) }, [_categories])
   useEffect(() => {
+    const saved = sessionStorage.getItem('codingPage.scrollY')
+    if (saved !== null) {
+      sessionStorage.removeItem('codingPage.scrollY')
+      requestAnimationFrame(() => window.scrollTo({ top: parseInt(saved, 10), behavior: 'instant' }))
+    }
+  }, [])
+  useEffect(() => {
     const normalized = (_rawBookmarks as any[]).map((bm: any) => {
       if (bm.interview_id !== undefined) return normalizeInterviewBookmark(bm as InterviewBookmark)
       if (bm.article_id !== undefined) return normalizeNewsBookmark(bm as NewsBookmark)
@@ -496,9 +518,20 @@ export default function CodingPage() {
   }, [_rawBookmarks])
   useEffect(() => { setBookmarkCodes(_bookmarkCodes ?? []) }, [_bookmarkCodes])
 
-  const [dateFrom, setDateFrom] = useState('')
-  const [dateTo, setDateTo] = useState('')
-  const [authorFilter, setAuthorFilter] = useState<AuthorFilter>('all')
+  const [dateFrom, setDateFrom] = useState<string>(() => searchParams.get('from') ?? '')
+  const [dateTo, setDateTo] = useState<string>(() => searchParams.get('to') ?? '')
+  const [authorFilter, setAuthorFilter] = useState<AuthorFilter>(() => (searchParams.get('author') as AuthorFilter) ?? 'all')
+
+  // Persist filter state in URL so browser back button restores it after visiting user detail
+  useEffect(() => {
+    setSearchParams(prev => {
+      const next = new URLSearchParams(prev)
+      dateFrom   ? next.set('from', dateFrom)       : next.delete('from')
+      dateTo     ? next.set('to', dateTo)            : next.delete('to')
+      authorFilter !== 'all' ? next.set('author', authorFilter) : next.delete('author')
+      return next
+    }, { replace: true })
+  }, [dateFrom, dateTo, authorFilter]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const [collapsedCats, setCollapsedCats] = useState<Set<number>>(new Set())
   const [expandedCodes, setExpandedCodes] = useState<Set<number>>(new Set())
@@ -576,15 +609,24 @@ export default function CodingPage() {
     : new Set(bookmarkCodes.map(bc => bc.bookmark_id))
   const filteredCodes = bookmarkCodes.filter(bc => filteredBmIds.has(bc.bookmark_id))
 
-  const setPhase = (phase: 1 | 2 | 3) => {
-    if (phase === 1) { setDateFrom('2023-04-01'); setDateTo('2023-07-18') }
-    else if (phase === 2) { setDateFrom('2023-07-19'); setDateTo('2023-09-05') }
-    else { setDateFrom('2023-09-06'); setDateTo('') }
+  type PhaseKey = '1' | '2' | '3' | '3a' | '3b' | '3c' | '3d'
+  const setPhase = (phase: PhaseKey) => {
+    if (phase === '1')  { setDateFrom('2023-04-01'); setDateTo('2023-07-18') }
+    else if (phase === '2')  { setDateFrom('2023-07-19'); setDateTo('2023-09-05') }
+    else if (phase === '3')  { setDateFrom('2023-09-06'); setDateTo('') }
+    else if (phase === '3a') { setDateFrom('2023-09-06'); setDateTo('2023-12-18') }
+    else if (phase === '3b') { setDateFrom('2023-12-18'); setDateTo('2024-03-17') }
+    else if (phase === '3c') { setDateFrom('2024-03-17'); setDateTo('2024-05-16') }
+    else if (phase === '3d') { setDateFrom('2024-05-17'); setDateTo('') }
   }
-  const activePhase =
-    dateFrom === '2023-04-01' && dateTo === '2023-07-18' ? 1 :
-    dateFrom === '2023-07-19' && dateTo === '2023-09-05' ? 2 :
-    dateFrom === '2023-09-06' && dateTo === '' ? 3 : null
+  const activePhase: PhaseKey | null =
+    dateFrom === '2023-04-01' && dateTo === '2023-07-18' ? '1' :
+    dateFrom === '2023-07-19' && dateTo === '2023-09-05' ? '2' :
+    dateFrom === '2023-09-06' && dateTo === '' ? '3' :
+    dateFrom === '2023-09-06' && dateTo === '2023-12-18' ? '3a' :
+    dateFrom === '2023-12-18' && dateTo === '2024-03-17' ? '3b' :
+    dateFrom === '2024-03-17' && dateTo === '2024-05-16' ? '3c' :
+    dateFrom === '2024-05-17' && dateTo === '' ? '3d' : null
 
   const openCodeDetail = (code: CodeExt) => {
     const withCount = { ...code, groundedness: bookmarkCodes.filter(bc => bc.code_id === code.id).length }
@@ -1031,22 +1073,46 @@ export default function CodingPage() {
         <div className="w-full flex flex-wrap items-center gap-2 pt-2 border-t border-gray-100">
           <span className="filter-label self-center shrink-0">Phase</span>
           <button
-            onClick={() => activePhase === 1 ? (setDateFrom(''), setDateTo('')) : setPhase(1)}
-            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${activePhase === 1 ? 'border-blue-400 bg-blue-100 text-blue-800' : 'border-blue-300 text-blue-700 hover:bg-blue-50'}`}
+            onClick={() => activePhase === '1' ? (setDateFrom(''), setDateTo('')) : setPhase('1')}
+            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${activePhase === '1' ? 'border-blue-400 bg-blue-100 text-blue-800' : 'border-blue-300 text-blue-700 hover:bg-blue-50'}`}
           >
             Phase 1 — Capability Surfacing <span className="opacity-60 ml-1">Apr - 18 Jul 2023</span>
           </button>
           <button
-            onClick={() => activePhase === 2 ? (setDateFrom(''), setDateTo('')) : setPhase(2)}
-            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${activePhase === 2 ? 'border-amber-400 bg-amber-100 text-amber-800' : 'border-amber-300 text-amber-700 hover:bg-amber-50'}`}
+            onClick={() => activePhase === '2' ? (setDateFrom(''), setDateTo('')) : setPhase('2')}
+            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${activePhase === '2' ? 'border-amber-400 bg-amber-100 text-amber-800' : 'border-amber-300 text-amber-700 hover:bg-amber-50'}`}
           >
             Phase 2 — Enclosure &amp; Scrutiny <span className="opacity-60 ml-1">19 Jul - 5 Sep 2023</span>
           </button>
           <button
-            onClick={() => activePhase === 3 ? (setDateFrom(''), setDateTo('')) : setPhase(3)}
-            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${activePhase === 3 ? 'border-emerald-400 bg-emerald-100 text-emerald-800' : 'border-emerald-300 text-emerald-700 hover:bg-emerald-50'}`}
+            onClick={() => activePhase === '3' ? (setDateFrom(''), setDateTo('')) : setPhase('3')}
+            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${activePhase === '3' ? 'border-emerald-400 bg-emerald-100 text-emerald-800' : 'border-emerald-300 text-emerald-700 hover:bg-emerald-50'}`}
           >
             Phase 3 — Commercialization <span className="opacity-60 ml-1">Sep 2023 - onward</span>
+          </button>
+          <button
+            onClick={() => activePhase === '3a' ? (setDateFrom(''), setDateTo('')) : setPhase('3a')}
+            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${activePhase === '3a' ? 'border-violet-400 bg-violet-100 text-violet-800' : 'border-violet-300 text-violet-700 hover:bg-violet-50'}`}
+          >
+            Phase 3A — Early Commercialization <span className="opacity-60 ml-1">6 Sep - 18 Dec 2023</span>
+          </button>
+          <button
+            onClick={() => activePhase === '3b' ? (setDateFrom(''), setDateTo('')) : setPhase('3b')}
+            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${activePhase === '3b' ? 'border-sky-400 bg-sky-100 text-sky-800' : 'border-sky-300 text-sky-700 hover:bg-sky-50'}`}
+          >
+            Phase 3B — Early Wide Adoption <span className="opacity-60 ml-1">18 Dec 2023 - 17 Mar 2024</span>
+          </button>
+          <button
+            onClick={() => activePhase === '3c' ? (setDateFrom(''), setDateTo('')) : setPhase('3c')}
+            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${activePhase === '3c' ? 'border-orange-400 bg-orange-100 text-orange-800' : 'border-orange-300 text-orange-700 hover:bg-orange-50'}`}
+          >
+            Phase 3C — Pre-Litigation <span className="opacity-60 ml-1">17 Mar - 16 May 2024</span>
+          </button>
+          <button
+            onClick={() => activePhase === '3d' ? (setDateFrom(''), setDateTo('')) : setPhase('3d')}
+            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${activePhase === '3d' ? 'border-rose-400 bg-rose-100 text-rose-800' : 'border-rose-300 text-rose-700 hover:bg-rose-50'}`}
+          >
+            Phase 3D — Warning &amp; Lawsuit <span className="opacity-60 ml-1">17 May 2024 - onward</span>
           </button>
         </div>
 
@@ -1241,6 +1307,8 @@ export default function CodingPage() {
                     onToggleCode={openCodeDetail}
                     filteredBmIds={filteredBmIds}
                     bookmarks={bookmarks}
+                    interviewBmIds={interviewBmIds}
+                    newsBmIds={newsBmIds}
                     bookmarkCodes={bookmarkCodes}
                     mergeMode={mergeMode}
                     mergeSelected={mergeSelected}
@@ -1279,6 +1347,8 @@ export default function CodingPage() {
                               excerpts={codeExcerpts}
                               filteredBmIds={filteredBmIds}
                               bookmarks={bookmarks}
+                              interviewBmIds={interviewBmIds}
+                              newsBmIds={newsBmIds}
                               mergeMode={mergeMode}
                               mergeSelected={mergeSelected.has(code.id)}
                               onMergeToggle={toggleMergeSelect}
@@ -1403,9 +1473,18 @@ export default function CodingPage() {
                       </div>
                       {/* Source */}
                       <div className="flex items-center gap-1.5 text-xs text-gray-500 flex-wrap">
-                        <span className="text-[11px] px-2 py-0.5 rounded-full font-semibold bg-indigo-100 text-indigo-700">
-                          {detailExcerptBm.username}
-                        </span>
+                        {detailExcerptBm.username && !interviewBmIds.has(detailExcerptBm.id) && !newsBmIds.has(detailExcerptBm.id) ? (
+                          <button
+                            onClick={() => { sessionStorage.setItem('codingPage.scrollY', String(window.scrollY)); navigate(`/discord/users/${encodeURIComponent(detailExcerptBm.username!)}`) }}
+                            className="text-[11px] px-2 py-0.5 rounded-full font-semibold bg-indigo-100 text-indigo-700 hover:bg-indigo-200 transition-colors"
+                          >
+                            {detailExcerptBm.username}
+                          </button>
+                        ) : (
+                          <span className="text-[11px] px-2 py-0.5 rounded-full font-semibold bg-indigo-100 text-indigo-700">
+                            {detailExcerptBm.username}
+                          </span>
+                        )}
                         <span>{detailExcerptBm.date?.slice(0, 19).replace('T', ' ')}</span>
                       </div>
                       {/* Current coding */}
@@ -1551,7 +1630,16 @@ export default function CodingPage() {
                                 className={`text-[11px] px-1.5 py-1 rounded ${cm.is_target ? 'bg-yellow-50 border border-yellow-200' : 'bg-slate-50'}`}
                               >
                                 <div className="flex items-center gap-1.5 mb-0.5">
-                                  <span className="font-semibold text-gray-700">{cm.username}</span>
+                                  {cm.username ? (
+                                    <button
+                                      onClick={() => { sessionStorage.setItem('codingPage.scrollY', String(window.scrollY)); navigate(`/discord/users/${encodeURIComponent(cm.username)}`) }}
+                                      className="font-semibold text-indigo-700 hover:underline"
+                                    >
+                                      {cm.username}
+                                    </button>
+                                  ) : (
+                                    <span className="font-semibold text-gray-700">—</span>
+                                  )}
                                   <span className="text-gray-400 text-[10px]">{cm.date?.slice(0, 19).replace('T', ' ')}</span>
                                 </div>
                                 <p className="text-gray-700 leading-snug">{cm.content}</p>
@@ -1685,7 +1773,16 @@ export default function CodingPage() {
                                   <p className="italic leading-relaxed">&ldquo;{text}{truncated ? '…' : ''}&rdquo;</p>
                                 </td>
                                 <td className="px-3 py-2 text-xs text-gray-500 border-b border-gray-100 whitespace-nowrap">
-                                  <div className="font-medium">{bm?.username || '—'}</div>
+                                  {bm?.username && getBmSource(bc.bookmark_id) === 'Discord' ? (
+                                    <button
+                                      onClick={() => { sessionStorage.setItem('codingPage.scrollY', String(window.scrollY)); navigate(`/discord/users/${encodeURIComponent(bm.username!)}`) }}
+                                      className="font-medium text-indigo-700 hover:underline block"
+                                    >
+                                      {bm.username}
+                                    </button>
+                                  ) : (
+                                    <div className="font-medium">{bm?.username || '—'}</div>
+                                  )}
                                   <div className="text-gray-400">{bm?.date?.slice(0, 19).replace('T', ' ') || ''}</div>
                                   <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded-full mt-1 inline-block ${sourceStyle(getBmSource(bc.bookmark_id))}`}>{getBmSource(bc.bookmark_id)}</span>
                                 </td>
@@ -1761,7 +1858,16 @@ export default function CodingPage() {
                                   <p className="italic leading-relaxed">&ldquo;{text}{truncated ? '…' : ''}&rdquo;</p>
                                 </td>
                                 <td className="px-3 py-2 text-xs text-gray-500 border-b border-gray-100 whitespace-nowrap">
-                                  <div className="font-medium">{bm?.username || '—'}</div>
+                                  {bm?.username && getBmSource(bc.bookmark_id) === 'Discord' ? (
+                                    <button
+                                      onClick={() => { sessionStorage.setItem('codingPage.scrollY', String(window.scrollY)); navigate(`/discord/users/${encodeURIComponent(bm.username!)}`) }}
+                                      className="font-medium text-indigo-700 hover:underline block"
+                                    >
+                                      {bm.username}
+                                    </button>
+                                  ) : (
+                                    <div className="font-medium">{bm?.username || '—'}</div>
+                                  )}
                                   <div className="text-gray-400">{bm?.date?.slice(0, 19).replace('T', ' ') || ''}</div>
                                   <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded-full mt-1 inline-block ${sourceStyle(getBmSource(bc.bookmark_id))}`}>{getBmSource(bc.bookmark_id)}</span>
                                 </td>

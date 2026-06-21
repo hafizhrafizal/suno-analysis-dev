@@ -9,6 +9,7 @@ pub mod github;
 pub mod interviews;
 pub mod labels;
 pub mod news;
+pub mod persona;
 pub mod search;
 pub mod stats;
 pub mod suno_team;
@@ -45,6 +46,9 @@ pub fn all_routes(state: AppState) -> Router {
         .route("/search/users-in-range", get(search::users_in_range))
         .route("/search/user-messages", get(search::user_messages))
         .route("/search/bulk-context", post(search::bulk_context))
+        .route("/messages/export", get(search::export_csv))
+        .route("/messages/emotions", post(search::get_message_emotions))
+        .route("/search/stored-sentiment", post(search::stored_sentiment))
         // Context
         .route("/context/:message_id", get(context_route::get_context))
         .route("/filter/semantic", post(context_route::filter_semantic))
@@ -59,7 +63,17 @@ pub fn all_routes(state: AppState) -> Router {
         .route("/user-topics", post(chat::user_topics))
         .route("/user-topics/stream", post(chat::user_topics_stream))
         .route("/user-emotion", post(chat::user_emotion))
+        .route("/search/sentiment-count", post(chat::sentiment_count))
+        .route("/search/batch-sentiment", post(chat::user_batch_sentiment))
+        .route("/search/batch-sentiment-stream", post(chat::batch_sentiment_stream))
         .route("/user-strategy-classify", post(chat::user_strategy_classify))
+        .route("/user-engagement-narrative", post(chat::user_engagement_narrative))
+        // Persona classification
+        .route("/persona/classify", post(persona::classify))
+        .route("/persona/by-phase", get(persona::by_phase))
+        .route("/persona/user/:username", get(persona::list_for_user))
+        .route("/persona/phase-summary", get(persona::phase_summary))
+        .route("/persona/:username/:phase/:method", delete(persona::delete_one))
         // Uploads — 200 MB body limit for large Discord CSV exports
         .route("/upload", post(uploads::upload_csv).layer(DefaultBodyLimit::max(200 * 1024 * 1024)))
         .route("/uploads", get(uploads::list_uploads))

@@ -319,9 +319,13 @@ mark {
 /* ── Coding Manager phase/author filter buttons ── */
 .cm-phase-btn { font-weight: 500; font-size: 0.75rem; padding: 0.3rem 0.625rem; border: 1px solid #d1d5db; background: #f9fafb; cursor: pointer; transition: all 0.15s; }
 .cm-suno-btn  { font-weight: 500; font-size: 0.75rem; padding: 0.3rem 0.625rem; border: 1px solid #d1d5db; background: #f9fafb; cursor: pointer; transition: all 0.15s; }
-.cm-phase-btn[data-phase="1"].cm-phase-active { background: #eff6ff; border-color: #3b82f6; color: #1d4ed8; font-weight: 700; }
-.cm-phase-btn[data-phase="2"].cm-phase-active { background: #fffbeb; border-color: #f59e0b; color: #b45309; font-weight: 700; }
-.cm-phase-btn[data-phase="3"].cm-phase-active { background: #ecfdf5; border-color: #10b981; color: #065f46; font-weight: 700; }
+.cm-phase-btn[data-phase="1"].cm-phase-active  { background: #eff6ff; border-color: #3b82f6; color: #1d4ed8; font-weight: 700; }
+.cm-phase-btn[data-phase="2"].cm-phase-active  { background: #fffbeb; border-color: #f59e0b; color: #b45309; font-weight: 700; }
+.cm-phase-btn[data-phase="3"].cm-phase-active  { background: #ecfdf5; border-color: #10b981; color: #065f46; font-weight: 700; }
+.cm-phase-btn[data-phase="3a"].cm-phase-active { background: #f5f3ff; border-color: #8b5cf6; color: #5b21b6; font-weight: 700; }
+.cm-phase-btn[data-phase="3b"].cm-phase-active { background: #e0f2fe; border-color: #38bdf8; color: #0369a1; font-weight: 700; }
+.cm-phase-btn[data-phase="3c"].cm-phase-active { background: #fff7ed; border-color: #fb923c; color: #c2410c; font-weight: 700; }
+.cm-phase-btn[data-phase="3d"].cm-phase-active { background: #fff1f2; border-color: #fb7185; color: #be123c; font-weight: 700; }
 .cm-suno-btn[data-suno="all"].cm-suno-active    { background: #374151; border-color: #374151; color: #fff; font-weight: 700; }
 .cm-suno-btn[data-suno="only"].cm-suno-active   { background: #6d28d9; border-color: #6d28d9; color: #fff; font-weight: 700; }
 .cm-suno-btn[data-suno="exclude"].cm-suno-active { background: #be123c; border-color: #be123c; color: #fff; font-weight: 700; }

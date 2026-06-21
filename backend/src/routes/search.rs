@@ -1,6 +1,8 @@
 use axum::{
+    body::Body,
     extract::{Query, State},
-    http::HeaderMap,
+    http::{header, HeaderMap, StatusCode},
+    response::Response,
     Json,
 };
 
@@ -88,6 +90,8 @@ pub struct UserRangeParams {
     pub upload_ids: Option<String>,
     pub is_suno_team: Option<String>,
     pub min_words: Option<i64>,
+    pub min_messages: Option<i64>,
+    pub limit: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -106,7 +110,7 @@ pub async fn keyword_search(
     if q.is_empty() {
         return Ok(Json(json!([])));
     }
-    let limit = params.limit.unwrap_or(10_000).min(10_000);
+    let limit = params.limit.unwrap_or(1_000_000);
     let match_type = params.match_type.as_deref().unwrap_or("fuzzy");
     let use_fts = state.fts_ready.load(Ordering::Relaxed);
 
@@ -619,7 +623,7 @@ pub async fn username_search(
     Query(params): Query<UsernameParams>,
 ) -> Result<Json<Value>> {
     let q = params.q.unwrap_or_default();
-    let limit = params.limit.unwrap_or(10_000).min(10_000);
+    let limit = params.limit.unwrap_or(1_000_000);
 
     let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
         "SELECT id, msg_uuid, author_id, username, date, content,
@@ -754,7 +758,7 @@ pub async fn range_search(
     qb.push(" ORDER BY date ASC");
     if let Some(lim) = params.limit {
         qb.push(" LIMIT ");
-        qb.push_bind(lim.min(10_000));
+        qb.push_bind(lim);
     }
     qb.push(" OFFSET ");
     qb.push_bind(offset);
@@ -833,8 +837,24 @@ pub async fn users_in_range(
 
     let combined_filters = format!("{}{}", filters, upload_filter);
 
+    let mut having_clause = String::new();
+    if let Some(mm) = params.min_messages {
+        if mm > 0 {
+            let n = args.len() + 1;
+            having_clause = format!(" HAVING COUNT(*) >= ${}", n);
+            args.push(mm.to_string());
+        }
+    }
+
+    let limit = params.limit.unwrap_or(1_000_000);
     let sql = format!(
-        "SELECT m.username,
+        "WITH tw AS MATERIALIZED (
+             SELECT COUNT(DISTINCT COALESCE(week,
+                     TO_CHAR(NULLIF(date,'')::timestamp, 'IYYY-IW'))) AS total_weeks
+             FROM messages
+             WHERE 1=1{cf}
+         )
+         SELECT m.username,
                 COUNT(*) AS message_count,
                 MIN(m.date) AS first_date,
                 MAX(m.date) AS last_date,
@@ -845,14 +865,16 @@ pub async fn users_in_range(
                 COUNT(DISTINCT COALESCE(m.week,
                     TO_CHAR(NULLIF(m.date,'')::timestamp, 'IYYY-IW'))) AS weeks_active,
                 MAX(CASE WHEN LOWER(m.is_suno_team) IN ('true', '1') THEN 1 ELSE 0 END)::bigint AS is_team,
-                (SELECT COUNT(DISTINCT COALESCE(week,
-                     TO_CHAR(NULLIF(date,'')::timestamp, 'IYYY-IW')))
-                 FROM messages WHERE 1=1{cf}) AS total_weeks
+                tw.total_weeks
          FROM messages m
+         CROSS JOIN tw
          WHERE 1=1{cf}
-         GROUP BY m.username
-         ORDER BY message_count DESC",
+         GROUP BY m.username, tw.total_weeks{having}
+         ORDER BY message_count DESC
+         LIMIT {limit}",
         cf = combined_filters,
+        having = having_clause,
+        limit = limit,
     );
 
     let mut q = sqlx::query(&sql);
@@ -891,7 +913,7 @@ pub async fn user_messages(
     Query(params): Query<UserMessagesParams>,
 ) -> Result<Json<Value>> {
     let username = params.username.unwrap_or_default();
-    let limit = params.limit.unwrap_or(100).min(10_000);
+    let limit = params.limit.unwrap_or(1_000_000);
     let offset = params.offset.unwrap_or(0);
 
     let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
@@ -1001,4 +1023,275 @@ pub async fn bulk_context(
     }
 
     Ok(Json(json!(results)))
+}
+
+// ── CSV export ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct ExportParams {
+    pub date_from: Option<String>,
+    pub date_to: Option<String>,
+    pub upload_ids: Option<String>,
+}
+
+pub async fn export_csv(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    Query(params): Query<ExportParams>,
+) -> Result<Response<Body>> {
+    use sqlx::Row;
+
+    let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
+        "SELECT id, msg_uuid, author_id, username, date, content, \
+                attachments, reactions, is_suno_team, upload_id, row_index \
+         FROM messages WHERE 1=1",
+    );
+
+    if let Some(ref df) = params.date_from {
+        qb.push(" AND date >= ");
+        qb.push_bind(df.clone());
+    }
+    if let Some(ref dt) = params.date_to {
+        qb.push(" AND date <= ");
+        qb.push_bind(dt.clone());
+    }
+    if let Some(ref uid_str) = params.upload_ids {
+        let ids: Vec<&str> = uid_str
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !ids.is_empty() {
+            qb.push(" AND upload_id IN (");
+            let mut sep = qb.separated(", ");
+            for id in &ids { sep.push_bind(id.to_string()); }
+            qb.push(")");
+        }
+    }
+    qb.push(" ORDER BY date ASC");
+
+    let rows = qb.build().fetch_all(&state.db).await?;
+
+    fn csv_field(s: &str) -> String {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    }
+    fn opt_field(o: &Option<String>) -> String {
+        o.as_deref().map(csv_field).unwrap_or_default()
+    }
+
+    let mut csv =
+        String::from("id,msg_uuid,author_id,username,date,content,attachments,reactions,is_suno_team,upload_id,row_index\r\n");
+
+    for row in rows {
+        let id: i64 = row.get("id");
+        let msg_uuid: String = row.get("msg_uuid");
+        let author_id: Option<String> = row.get("author_id");
+        let username: String = row.get("username");
+        let date: String = row.get("date");
+        let content: String = row.get("content");
+        let attachments: Option<String> = row.get("attachments");
+        let reactions: Option<String> = row.get("reactions");
+        let is_suno_team: Option<String> = row.get("is_suno_team");
+        let upload_id: Option<String> = row.get("upload_id");
+        let row_index: Option<i64> = row.get("row_index");
+
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{}\r\n",
+            id,
+            csv_field(&msg_uuid),
+            opt_field(&author_id),
+            csv_field(&username),
+            csv_field(&date),
+            csv_field(&content),
+            opt_field(&attachments),
+            opt_field(&reactions),
+            opt_field(&is_suno_team),
+            opt_field(&upload_id),
+            row_index.map(|v| v.to_string()).unwrap_or_default(),
+        ));
+    }
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/csv; charset=utf-8")
+        .header(header::CONTENT_DISPOSITION, "attachment; filename=\"chat_export.csv\"")
+        .body(Body::from(csv))
+        .map_err(|e| AppError::Internal(format!("Response build error: {}", e)))
+}
+
+/// POST /messages/emotions
+/// Body: { "msg_uuids": ["uuid1", ...] }
+/// Returns: { "uuid1": { "sentiment": "...", "dominant_emotion": "...", "top_emotions": [...] }, ... }
+/// Aggregate already-saved message_emotions rows for a list of usernames.
+/// Returns the same shape as /search/batch-sentiment so the frontend can
+/// populate the stats table without re-running the AI service.
+pub async fn stored_sentiment(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>> {
+    use sqlx::Row;
+    use std::collections::HashMap;
+
+    let usernames: Vec<String> = body["usernames"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
+    if usernames.is_empty() {
+        return Ok(Json(json!({ "results": [] })));
+    }
+
+    // Build positional args and optional filters (same pattern as user_batch_sentiment)
+    let mut args: Vec<String> = usernames.clone();
+    let un_placeholders: String = (1..=usernames.len())
+        .map(|i| format!("${}", i))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut filters = String::new();
+    if let Some(df) = body["date_from"].as_str().filter(|s| !s.is_empty()) {
+        filters.push_str(&format!(" AND m.date >= ${}", args.len() + 1));
+        args.push(df.to_string());
+    }
+    if let Some(dt) = body["date_to"].as_str().filter(|s| !s.is_empty()) {
+        filters.push_str(&format!(" AND m.date <= ${}", args.len() + 1));
+        args.push(dt.to_string());
+    }
+    if let Some(uid_str) = body["upload_ids"].as_str().filter(|s| !s.is_empty()) {
+        let ids: Vec<&str> = uid_str.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        if !ids.is_empty() {
+            let phs: Vec<String> = ids.iter().enumerate()
+                .map(|(i, _)| format!("${}", args.len() + i + 1))
+                .collect();
+            filters.push_str(&format!(" AND m.upload_id IN ({})", phs.join(", ")));
+            args.extend(ids.iter().map(|s| s.to_string()));
+        }
+    }
+
+    let sql = format!(
+        "SELECT m.username, me.sentiment, me.top_emotions \
+         FROM messages m \
+         JOIN message_emotions me ON m.msg_uuid = me.msg_uuid \
+         WHERE m.username IN ({un}) AND m.msg_uuid IS NOT NULL{filters} \
+         ORDER BY m.username",
+        un = un_placeholders,
+        filters = filters,
+    );
+
+    let mut q = sqlx::query(&sql);
+    for a in &args { q = q.bind(a.clone()); }
+    let rows = q.fetch_all(&state.db).await?;
+
+    // Aggregate: counts and label score sums per user and per sentiment bucket
+    let mut user_counts: HashMap<String, (i64, i64, i64)> = HashMap::new();
+    let mut user_label: HashMap<String, HashMap<String, (f64, i64)>> = HashMap::new();
+    let mut user_by_sent: HashMap<String, HashMap<String, HashMap<String, (f64, i64)>>> = HashMap::new();
+
+    for row in &rows {
+        let username: String = row.get("username");
+        let sentiment: String = row.get("sentiment");
+        let top_emotions: serde_json::Value = row.try_get("top_emotions").unwrap_or(json!([]));
+
+        let e = user_counts.entry(username.clone()).or_insert((0, 0, 0));
+        match sentiment.as_str() {
+            "positive" => e.0 += 1,
+            "negative" => e.1 += 1,
+            _ => e.2 += 1,
+        }
+
+        if let Some(arr) = top_emotions.as_array() {
+            let label_map = user_label.entry(username.clone()).or_default();
+            let sent_map = user_by_sent
+                .entry(username.clone()).or_default()
+                .entry(sentiment.clone()).or_default();
+            for em in arr {
+                if let (Some(label), Some(score)) = (em["label"].as_str(), em["score"].as_f64()) {
+                    let acc = label_map.entry(label.to_string()).or_insert((0.0, 0));
+                    acc.0 += score; acc.1 += 1;
+                    let sacc = sent_map.entry(label.to_string()).or_insert((0.0, 0));
+                    sacc.0 += score; sacc.1 += 1;
+                }
+            }
+        }
+    }
+
+    let sort_top3 = |label_map: &HashMap<String, (f64, i64)>| -> Vec<serde_json::Value> {
+        let mut v: Vec<serde_json::Value> = label_map.iter().map(|(label, (sum, cnt))| {
+            let avg = (sum / (*cnt as f64) * 1000.0).round() / 1000.0;
+            json!({ "label": label, "score": avg })
+        }).collect();
+        v.sort_by(|a, b| b["score"].as_f64().unwrap_or(0.0)
+            .partial_cmp(&a["score"].as_f64().unwrap_or(0.0))
+            .unwrap_or(std::cmp::Ordering::Equal));
+        v.into_iter().take(3).collect()
+    };
+
+    let results: Vec<serde_json::Value> = usernames.iter().map(|u| {
+        let (pos, neg, neu) = user_counts.get(u).copied().unwrap_or((0, 0, 0));
+        let total = pos + neg + neu;
+        if total == 0 {
+            return json!({ "username": u, "positive": 0.0, "negative": 0.0, "neutral": 0.0, "analyzed": 0 });
+        }
+        let top_emotions = user_label.get(u).map(&sort_top3).unwrap_or_default();
+        let empty_sent: HashMap<String, HashMap<String, (f64, i64)>> = HashMap::new();
+        let sent_data = user_by_sent.get(u).unwrap_or(&empty_sent);
+        json!({
+            "username": u,
+            "positive": (pos as f64) / (total as f64),
+            "negative": (neg as f64) / (total as f64),
+            "neutral":  (neu as f64) / (total as f64),
+            "analyzed": total,
+            "top_emotions": top_emotions,
+            "by_sentiment": {
+                "positive": { "count": pos, "top_emotions": sent_data.get("positive").map(&sort_top3).unwrap_or_default() },
+                "negative": { "count": neg, "top_emotions": sent_data.get("negative").map(&sort_top3).unwrap_or_default() },
+                "neutral":  { "count": neu, "top_emotions": sent_data.get("neutral").map(&sort_top3).unwrap_or_default() },
+            },
+        })
+    }).collect();
+
+    Ok(Json(json!({ "results": results })))
+}
+
+pub async fn get_message_emotions(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>> {
+    use sqlx::Row;
+    let uuids: Vec<String> = body["msg_uuids"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
+    if uuids.is_empty() {
+        return Ok(Json(json!({})));
+    }
+
+    let placeholders: String = (1..=uuids.len()).map(|i| format!("${}", i)).collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "SELECT msg_uuid, sentiment, dominant_emotion, top_emotions \
+         FROM message_emotions WHERE msg_uuid IN ({})",
+        placeholders
+    );
+
+    let mut q = sqlx::query(&sql);
+    for uuid in &uuids { q = q.bind(uuid.clone()); }
+    let rows = q.fetch_all(&state.db).await?;
+
+    let mut out = serde_json::Map::new();
+    for row in rows {
+        let uuid: String = row.get("msg_uuid");
+        let sentiment: String = row.get("sentiment");
+        let dominant: String = row.get("dominant_emotion");
+        let top_emotions: serde_json::Value = row.try_get("top_emotions").unwrap_or(json!([]));
+        out.insert(uuid, json!({
+            "sentiment": sentiment,
+            "dominant_emotion": dominant,
+            "top_emotions": top_emotions,
+        }));
+    }
+
+    Ok(Json(Value::Object(out)))
 }

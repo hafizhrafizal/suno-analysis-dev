@@ -3,6 +3,8 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { apiFetch } from '../api/client'
 import { useAuthStore } from '../store/authStore'
+import { usePhaseStore, CHIP_PRESETS, DEFAULT_PHASE_DEFS } from '../store/phaseStore'
+import type { PhaseDef } from '../store/phaseStore'
 import type { Stats, EmbeddingModel, Upload, SunoTeamMember } from '../types'
 
 interface SyncScanResult {
@@ -234,6 +236,220 @@ function UploadCard({
         </div>
       )}
     </div>
+  )
+}
+
+const BLANK_PHASE: PhaseDef = { key: '', label: '', sub: '', from: '', to: '', barColor: '#3b82f6', chipCls: CHIP_PRESETS[0].chipCls }
+
+function PhaseForm({ draft, onChange, onSave, onCancel, error }: {
+  draft: PhaseDef
+  onChange: (d: PhaseDef) => void
+  onSave: () => void
+  onCancel: () => void
+  error: string | null
+}) {
+  return (
+    <div className="bg-gray-50 border border-gray-200 rounded-xl p-4 space-y-3">
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <label className="block text-[10px] font-semibold text-gray-500 uppercase mb-1">Key *</label>
+          <input
+            value={draft.key}
+            onChange={e => onChange({ ...draft, key: e.target.value })}
+            placeholder="e.g. 3e"
+            className="w-full text-xs border border-gray-200 rounded-lg px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-300"
+          />
+        </div>
+        <div>
+          <label className="block text-[10px] font-semibold text-gray-500 uppercase mb-1">Label *</label>
+          <input
+            value={draft.label}
+            onChange={e => onChange({ ...draft, label: e.target.value })}
+            placeholder="e.g. Phase 3E"
+            className="w-full text-xs border border-gray-200 rounded-lg px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-300"
+          />
+        </div>
+        <div className="col-span-2">
+          <label className="block text-[10px] font-semibold text-gray-500 uppercase mb-1">Sub-title</label>
+          <input
+            value={draft.sub}
+            onChange={e => onChange({ ...draft, sub: e.target.value })}
+            placeholder="e.g. Post-Litigation"
+            className="w-full text-xs border border-gray-200 rounded-lg px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-300"
+          />
+        </div>
+        <div>
+          <label className="block text-[10px] font-semibold text-gray-500 uppercase mb-1">From *</label>
+          <input
+            type="date"
+            value={draft.from}
+            onChange={e => onChange({ ...draft, from: e.target.value })}
+            className="w-full text-xs border border-gray-200 rounded-lg px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-300"
+          />
+        </div>
+        <div>
+          <label className="block text-[10px] font-semibold text-gray-500 uppercase mb-1">To (leave empty = ongoing)</label>
+          <input
+            type="date"
+            value={draft.to}
+            onChange={e => onChange({ ...draft, to: e.target.value })}
+            className="w-full text-xs border border-gray-200 rounded-lg px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-300"
+          />
+        </div>
+        <div className="col-span-2">
+          <label className="block text-[10px] font-semibold text-gray-500 uppercase mb-1">Color</label>
+          <div className="flex flex-wrap gap-1.5">
+            {CHIP_PRESETS.map(p => (
+              <button
+                key={p.label}
+                type="button"
+                onClick={() => onChange({ ...draft, chipCls: p.chipCls, barColor: p.barColor })}
+                className={`text-[10px] font-semibold px-2.5 py-1 rounded-full border transition-all ${p.chipCls} ${draft.chipCls === p.chipCls ? 'ring-2 ring-offset-1 ring-gray-500' : 'opacity-60 hover:opacity-100'}`}
+              >
+                {p.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+      {error && <p className="text-xs text-rose-600">{error}</p>}
+      <div className="flex gap-2">
+        <button onClick={onSave} className="search-btn text-xs px-3 py-1.5">Save</button>
+        <button onClick={onCancel} className="text-xs px-3 py-1.5 rounded-lg border border-gray-200 text-gray-600 hover:bg-gray-100">Cancel</button>
+      </div>
+    </div>
+  )
+}
+
+function PhaseTemplateSection() {
+  const { defs, setDefs, resetToDefaults } = usePhaseStore()
+  const [editingIdx, setEditingIdx] = useState<number | null>(null)
+  const [editDraft, setEditDraft] = useState<PhaseDef>(BLANK_PHASE)
+  const [addingNew, setAddingNew] = useState(false)
+  const [newDraft, setNewDraft] = useState<PhaseDef>(BLANK_PHASE)
+  const [error, setError] = useState<string | null>(null)
+
+  const startEdit = (idx: number) => {
+    setEditingIdx(idx)
+    setEditDraft({ ...defs[idx] })
+    setAddingNew(false)
+    setError(null)
+  }
+
+  const cancelEdit = () => { setEditingIdx(null); setError(null) }
+
+  const saveEdit = () => {
+    if (!editDraft.key.trim() || !editDraft.label.trim() || !editDraft.from.trim()) {
+      setError('Key, Label and From date are required.')
+      return
+    }
+    const duplicate = defs.some((d, i) => d.key === editDraft.key.trim() && i !== editingIdx)
+    if (duplicate) { setError('Key must be unique.'); return }
+    const next = defs.map((d, i) => i === editingIdx ? { ...editDraft, key: editDraft.key.trim() } : d)
+    setDefs(next)
+    setEditingIdx(null)
+    setError(null)
+  }
+
+  const deletePhase = (idx: number) => {
+    if (!window.confirm(`Delete "${defs[idx].label}"?`)) return
+    setDefs(defs.filter((_, i) => i !== idx))
+    if (editingIdx === idx) setEditingIdx(null)
+  }
+
+  const movePhase = (idx: number, dir: -1 | 1) => {
+    const next = [...defs]
+    const target = idx + dir
+    if (target < 0 || target >= next.length) return
+    ;[next[idx], next[target]] = [next[target], next[idx]]
+    setDefs(next)
+    if (editingIdx === idx) setEditingIdx(target)
+    else if (editingIdx === target) setEditingIdx(idx)
+  }
+
+  const saveNew = () => {
+    if (!newDraft.key.trim() || !newDraft.label.trim() || !newDraft.from.trim()) {
+      setError('Key, Label and From date are required.')
+      return
+    }
+    if (defs.some(d => d.key === newDraft.key.trim())) { setError('Key must be unique.'); return }
+    setDefs([...defs, { ...newDraft, key: newDraft.key.trim() }])
+    setAddingNew(false)
+    setNewDraft(BLANK_PHASE)
+    setError(null)
+  }
+
+  return (
+    <section className="bg-white rounded-2xl shadow p-5">
+      <div className="flex items-center justify-between mb-4">
+        <div>
+          <h2 className="font-semibold text-sm text-gray-700 uppercase tracking-wide">Phase Template</h2>
+          <p className="text-xs text-gray-400 mt-0.5">Define the phases used in dropout analysis and user flow charts</p>
+        </div>
+        <div className="flex gap-2">
+          <button
+            onClick={() => { if (window.confirm('Reset all phases to defaults?')) resetToDefaults() }}
+            className="text-xs px-3 py-1.5 rounded-lg border border-gray-200 text-gray-600 hover:bg-gray-50 transition-colors"
+          >
+            Reset to Defaults
+          </button>
+          <button
+            onClick={() => { setAddingNew(true); setNewDraft(BLANK_PHASE); setEditingIdx(null); setError(null) }}
+            disabled={addingNew}
+            className="text-xs px-3 py-1.5 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 transition-colors font-semibold"
+          >
+            + Add Phase
+          </button>
+        </div>
+      </div>
+
+      <div className="space-y-2">
+        {defs.map((def, idx) => (
+          <div key={def.key}>
+            <div className="flex items-center gap-2 px-3 py-2 rounded-xl border border-gray-100 hover:border-gray-200 bg-gray-50 hover:bg-white transition-colors">
+              {/* Move buttons */}
+              <div className="flex flex-col gap-0.5 shrink-0">
+                <button onClick={() => movePhase(idx, -1)} disabled={idx === 0} className="p-0.5 text-gray-300 hover:text-gray-600 disabled:invisible transition-colors">
+                  <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 15l7-7 7 7" /></svg>
+                </button>
+                <button onClick={() => movePhase(idx, 1)} disabled={idx === defs.length - 1} className="p-0.5 text-gray-300 hover:text-gray-600 disabled:invisible transition-colors">
+                  <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M19 9l-7 7-7-7" /></svg>
+                </button>
+              </div>
+              {/* Chip preview */}
+              <span className={`shrink-0 inline-block px-2 py-0.5 rounded-full text-[10px] font-semibold border ${def.chipCls}`}>{def.label}</span>
+              {/* Details */}
+              <div className="flex-1 min-w-0">
+                <span className="text-xs text-gray-700 font-medium">{def.sub || <span className="italic text-gray-400">no subtitle</span>}</span>
+                <span className="ml-2 text-[10px] text-gray-400 tabular-nums">{def.from} → {def.to || 'ongoing'}</span>
+                {def.to && <span className="ml-2 text-[10px] text-gray-300">{Math.round((new Date(def.to).getTime() - new Date(def.from).getTime()) / 86400000)}d</span>}
+              </div>
+              {/* Actions */}
+              <button onClick={() => editingIdx === idx ? cancelEdit() : startEdit(idx)} className="shrink-0 text-xs text-indigo-600 hover:text-indigo-800 font-medium">
+                {editingIdx === idx ? 'Cancel' : 'Edit'}
+              </button>
+              <button onClick={() => deletePhase(idx)} className="shrink-0 text-xs text-rose-500 hover:text-rose-700 font-medium">Delete</button>
+            </div>
+            {editingIdx === idx && (
+              <div className="mt-1.5 ml-6">
+                <PhaseForm draft={editDraft} onChange={setEditDraft} onSave={saveEdit} onCancel={cancelEdit} error={error} />
+              </div>
+            )}
+          </div>
+        ))}
+
+        {defs.length === 0 && (
+          <p className="text-sm text-gray-400 italic text-center py-4">No phases defined. Add one or reset to defaults.</p>
+        )}
+
+        {addingNew && (
+          <div className="mt-2">
+            <p className="text-xs font-semibold text-gray-600 mb-1.5">New Phase</p>
+            <PhaseForm draft={newDraft} onChange={setNewDraft} onSave={saveNew} onCancel={() => { setAddingNew(false); setError(null) }} error={error} />
+          </div>
+        )}
+      </div>
+    </section>
   )
 }
 
@@ -883,6 +1099,9 @@ export default function SettingsPage() {
           </div>
         </section>
       )}
+
+      {/* Phase Template */}
+      <PhaseTemplateSection />
 
     </div>
   )

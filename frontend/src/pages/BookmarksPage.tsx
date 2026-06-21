@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
-import { useLocation, useSearchParams } from 'react-router-dom'
+import { Link, useLocation, useSearchParams } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '../api/client'
 import { getUserStyle } from '../utils/colors'
@@ -389,9 +389,20 @@ function BookmarkCard({
         <div className="flex items-start justify-between gap-2 mb-2">
           <div className="flex flex-col gap-0.5">
             <div className="flex items-center flex-wrap gap-1.5">
-              <span className="ubadge" style={getUserStyle(bookmark.username || '')}>
-                {bookmark.username}
-              </span>
+              {bookmark.source === 'discord' ? (
+                <Link
+                  to={`/discord/users/${encodeURIComponent(bookmark.username || '')}`}
+                  className="ubadge hover:underline"
+                  style={getUserStyle(bookmark.username || '')}
+                  onClick={e => e.stopPropagation()}
+                >
+                  {bookmark.username}
+                </Link>
+              ) : (
+                <span className="ubadge" style={getUserStyle(bookmark.username || '')}>
+                  {bookmark.username}
+                </span>
+              )}
               {isTruthy(bookmark.is_suno_team) && (
                 <span
                   className="text-xs px-2 py-0.5 font-medium"
@@ -666,9 +677,20 @@ function BookmarkCard({
                   : 'bg-slate-50'
               }`}
             >
-              <span className="shrink-0 font-semibold" style={getUserStyle(m.username || '')}>
-                {m.username}
-              </span>
+              {bookmark.source === 'discord' ? (
+                <Link
+                  to={`/discord/users/${encodeURIComponent(m.username || '')}`}
+                  className="shrink-0 font-semibold hover:underline"
+                  style={getUserStyle(m.username || '')}
+                  onClick={e => e.stopPropagation()}
+                >
+                  {m.username}
+                </Link>
+              ) : (
+                <span className="shrink-0 font-semibold" style={getUserStyle(m.username || '')}>
+                  {m.username}
+                </span>
+              )}
               <span className="text-gray-400 shrink-0 whitespace-nowrap">{m.date?.slice(0, 19).replace('T', ' ')}</span>
               <span className="text-gray-700 flex-1 break-words">{m.content}</span>
             </div>

@@ -3,10 +3,22 @@ import logging
 import os
 import random
 import re
+import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import List, Optional
 
+# Load .env BEFORE any os.environ.get() reads below — module-level constants
+# like _HF_ENDPOINT_URL are evaluated at import time, so dotenv has to win
+# the race.  `.env` is .gitignored; keep secrets there, not in source.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent / ".env")
+except ImportError:
+    pass  # dotenv missing → fall back to whatever's in the shell env
+
 import numpy as np
+import requests
 
 # Global seed for reproducibility across numpy, Python random, and (where
 # supported) any library that respects np.random state.
@@ -23,6 +35,57 @@ logger = logging.getLogger(__name__)
 embedding_model = None
 emotion_classifier = None
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+
+# Cap concurrent inferences at the CPU count so 8 backend chunks don't oversubscribe
+# the CPU and induce swap/contention spikes (which were observed as backend-side
+# "client timeout (no response in 300s)" retries).  Excess requests AWAIT inside
+# asyncio for ~one-inference-duration instead of being fast-rejected (no 503s,
+# no retry storms).  Override with env AI_INFERENCE_CONCURRENCY when needed.
+_AI_INFERENCE_CONCURRENCY = max(
+    1, int(os.environ.get("AI_INFERENCE_CONCURRENCY", os.cpu_count() or 4))
+)
+# Created in lifespan so it binds to the FastAPI event loop, not module import time.
+_inference_sem: "Optional[asyncio.Semaphore]" = None
+
+# When set, /analyze_emotion forwards inference to this HF Dedicated Endpoint
+# (using the per-request X-HF-Token as the Bearer auth) instead of the local
+# ONNX model.  GPU-backed endpoints are ~10-30x faster than local CPU.
+# Cold-start (15-min idle scale-to-zero) takes ~30-60s; first call after idle
+# may return 503/504 — handled by backend's ai_retry.
+_HF_ENDPOINT_URL = os.environ.get("HF_ENDPOINT_URL", "").strip() or None
+# Optional token for the startup pre-warm ping (no request exists yet at that
+# point, so we can't borrow X-HF-Token).  Falls back to HUGGINGFACE_HUB_TOKEN
+# which most HF-aware setups already have.  Inference at runtime still uses
+# the per-request X-HF-Token, not this.
+_HF_ENDPOINT_WARMUP_TOKEN = (
+    os.environ.get("HF_ENDPOINT_TOKEN", "").strip()
+    or os.environ.get("HUGGINGFACE_HUB_TOKEN", "").strip()
+    or None
+)
+if _HF_ENDPOINT_URL:
+    logger.info("HF_ENDPOINT_URL set — emotion inference will use remote endpoint.")
+
+# Shared HTTPS session for HF calls.  Without an explicit adapter, urllib3
+# caps `pool_maxsize` at 10, so 32 parallel inference threads serialize on
+# 10 connection slots AND every call pays a full TLS handshake.  Pool of
+# 64 + connection reuse drops per-call overhead from ~1s to ~100ms.
+_hf_session: "Optional[requests.Session]" = None
+
+def _get_hf_session() -> "requests.Session":
+    global _hf_session
+    if _hf_session is None:
+        s = requests.Session()
+        # Pool sized for the peak: backend AI_CONCURRENCY=8 concurrent chunks
+        # × max_workers=32 threads per chunk = up to 256 in-flight HTTPS calls
+        # to the same host.  Smaller pool causes urllib3 "Connection pool is
+        # full" warnings + per-overflow TLS handshakes (wasted ~100-300ms each).
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=64, pool_maxsize=256, pool_block=False,
+        )
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        _hf_session = s
+    return _hf_session
 
 # Suno/Discord-specific noise words added on top of sklearn's English stopwords
 DOMAIN_STOPWORDS = [
@@ -46,6 +109,21 @@ NEGATIVE_EMOTIONS = frozenset({
     "disgust", "embarrassment", "fear", "grief",
     "nervousness", "remorse", "sadness",
 })
+
+_EMOTION_MODEL_ID = "SamLowe/roberta-base-go_emotions"
+# Store ONNX artefacts inside the HuggingFace cache volume so they survive
+# container restarts (the volume is mounted at /root/.cache/huggingface in Docker).
+_HF_CACHE_ROOT = Path(os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface")))
+_EMOTION_ONNX_DIR = _HF_CACHE_ROOT / "go_emotions_onnx"
+_EMOTION_QUANT_DIR = _HF_CACHE_ROOT / "go_emotions_onnx_int8"
+
+# Each concurrent inference runs in its own asyncio.to_thread worker.
+# OMP_NUM_THREADS=1 ensures every ONNX/PyTorch session uses exactly one OS
+# thread so N parallel requests use N threads instead of N×cores threads,
+# preventing CPU over-subscription.  The backend's AI_CONCURRENCY=8 semaphore
+# is the single throttle; no additional semaphore is needed here.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 # Compiled patterns for document cleaning
 _URL_RE = re.compile(r'https?://\S+|www\.\S+')
@@ -79,6 +157,15 @@ def is_meaningful(text: str, min_words: int = 5) -> bool:
     return len(alpha_words) >= 3
 
 
+def _is_meaningful_cleaned(cleaned: str, min_words: int = 5) -> bool:
+    """Like is_meaningful but accepts pre-cleaned text, avoiding a redundant clean_doc call."""
+    words = cleaned.split()
+    if len(words) < min_words:
+        return False
+    alpha_words = [w for w in words if re.fullmatch(r'[a-zA-Z]{3,}', w)]
+    return len(alpha_words) >= 3
+
+
 def emotion_to_sentiment(label: str) -> str:
     if label in POSITIVE_EMOTIONS:
         return "positive"
@@ -87,31 +174,196 @@ def emotion_to_sentiment(label: str) -> str:
     return "neutral"
 
 
+def _load_emotion_pipeline():
+    """
+    Load the GoEmotions classifier with a 3-tier fallback:
+      1. ONNX INT8 quantized  — fastest (~3-5x vs PyTorch CPU)
+      2. ONNX FP32            — still faster than PyTorch (~1.5-2x)
+      3. PyTorch CPU          — original behaviour, always available
+    The ONNX export and INT8 quantization run once and are cached to disk.
+    """
+    from transformers import pipeline as hf_pipeline
+
+    def _pytorch_fallback():
+        import torch
+        torch.manual_seed(_SEED)
+        torch.set_num_threads(1)  # 1 thread per session so N parallel sessions use N threads
+        pipe = hf_pipeline(
+            "text-classification",
+            model=_EMOTION_MODEL_ID,
+            top_k=None,
+            device=-1,
+            truncation=True,
+            max_length=128,
+        )
+        logger.info("Emotion model ready (PyTorch CPU).")
+        return pipe
+
+    # Try to import optimum; skip ONNX tiers if not installed.
+    try:
+        from optimum.onnxruntime import ORTModelForSequenceClassification, ORTQuantizer
+        from optimum.onnxruntime.configuration import AutoQuantizationConfig
+        from transformers import AutoTokenizer
+    except ImportError:
+        logger.info("optimum not installed; using PyTorch CPU for emotion model.")
+        return _pytorch_fallback()
+
+    tokenizer = AutoTokenizer.from_pretrained(_EMOTION_MODEL_ID)
+
+    def _make_pipeline(model):
+        return hf_pipeline(
+            "text-classification",
+            model=model,
+            tokenizer=tokenizer,
+            top_k=None,
+            truncation=True,
+            max_length=128,
+        )
+
+    # --- Tier 1: INT8 quantized ONNX ---
+    quant_files = sorted(_EMOTION_QUANT_DIR.glob("*.onnx")) if _EMOTION_QUANT_DIR.exists() else []
+    if quant_files:
+        try:
+            model = ORTModelForSequenceClassification.from_pretrained(
+                str(_EMOTION_QUANT_DIR), file_name=quant_files[0].name
+            )
+            logger.info("Emotion model ready (ONNX INT8, cached).")
+            return _make_pipeline(model)
+        except Exception as exc:
+            logger.warning("Cached INT8 model load failed (%s); rebuilding...", exc)
+
+    # Build: export to ONNX then quantize to INT8
+    try:
+        onnx_model_file = _EMOTION_ONNX_DIR / "model.onnx"
+        if not onnx_model_file.exists():
+            logger.info("Exporting emotion model to ONNX (one-time setup, ~1 min)...")
+            _EMOTION_ONNX_DIR.mkdir(parents=True, exist_ok=True)
+            ort_model = ORTModelForSequenceClassification.from_pretrained(
+                _EMOTION_MODEL_ID, export=True
+            )
+            ort_model.save_pretrained(str(_EMOTION_ONNX_DIR))
+
+        logger.info("Quantizing ONNX model to INT8...")
+        _EMOTION_QUANT_DIR.mkdir(parents=True, exist_ok=True)
+        quantizer = ORTQuantizer.from_pretrained(str(_EMOTION_ONNX_DIR))
+        qconfig = AutoQuantizationConfig.avx2(is_static=False, per_channel=False)
+        quantizer.quantize(save_dir=str(_EMOTION_QUANT_DIR), quantization_config=qconfig)
+
+        quant_files = sorted(_EMOTION_QUANT_DIR.glob("*.onnx"))
+        if quant_files:
+            model = ORTModelForSequenceClassification.from_pretrained(
+                str(_EMOTION_QUANT_DIR), file_name=quant_files[0].name
+            )
+            logger.info("Emotion model ready (ONNX INT8).")
+            return _make_pipeline(model)
+    except Exception as exc:
+        logger.warning("ONNX INT8 setup failed (%s); trying plain ONNX...", exc)
+
+    # --- Tier 2: plain ONNX FP32 ---
+    try:
+        onnx_model_file = _EMOTION_ONNX_DIR / "model.onnx"
+        if not onnx_model_file.exists():
+            logger.info("Exporting emotion model to ONNX...")
+            _EMOTION_ONNX_DIR.mkdir(parents=True, exist_ok=True)
+            ort_model = ORTModelForSequenceClassification.from_pretrained(
+                _EMOTION_MODEL_ID, export=True
+            )
+            ort_model.save_pretrained(str(_EMOTION_ONNX_DIR))
+
+        model = ORTModelForSequenceClassification.from_pretrained(str(_EMOTION_ONNX_DIR))
+        logger.info("Emotion model ready (ONNX FP32).")
+        return _make_pipeline(model)
+    except Exception as exc:
+        logger.warning("Plain ONNX setup failed (%s); falling back to PyTorch CPU...", exc)
+
+    # --- Tier 3: original PyTorch CPU ---
+    return _pytorch_fallback()
+
+
+async def _prewarm_hf_endpoint():
+    """Wake the HF Dedicated Endpoint at startup so the first user request
+    doesn't pay the 30-60s scale-to-zero cold-start.  Runs as a background
+    task — never blocks app startup.  Logs success/failure but never raises."""
+    if not _HF_ENDPOINT_URL:
+        return
+    if not _HF_ENDPOINT_WARMUP_TOKEN:
+        logger.warning(
+            "HF_ENDPOINT_URL is set but no warmup token in env "
+            "(HF_ENDPOINT_TOKEN or HUGGINGFACE_HUB_TOKEN).  Pre-warm skipped — "
+            "the first user request will pay the cold-start cost (~30-60s)."
+        )
+        return
+    logger.info("Pre-warming HF endpoint in background (may take 30-60s if cold)…")
+    t0 = time.perf_counter()
+    try:
+        sess = _get_hf_session()
+        resp = await asyncio.to_thread(
+            sess.post,
+            _HF_ENDPOINT_URL,
+            headers={
+                "Authorization": f"Bearer {_HF_ENDPOINT_WARMUP_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={"inputs": "warmup"},
+            timeout=180,
+        )
+        dt = time.perf_counter() - t0
+        if resp.status_code == 200:
+            logger.info("HF endpoint warm (%.1fs).", dt)
+        else:
+            logger.warning(
+                "HF pre-warm got HTTP %d in %.1fs: %s",
+                resp.status_code, dt, resp.text[:200],
+            )
+    except Exception as exc:
+        logger.warning("HF endpoint pre-warm failed (non-fatal): %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global embedding_model, emotion_classifier
+    global embedding_model, emotion_classifier, _inference_sem
+    _inference_sem = asyncio.Semaphore(_AI_INFERENCE_CONCURRENCY)
+    logger.info("Inference semaphore initialised with %d slot(s).", _AI_INFERENCE_CONCURRENCY)
     logger.info("Loading sentence-transformer model (all-MiniLM-L6-v2) as fallback…")
     from sentence_transformers import SentenceTransformer
     embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
     logger.info("Sentence-transformer ready.")
-    logger.info("Loading GoEmotions classifier (SamLowe/roberta-base-go_emotions)…")
-    try:
-        import torch
-        torch.manual_seed(_SEED)
-        # Cap PyTorch intra-op threads to avoid over-subscription on CPU
-        torch.set_num_threads(min(os.cpu_count() or 1, 4))
-        from transformers import pipeline as hf_pipeline
-        emotion_classifier = hf_pipeline(
-            "text-classification",
-            model="SamLowe/roberta-base-go_emotions",
-            top_k=None,
-            device=-1,
-            truncation=True,
-            max_length=128,   # Discord messages are short; 128 tokens is ample
-        )
-        logger.info("Emotion model ready.")
-    except Exception as exc:
-        logger.warning("Could not load emotion model: %s", exc)
+    if _HF_ENDPOINT_URL:
+        # HF mode: skip local emotion model entirely.  All /analyze_emotion
+        # traffic goes to the remote endpoint, so loading + JIT-warming a
+        # local fallback would be 30-90s of wasted CPU and ~125MB of dead RAM.
+        # If HF goes down, unset HF_ENDPOINT_URL and restart to use the
+        # local model instead — there's no automatic silent fallback.
+        logger.info("Skipping local emotion model load (HF_ENDPOINT_URL is set).")
+    else:
+        logger.info("Loading emotion classifier (ONNX INT8 preferred, PyTorch CPU fallback)…")
+        try:
+            emotion_classifier = _load_emotion_pipeline()
+        except Exception as exc:
+            logger.warning("Could not load emotion model: %s", exc)
+        # Warm up: run dummy inferences matching production shapes so ONNX RT
+        # JIT-compiles the graph kernels NOW, not on the first user request.
+        # Production calls use batch_size=128 with truncation max_length=128.
+        # We warm three shapes so concurrent first-chunks never serialize on a
+        # JIT event (this was the dominant cause of "retrying in 0.7s…"
+        # warnings right after startup):
+        #   - batch=128 → main path
+        #   - batch=64  → typical tail batch
+        #   - batch=1   → ad-hoc single-message calls (user_emotion endpoint)
+        if emotion_classifier is not None:
+            try:
+                logger.info("Warming up emotion model (JIT-compiling production batch shapes)…")
+                warm_text = "the model needs a realistic input to compile its graph properly"
+                for warm_batch in (128, 64, 1):
+                    emotion_classifier([warm_text] * warm_batch, batch_size=128)
+                logger.info("Emotion model warmed up for batch sizes 1/64/128.")
+            except Exception as exc:
+                logger.warning("Warm-up inference failed (non-fatal): %s", exc)
+    # Background pre-warm of the remote HF endpoint so the first user request
+    # doesn't wait the 30-60s cold-start.  Non-blocking: app accepts traffic
+    # immediately; warmup completes in parallel.
+    if _HF_ENDPOINT_URL:
+        asyncio.create_task(_prewarm_hf_endpoint())
     yield
 
 
@@ -278,7 +530,7 @@ async def run_bertopic(req: TopicsRequest):
     umap_model = UMAP(
         n_neighbors=min(15, n - 1),
         n_components=min(5, n - 2),
-        n_epochs=200,
+        n_epochs=25 if n > 5000 else (50 if n > 2000 else 100),
         min_dist=0.0,
         metric='cosine',
         random_state=_SEED,
@@ -483,17 +735,28 @@ async def analyze_emotion(
     req: EmotionRequest,
     x_hf_token: Optional[str] = Header(default=None, alias="x-hf-token"),
 ):
-    if emotion_classifier is None:
+    # Local-model gate is bypassed when an HF endpoint is configured:
+    # inference happens on HF's GPU and only requires the token to call it.
+    if _HF_ENDPOINT_URL is None and emotion_classifier is None:
         raise HTTPException(status_code=503, detail="Emotion model not loaded")
+    if _HF_ENDPOINT_URL is not None and not x_hf_token:
+        raise HTTPException(
+            status_code=401,
+            detail="HF endpoint is configured but X-HF-Token header is missing.",
+        )
 
-    # Make HF token available to huggingface_hub for any on-demand model ops
     if x_hf_token:
         os.environ["HUGGINGFACE_HUB_TOKEN"] = x_hf_token
 
-    total_input = len(req.messages)
-    meaningful = [m for m in req.messages if is_meaningful(m.content.strip())]
+    return await _do_analyze_emotion(req, hf_token=x_hf_token)
 
-    if not meaningful:
+
+async def _do_analyze_emotion(req: EmotionRequest, hf_token: Optional[str] = None):
+    total_input = len(req.messages)
+    pairs = [(m, clean_doc(m.content.strip())) for m in req.messages]
+    meaningful_pairs = [(m, t) for m, t in pairs if _is_meaningful_cleaned(t)]
+
+    if not meaningful_pairs:
         return {
             "per_message": [],
             "summary": {
@@ -505,16 +768,102 @@ async def analyze_emotion(
             "analyzed_messages": 0,
         }
 
-    texts = [clean_doc(m.content.strip()) for m in meaningful]
+    meaningful = [p[0] for p in meaningful_pairs]
+    texts = [p[1] for p in meaningful_pairs]
 
-    def _run_inference(batch):
-        return emotion_classifier(batch, batch_size=64)
+    # Match the backend's CHUNK_SIZE so each backend-shipped chunk maps to
+    # exactly one batch on the ORT side — no tail batch of mismatched shape.
+    _EMOTION_CHUNK = 128
 
+    def _run_chunk(chunk):
+        return emotion_classifier(chunk, batch_size=128)
+
+    def _run_chunk_hf(chunk):
+        # The HF Dedicated Endpoint we're hitting does NOT batch correctly:
+        # sending `inputs: [a, b, c]` returns one prediction (treating the
+        # JSON array as a single string or taking only the last item) and
+        # large batches trigger 422 schema-validation rejections.  Working
+        # around it by sending one HTTP request per input concurrently
+        # via a thread pool.  Each single-input response is a flat list
+        # of 28 label/score dicts (verified via curl); we assemble them
+        # into the list-of-lists shape the downstream code expects:
+        #     [[{label,score} × 28], [{label,score} × 28], ...]
+        from concurrent.futures import ThreadPoolExecutor
+
+        sess = _get_hf_session()
+        def _single(text):
+            resp = sess.post(
+                _HF_ENDPOINT_URL,
+                headers={
+                    "Authorization": f"Bearer {hf_token}",
+                    "Content-Type": "application/json",
+                },
+                json={"inputs": text, "parameters": {"top_k": None}},
+                timeout=180,
+            )
+            if not resp.ok:
+                body = (resp.text or "")[:300]
+                raise requests.HTTPError(
+                    f"HF returned {resp.status_code}: {body}", response=resp
+                )
+            body = resp.json()
+            # Defensive normalisation: HF may return either
+            #   A. [{label,score}, ...]      (flat, what we expect for single input)
+            #   B. [[{label,score}, ...]]    (nested singleton — unwrap)
+            if body and isinstance(body, list) and isinstance(body[0], list):
+                return body[0]
+            return body
+
+        t0 = time.perf_counter()
+        # 32 parallel HTTPS calls.  T4 endpoint serves them concurrently;
+        # network RTT (~50-100ms) dominates per-call latency, not GPU time.
+        # 128 msgs / 32 workers × ~80ms RTT ≈ 320ms per chunk.
+        with ThreadPoolExecutor(max_workers=32) as executor:
+            results = list(executor.map(_single, chunk))
+        dt = time.perf_counter() - t0
+
+        # >30s suggests an actual cold-start wake (HF scale-from-zero is
+        # 30-60s).  Sub-30s chunks are just normal HF autoscaling latency or
+        # queue depth as parallel requests stack up, not a problem worth
+        # warning about — was previously flagging 8s chunks which are fine.
+        if dt > 30.0:
+            logger.warning("HF chunk: %d msgs in %.2fs (likely cold-start wake)",
+                           len(chunk), dt)
+        else:
+            logger.info("HF chunk: %d msgs in %.2fs (%.0f msg/s)",
+                        len(chunk), dt, len(chunk) / dt if dt > 0 else 0.0)
+        return results
+
+    async def _run_chunk_gated(chunk):
+        if _HF_ENDPOINT_URL is not None:
+            # No local semaphore: inference happens on HF's GPU; this process
+            # is just I/O-forwarding.  Concurrency is bounded by backend's
+            # AI_CONCURRENCY=8, and HF's autoscaling handles its end.
+            return await asyncio.to_thread(_run_chunk_hf, chunk)
+        # Local path — semaphore caps inferences at cpu_count to avoid
+        # oversubscription.
+        assert _inference_sem is not None, "Semaphore not initialised"
+        async with _inference_sem:
+            return await asyncio.to_thread(_run_chunk, chunk)
+
+    t0 = time.perf_counter()
     try:
-        raw_results = await asyncio.to_thread(_run_inference, texts)
+        chunks = [texts[i:i + _EMOTION_CHUNK] for i in range(0, len(texts), _EMOTION_CHUNK)]
+        chunk_results = await asyncio.gather(*[_run_chunk_gated(c) for c in chunks])
+        raw_results = [item for sublist in chunk_results for item in sublist]
     except Exception as exc:
         logger.exception("Emotion inference failed")
         raise HTTPException(status_code=500, detail=str(exc))
+    dt = time.perf_counter() - t0
+    # Per-request timing.  Local mode: >30s means CPU contention.  HF mode:
+    # >30s usually means the endpoint was cold-starting (~30-60s wake).
+    mode = "HF" if _HF_ENDPOINT_URL else "local"
+    level = logging.WARNING if dt > 30.0 else logging.INFO
+    logger.log(level,
+        "analyze_emotion [%s]: %d msgs (%d meaningful) in %.2fs (%.1f msg/s)",
+        mode, total_input, len(meaningful), dt,
+        (len(meaningful) / dt) if dt > 0 else 0.0,
+    )
 
     per_message = []
     emotion_totals: dict = {}

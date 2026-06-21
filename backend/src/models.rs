@@ -115,18 +115,6 @@ pub struct UserTopicsRequest {
     pub msg_uuids: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct EmotionMessageItem {
-    pub content: String,
-    pub date: String,
-    pub msg_uuid: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct UserEmotionRequest {
-    pub messages: Vec<EmotionMessageItem>,
-}
-
 #[derive(Debug, Deserialize)]
 pub struct StrategyDef {
     pub id: String,

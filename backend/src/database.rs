@@ -3,8 +3,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub async fn create_pool(url: &str) -> Result<PgPool, sqlx::Error> {
+    // 5-minute statement_timeout on every connection — if a query (e.g. a
+    // pathological COUNT scan) runs longer than this, Postgres kills it
+    // server-side instead of letting it linger after the HTTP client
+    // disconnected.  Prevents the zombie-query/lock cascade where stale
+    // SELECTs block subsequent ALTER TABLEs in init_db.
+    use sqlx::Executor;
     PgPoolOptions::new()
         .max_connections(10)
+        .after_connect(|conn, _meta| Box::pin(async move {
+            conn.execute("SET statement_timeout = '300s'").await?;
+            Ok(())
+        }))
         .connect(url)
         .await
 }
@@ -511,6 +521,44 @@ pub async fn init_db(pool: &PgPool) -> Result<(), sqlx::Error> {
         "ALTER TABLE github_issues ADD COLUMN IF NOT EXISTS comments_fetched BOOLEAN NOT NULL DEFAULT false",
         "ALTER TABLE github_discussions ADD COLUMN IF NOT EXISTS comments_fetched BOOLEAN NOT NULL DEFAULT false",
         "ALTER TABLE github_pulls ADD COLUMN IF NOT EXISTS comments_fetched BOOLEAN NOT NULL DEFAULT false",
+    ] {
+        let _ = sqlx::query(stmt).execute(pool).await;
+    }
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS persona_classifications (
+            id BIGSERIAL PRIMARY KEY,
+            username TEXT NOT NULL,
+            phase TEXT NOT NULL,
+            phase_label TEXT NOT NULL,
+            method TEXT NOT NULL,
+            persona TEXT NOT NULL,
+            confidence REAL DEFAULT 0.5,
+            reasoning TEXT DEFAULT '',
+            features JSONB DEFAULT '{}',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE(username, phase, method)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS message_emotions (
+            msg_uuid TEXT PRIMARY KEY,
+            dominant_emotion TEXT NOT NULL DEFAULT '',
+            sentiment TEXT NOT NULL DEFAULT 'neutral',
+            top_emotions JSONB NOT NULL DEFAULT '[]',
+            analyzed_at TEXT DEFAULT to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    for stmt in &[
+        "CREATE INDEX IF NOT EXISTS idx_persona_username ON persona_classifications(username)",
+        "CREATE INDEX IF NOT EXISTS idx_persona_phase ON persona_classifications(phase)",
     ] {
         let _ = sqlx::query(stmt).execute(pool).await;
     }

@@ -2,7 +2,16 @@
 # Overrides:
 #   - backend: compile Rust inside Docker (CI/CD uses a pre-built binary)
 #   - nginx: HTTP-only on port 80, no SSL certs required
+#   - postgres/qdrant: ports exposed so native (non-Docker) processes can connect
 services:
+  postgres:
+    ports:
+      - "5432:5432"
+
+  qdrant:
+    ports:
+      - "6333:6333"
+
   backend:
     build:
       context: .
@@ -10,6 +19,13 @@ services:
     image: retrieval-backend:local
     ports:
       - "8000:8000"
+
+  ai_service:
+    environment:
+      # When set, /analyze_emotion forwards inference to this HF Dedicated
+      # Endpoint (using the per-request X-HF-Token as the Bearer auth) instead
+      # of running the local ONNX model.  Unset = use local model.
+      HF_ENDPOINT_URL: "https://yk8g5z6jkf0tuyjs.us-east-1.aws.endpoints.huggingface.cloud"
 
   nginx:
     ports:
