@@ -109,7 +109,9 @@ jobs:
       - name: Configure SSH
         env:
           SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
-          KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+          # VPS host key, pinned so a spoofed server is rejected. Override with the
+          # VPS_KNOWN_HOSTS secret if the server is rebuilt (ssh-keyscan -t ed25519 <host>).
+          KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS || '129.226.210.164 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPnCd+niDr944LGs6P5/jx1avIvLIdufhXn5TiQbG8Lr' }}
         run: |
           install -m 700 -d ~/.ssh
           printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key

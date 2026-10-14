@@ -35,8 +35,8 @@ Repository secrets used by the `deploy` job (environment `production`):
 | --- | --- |
 | `VPS_HOST` | `129.226.210.164` |
 | `VPS_USER` | `ubuntu` |
-| `VPS_SSH_KEY` | private key of `~/.ssh/ci_deploy` on the VPS |
-| `VPS_KNOWN_HOSTS` | output of `ssh-keyscan -t ed25519 129.226.210.164` |
+| `VPS_SSH_KEY` | private key of `~/.ssh/ci_deploy` on the VPS (any key in `~/.ssh/authorized_keys` works) |
+| `VPS_KNOWN_HOSTS` | optional — the VPS host key is pinned in the workflow; set this only if the server is rebuilt |
 
 ## Server configuration
 
