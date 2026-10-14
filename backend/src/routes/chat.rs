@@ -153,46 +153,172 @@ fn to_qdrant_id(id: &str) -> String {
     }
 }
 
+fn vector_f64_from_point(point: &serde_json::Value) -> Option<Vec<f64>> {
+    let vector = &point["vector"];
+    if let Some(arr) = vector.as_array() {
+        let vec: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
+        return if vec.is_empty() { None } else { Some(vec) };
+    }
+    if let Some(obj) = vector.as_object() {
+        for value in obj.values() {
+            if let Some(arr) = value.as_array() {
+                let vec: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
+                if !vec.is_empty() {
+                    return Some(vec);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn vector_f32_from_point(point: &serde_json::Value) -> Option<Vec<f32>> {
+    vector_f64_from_point(point).map(|vec| vec.into_iter().map(|v| v as f32).collect())
+}
+
 /// Fetch embeddings from Qdrant for the given msg_uuids.
 /// Converts IDs to Qdrant UUID form for the lookup, then reads original msg_uuid
 /// back from the point payload so the returned keys match the database values.
+/// Falls back to a reverse-ID map if payload.msg_uuid is absent (e.g. migrated data).
 async fn fetch_embeddings_qdrant(
     qdrant_url: &str,
     collection: &str,
     api_key: Option<&str>,
     uuids: &[String],
 ) -> Option<Vec<(String, Vec<f32>)>> {
+    if uuids.is_empty() {
+        return Some(Vec::new());
+    }
+
     let client = reqwest::Client::new();
-    // /points/get is the correct endpoint for fetching points by ID
-    let url = format!("{}/collections/{}/points/get", qdrant_url, collection);
-    let qdrant_ids: Vec<String> = uuids.iter().map(|id| to_qdrant_id(id)).collect();
-    let mut req = client.post(&url).json(&serde_json::json!({
-        "ids": qdrant_ids,
-        "with_vectors": true,
-        "with_payload": true,  // needed to read back original msg_uuid
-    }));
-    if let Some(key) = api_key { req = req.header("api-key", key); }
-    let resp = req.send().await.ok()?;
-    if !resp.status().is_success() { return None; }
-    let body: serde_json::Value = resp.json().await.ok()?;
-    let points = body["result"].as_array()?;
-    let result: Vec<(String, Vec<f32>)> = points
-        .iter()
-        .filter_map(|p| {
-            // Use payload.msg_uuid (original ID) as the map key so callers can
-            // look up by the same msg_uuid values they have from the database
-            let id = p["payload"]["msg_uuid"].as_str()
-                .or_else(|| p["id"].as_str())
-                .map(String::from)?;
-            let vec: Vec<f32> = p["vector"]
-                .as_array()?
-                .iter()
-                .filter_map(|v| v.as_f64().map(|x| x as f32))
-                .collect();
-            if vec.is_empty() { None } else { Some((id, vec)) }
-        })
+    // Qdrant's batch point-retrieval endpoint is POST /collections/{c}/points
+    // (PUT to the same path is the upsert op) — /points/get 404s on Qdrant 1.x.
+    let url = format!("{}/collections/{}/points", qdrant_url, collection);
+
+    // Fetch chunks concurrently — sequential awaits here turned a 7k-message
+    // summarize/analyze into dozens of serial round-trips. Only request the
+    // msg_uuid payload field (not the full "document" text) to cut response size.
+    let fetches = uuids.chunks(256).map(|chunk| {
+        let client = client.clone();
+        let url = url.clone();
+        let api_key = api_key.map(String::from);
+        let qdrant_ids: Vec<String> = chunk.iter().map(|id| to_qdrant_id(id)).collect();
+        // Reverse map: qdrant_id → original msg_uuid, so we can recover the key
+        // even when payload.msg_uuid is missing (e.g. Chroma-migrated points).
+        let qdrant_to_orig: std::collections::HashMap<String, String> = chunk.iter()
+            .zip(qdrant_ids.iter())
+            .map(|(orig, qid)| (qid.clone(), orig.clone()))
+            .collect();
+
+        async move {
+            let mut req = client.post(&url).json(&serde_json::json!({
+                "ids": qdrant_ids,
+                "with_vectors": true,
+                "with_payload": ["msg_uuid"],
+            }));
+            if let Some(key) = &api_key { req = req.header("api-key", key); }
+            let resp = match req.send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    tracing::warn!("Qdrant points request failed for summary embeddings: {}", e);
+                    return Vec::new();
+                }
+            };
+            if !resp.status().is_success() {
+                let status = resp.status();
+                if status.as_u16() == 404 {
+                    // 404 = collection doesn't exist yet (no data embedded); not an error.
+                    tracing::debug!("Qdrant collection not found for summary embeddings (404)");
+                } else {
+                    let body = resp.text().await.unwrap_or_default();
+                    tracing::warn!(
+                        "Qdrant points HTTP {} for summary embeddings: {}",
+                        status,
+                        &body[..body.len().min(300)]
+                    );
+                }
+                return Vec::new();
+            }
+            let body: serde_json::Value = match resp.json().await {
+                Ok(body) => body,
+                Err(e) => {
+                    tracing::warn!("Qdrant points response parse failed: {}", e);
+                    return Vec::new();
+                }
+            };
+            let Some(points) = body["result"].as_array() else { return Vec::new() };
+            points.iter().filter_map(|p| {
+                // Prefer payload.msg_uuid (original ID written by upsert_qdrant_batch).
+                // Fall back to reversing the qdrant_id → original mapping for migrated data
+                // that lacks the msg_uuid payload field.
+                let id = p["payload"]["msg_uuid"].as_str()
+                    .map(String::from)
+                    .or_else(|| {
+                        p["id"].as_str()
+                            .and_then(|qid| qdrant_to_orig.get(qid))
+                            .cloned()
+                    })?;
+                vector_f32_from_point(p).map(|vec| (id, vec))
+            }).collect::<Vec<_>>()
+        }
+    });
+
+    let result: Vec<(String, Vec<f32>)> = futures::future::join_all(fetches).await
+        .into_iter()
+        .flatten()
         .collect();
-    Some(result)
+
+    if result.is_empty() { None } else { Some(result) }
+}
+
+/// Compute text embeddings on-demand via OpenAI's embedding API.
+/// Returns a Vec aligned to `texts`: Some(vec) on success, None on failure.
+/// Uses `text-embedding-3-small` (1536 dims) in batches of 100.
+async fn embed_texts_openai(api_key: &str, texts: &[String]) -> Vec<Option<Vec<f32>>> {
+    if texts.is_empty() { return Vec::new(); }
+
+    let client = reqwest::Client::new();
+    let mut result: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+
+    for (chunk_start, chunk) in texts.chunks(100).enumerate() {
+        let resp = match client
+            .post("https://api.openai.com/v1/embeddings")
+            .bearer_auth(api_key)
+            .json(&json!({ "input": chunk, "model": "text-embedding-3-small" }))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => { tracing::warn!("On-demand embedding request failed: {}", e); continue; }
+        };
+
+        if !resp.status().is_success() {
+            tracing::warn!("On-demand embedding HTTP {}", resp.status());
+            continue;
+        }
+
+        let data: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => { tracing::warn!("On-demand embedding parse failed: {}", e); continue; }
+        };
+
+        if let Some(arr) = data["data"].as_array() {
+            for item in arr {
+                let local_idx = item["index"].as_u64().unwrap_or(0) as usize;
+                let global_idx = chunk_start * 100 + local_idx;
+                if global_idx < result.len() {
+                    if let Some(emb_arr) = item["embedding"].as_array() {
+                        let vec: Vec<f32> = emb_arr.iter()
+                            .filter_map(|v| v.as_f64().map(|f| f as f32))
+                            .collect();
+                        if !vec.is_empty() { result[global_idx] = Some(vec); }
+                    }
+                }
+            }
+        }
+    }
+
+    result
 }
 
 async fn retrieve_keyword_messages(
@@ -414,39 +540,77 @@ pub async fn summarize_results(
             let n = deduped.len();
             let min_cs = 3usize.min(n / 4).max(2);
 
-            // Try to fetch embeddings from ChromaDB
+            // ── 3a. Try Qdrant embeddings ──────────────────────────────────
             let uuids: Vec<String> = deduped.iter()
                 .filter_map(|m| m.msg_uuid.clone())
                 .collect();
-            let has_uuids = !uuids.is_empty();
 
-            if has_uuids {
+            let qdrant_map: std::collections::HashMap<String, Vec<f32>> = if !uuids.is_empty() {
                 yield Ok(log_event("retrieval", "Retrieval",
                     &format!("Fetching embeddings for {} messages from Qdrant…", uuids.len())));
-            }
-
-            let embedding_map: std::collections::HashMap<String, Vec<f32>> = if has_uuids {
                 match fetch_embeddings_qdrant(
                     &qdrant_url, &qdrant_collection, qdrant_api_key.as_deref(), &uuids,
                 ).await {
                     Some(pairs) => pairs.into_iter().collect(),
-                    None => {
-                        yield Ok(log_event("fallback", "Warning",
-                            "Could not fetch embeddings from Qdrant — falling back to word-count sampling"));
-                        std::collections::HashMap::new()
-                    }
+                    None => std::collections::HashMap::new(),
                 }
             } else {
-                yield Ok(log_event("fallback", "Warning",
-                    "No UUIDs in messages — falling back to word-count sampling"));
                 std::collections::HashMap::new()
             };
 
-            // Build embedding matrix aligned to deduped
-            let embeddings: Vec<Option<Vec<f32>>> = deduped.iter()
-                .map(|m| m.msg_uuid.as_deref().and_then(|u| embedding_map.get(u)).cloned())
+            // Build embedding vector aligned to deduped positions
+            let mut embeddings: Vec<Option<Vec<f32>>> = deduped.iter()
+                .map(|m| m.msg_uuid.as_deref().and_then(|u| qdrant_map.get(u)).cloned())
                 .collect();
 
+            let qdrant_count = embeddings.iter().filter(|e| e.is_some()).count();
+
+            // ── 3b. On-demand embedding fallback ───────────────────────────
+            // If Qdrant returned fewer than min_cs*2 embeddings (e.g. messages were
+            // not pre-embedded, or Qdrant was down during upload), compute embeddings
+            // on-demand via the OpenAI API so clustering still works.
+            if qdrant_count < min_cs * 2 {
+                let reason = if qdrant_count == 0 {
+                    format!("no Qdrant embeddings found for {} messages", n)
+                } else {
+                    format!("only {}/{} Qdrant embeddings — not enough for clustering", qdrant_count, n)
+                };
+                yield Ok(log_event("retrieval", "Retrieval",
+                    &format!("{} — computing embeddings on-demand via OpenAI…", reason)));
+
+                // Cap to avoid very long embedding calls; HDBSCAN on >500 is slow too.
+                // For large corpora use reservoir sampling so the embedded subset is
+                // spread across the whole timeline rather than just the most recent messages.
+                let cap = 500usize;
+                let (sample_indices, texts): (Vec<usize>, Vec<String>) = if n <= cap {
+                    let idx: Vec<usize> = (0..n).collect();
+                    let txts = deduped.iter().map(|m| m.content.clone()).collect();
+                    (idx, txts)
+                } else {
+                    // Evenly-strided sample across deduped so we cover the full date range
+                    let step = n / cap;
+                    let idx: Vec<usize> = (0..cap).map(|k| k * step).collect();
+                    let txts = idx.iter().map(|&i| deduped[i].content.clone()).collect();
+                    (idx, txts)
+                };
+                let on_demand = embed_texts_openai(&api_key, &texts).await;
+                let od_count = on_demand.iter().filter(|e| e.is_some()).count();
+                yield Ok(log_event("retrieval", "Retrieval",
+                    &format!("Computed {}/{} on-demand embeddings (sampled from {})",
+                        od_count, texts.len(), n)));
+
+                // Merge into the positions-aligned embeddings vector
+                for (emb, &orig_i) in on_demand.into_iter().zip(sample_indices.iter()) {
+                    if orig_i < embeddings.len() && embeddings[orig_i].is_none() {
+                        embeddings[orig_i] = emb;
+                    }
+                }
+            } else {
+                yield Ok(log_event("retrieval", "Retrieval",
+                    &format!("Using {} Qdrant embeddings for clustering", qdrant_count)));
+            }
+
+            // ── 3c. HDBSCAN clustering ─────────────────────────────────────
             let embedded_indices: Vec<usize> = embeddings.iter().enumerate()
                 .filter_map(|(i, e)| e.as_ref().map(|_| i))
                 .collect();
@@ -455,7 +619,6 @@ pub async fn summarize_results(
                 .collect();
 
             if embedded_vecs.len() >= min_cs * 2 {
-                // ── HDBSCAN ────────────────────────────────────────────────
                 yield Ok(log_event("cluster", "Cluster",
                     &format!("Running HDBSCAN on {} embedded messages (min_cluster_size={})",
                         embedded_vecs.len(), min_cs)));
@@ -487,7 +650,7 @@ pub async fn summarize_results(
                         }
                     }
                 }
-                // Also include noise points (1 per noise, capped)
+                // Also include noise points (capped at 5)
                 let noise_local: Vec<usize> = labels.iter().enumerate()
                     .filter(|(_, &l)| l < 0)
                     .map(|(i, _)| i)
@@ -501,12 +664,11 @@ pub async fn summarize_results(
                     &format!("Selected {} messages (closest + furthest from each cluster centroid)",
                         sampled_embedded_indices.len())));
 
-                // Map local embedded indices → indices in deduped
                 sampled_embedded_indices.iter()
                     .map(|&local_i| deduped[embedded_indices[local_i]].clone())
                     .collect()
             } else {
-                // Not enough embeddings — fall back to word-count top-N per time window
+                // Still not enough after on-demand — use word-count sampling as last resort
                 yield Ok(log_event("fallback", "Warning",
                     "Too few embeddings for HDBSCAN — using word-count sampling"));
                 let cap = 60usize;
@@ -730,12 +892,10 @@ pub async fn user_topics_stream(
         for data_opt in futures::future::join_all(fetch_futs).await.into_iter().flatten() {
             if let Some(points) = data_opt["result"]["points"].as_array() {
                 for point in points {
-                    if let (Some(uuid), Some(vector)) = (
+                    if let (Some(uuid), Some(vec)) = (
                         point["payload"]["msg_uuid"].as_str(),
-                        point["vector"].as_array(),
+                        vector_f64_from_point(point),
                     ) {
-                        let vec: Vec<f64> =
-                            vector.iter().filter_map(|v| v.as_f64()).collect();
                         uuid_to_vector.insert(uuid.to_string(), vec);
                     }
                 }
@@ -831,6 +991,18 @@ pub async fn user_topics_stream(
             "used_precomputed": used_precomputed
         }));
 
+        // Persist to DB so batch-get can load results on next page visit.
+        if let Some(ref username) = req.username {
+            let date_from  = req.date_from.as_deref().unwrap_or("");
+            let date_to    = req.date_to.as_deref().unwrap_or("");
+            let upload_ids = req.upload_ids.as_deref().unwrap_or("");
+            if let Err(e) = crate::routes::topics::upsert_topic_run(
+                &state.db, username, date_from, date_to, upload_ids, &result,
+            ).await {
+                tracing::warn!("Failed to persist topic run for {}: {}", username, e);
+            }
+        }
+
         // Stage 5: complete — carry the full result
         emit!(json!({
             "stage": "complete",
@@ -891,12 +1063,10 @@ pub async fn user_topics(
     for data_opt in futures::future::join_all(fetch_futs).await.into_iter().flatten() {
         if let Some(points) = data_opt["result"]["points"].as_array() {
             for point in points {
-                if let (Some(uuid), Some(vector)) = (
+                if let (Some(uuid), Some(vec)) = (
                     point["payload"]["msg_uuid"].as_str(),
-                    point["vector"].as_array(),
+                    vector_f64_from_point(point),
                 ) {
-                    let vec: Vec<f64> =
-                        vector.iter().filter_map(|v| v.as_f64()).collect();
                     uuid_to_vector.insert(uuid.to_string(), vec);
                 }
             }
@@ -936,6 +1106,17 @@ pub async fn user_topics(
         .json()
         .await
         .map_err(|e| AppError::Internal(format!("AI service response parse error: {}", e)))?;
+
+    if let Some(ref username) = req.username {
+        let date_from  = req.date_from.as_deref().unwrap_or("");
+        let date_to    = req.date_to.as_deref().unwrap_or("");
+        let upload_ids = req.upload_ids.as_deref().unwrap_or("");
+        if let Err(e) = crate::routes::topics::upsert_topic_run(
+            &state.db, username, date_from, date_to, upload_ids, &result,
+        ).await {
+            tracing::warn!("Failed to persist topic run for {}: {}", username, e);
+        }
+    }
 
     Ok(Json(result))
 }

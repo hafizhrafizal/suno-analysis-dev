@@ -3,7 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { apiFetch } from '../api/client'
 import { useAuthStore } from '../store/authStore'
-import { usePhaseStore, CHIP_PRESETS, DEFAULT_PHASE_DEFS } from '../store/phaseStore'
+import { usePhaseStore, CHIP_PRESETS } from '../store/phaseStore'
 import type { PhaseDef } from '../store/phaseStore'
 import type { Stats, EmbeddingModel, Upload, SunoTeamMember } from '../types'
 
@@ -486,7 +486,7 @@ export default function SettingsPage() {
   const { data: sunoTeam = [], refetch: refetchSuno } = useQuery<SunoTeamMember[]>({
     queryKey: ['suno-team'],
     queryFn: () => apiFetch('/suno-team'),
-    enabled: isAdmin,
+    enabled: isAdmin && appMode !== 'demo',
   })
 
   const handleUpload = async () => {
@@ -1033,8 +1033,8 @@ export default function SettingsPage() {
         </section>
       )}
 
-      {/* Suno Team management (multi-mode admins only) */}
-      {appMode === 'multi' && user?.is_admin === true && (
+      {/* Suno Team management */}
+      {isAdmin && appMode !== 'demo' && (
         <section className="bg-white rounded-2xl shadow p-5">
           <div className="flex items-center justify-between mb-1">
             <h2 className="font-semibold text-sm text-gray-700 uppercase tracking-wide">Suno Team Members</h2>

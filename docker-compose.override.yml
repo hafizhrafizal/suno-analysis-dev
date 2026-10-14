@@ -2,15 +2,12 @@
 # Overrides:
 #   - backend: compile Rust inside Docker (CI/CD uses a pre-built binary)
 #   - nginx: HTTP-only on port 80, no SSL certs required
-#   - postgres/qdrant: ports exposed so native (non-Docker) processes can connect
+#   - postgres: port exposed so native (non-Docker) processes can connect
+#   - qdrant: runs natively on Windows (not in Docker); backend reaches it via host.docker.internal:6333
 services:
   postgres:
     ports:
       - "5432:5432"
-
-  qdrant:
-    ports:
-      - "6333:6333"
 
   backend:
     build:

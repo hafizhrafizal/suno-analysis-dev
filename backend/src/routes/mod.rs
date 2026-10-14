@@ -5,10 +5,7 @@ pub mod chat;
 pub mod codes;
 pub mod config_api;
 pub mod context_route;
-pub mod github;
-pub mod interviews;
 pub mod labels;
-pub mod news;
 pub mod persona;
 pub mod search;
 pub mod stats;
@@ -67,17 +64,21 @@ pub fn all_routes(state: AppState) -> Router {
         .route("/topics/save", post(topics::save_topics))
         .route("/topics/user/:username", get(topics::get_topics_for_user))
         .route("/topics/batch-get", post(topics::batch_get_topics))
+        .route("/topics/label", post(topics::update_topic_label))   // manual override
+        .route("/topics/relabel", post(topics::relabel_topic))      // AI re-label
+        .route("/topics/user/:username/messages", get(topics::get_topic_messages_for_user))
         .route("/user-emotion", post(chat::user_emotion))
         .route("/search/sentiment-count", post(chat::sentiment_count))
         .route("/search/batch-sentiment", post(chat::user_batch_sentiment))
         .route("/search/batch-sentiment-stream", post(chat::batch_sentiment_stream))
         .route("/user-strategy-classify", post(chat::user_strategy_classify))
         .route("/user-engagement-narrative", post(chat::user_engagement_narrative))
-        // Persona classification
-        .route("/persona/classify", post(persona::classify))
+        // Persona / archetype classification (single-method primary + secondary)
+        .route("/persona/compute-batch", post(persona::compute_batch))
         .route("/persona/by-phase", get(persona::by_phase))
         .route("/persona/user/:username", get(persona::list_for_user))
         .route("/persona/phase-summary", get(persona::phase_summary))
+        .route("/persona/phase-sentiment", post(persona::phase_sentiment))
         .route("/persona/:username/:phase/:method", delete(persona::delete_one))
         // Uploads — 200 MB body limit for large Discord CSV exports
         .route("/upload", post(uploads::upload_csv).layer(DefaultBodyLimit::max(200 * 1024 * 1024)))
@@ -112,56 +113,5 @@ pub fn all_routes(state: AppState) -> Router {
         // Suno team
         .route("/suno-team", get(suno_team::list_suno_team))
         .route("/suno-team/:username", post(suno_team::add_suno_team).delete(suno_team::remove_suno_team))
-        // GitHub Activity Analysis
-        .route("/github/tokens", get(github::list_github_tokens).post(github::add_github_token))
-        .route("/github/tokens/:index", delete(github::delete_github_token))
-        .route("/github/repos", get(github::list_repos).post(github::add_repo))
-        .route("/github/repos/:id", get(github::get_repo).delete(github::delete_repo))
-        .route("/github/repos/:id/reanalyze", post(github::reanalyze_repo))
-        .route("/github/repos/:id/commits", get(github::list_commits))
-        .route("/github/repos/:id/commits/:sha", get(github::get_commit_detail))
-        .route("/github/repos/:id/forks", get(github::list_forks))
-        .route("/github/repos/:id/issues", get(github::list_issues))
-        .route("/github/repos/:id/issues/:number/comments", get(github::get_issue_comments))
-        .route("/github/repos/:id/pulls", get(github::list_pulls))
-        .route("/github/repos/:id/pulls/:number/comments", get(github::get_pull_comments))
-        .route("/github/repos/:id/releases", get(github::list_releases))
-        .route("/github/repos/:id/discussions", get(github::list_discussions))
-        .route("/github/repos/:id/discussions/:number/comments", get(github::get_discussion_comments))
-        // News articles
-        .route("/news/articles", get(news::list_articles))
-        .route("/news/articles/:id", get(news::get_article).put(news::update_article).delete(news::delete_article))
-        .route("/news/extract-url", post(news::extract_url))
-        .route("/news/upload",
-            post(news::upload_article).layer(DefaultBodyLimit::max(50 * 1024 * 1024)))
-        // News bookmarks
-        .route("/news/bookmarks", post(news::create_bookmark).get(news::list_bookmarks))
-        .route("/news/bookmarks/:id",
-            put(news::update_bookmark).delete(news::delete_bookmark))
-        .route("/news/bookmark-codes", post(news::assign_bookmark_code))
-        .route("/news/bookmark-codes/:id/:code_id", delete(news::remove_bookmark_code))
-        // Interviews — 50 MB body limit for audio/transcript uploads
-        .route("/interviews", get(interviews::list_transcripts))
-        .route("/interviews/upload",
-            post(interviews::upload_transcript).layer(DefaultBodyLimit::max(50 * 1024 * 1024)))
-        .route("/interviews/youtube", post(interviews::transcribe_youtube))
-        .route("/interviews/:id", get(interviews::get_transcript)
-            .put(interviews::update_transcript)
-            .delete(interviews::delete_transcript))
-        .route("/interviews/:id/format-qa", post(interviews::format_transcript_qa_endpoint))
-        // Interview bookmarks
-        .route("/interview-bookmarks",
-            post(interviews::create_interview_bookmark).get(interviews::list_interview_bookmarks))
-        .route("/interview-bookmarks/:id",
-            put(interviews::update_interview_bookmark).delete(interviews::delete_interview_bookmark))
-        .route("/interview-bookmarks/:id/highlights",
-            post(interviews::add_interview_highlight))
-        .route("/interview-bookmarks/:id/highlights/:hl_id",
-            delete(interviews::remove_interview_highlight))
-        // Interview bookmark codes
-        .route("/interview-bookmark-codes",
-            post(interviews::assign_interview_code).get(interviews::list_all_interview_bookmark_codes))
-        .route("/interview-bookmark-codes/:bookmark_id/:code_id",
-            delete(interviews::remove_interview_code))
         .with_state(state)
 }

@@ -4,9 +4,7 @@ import Header from './Header'
 import ApiKeyModal from '../modals/ApiKeyModal'
 import HfTokenModal from '../modals/HfTokenModal'
 
-export type AppMode = 'discord' | 'coding' | 'interview' | 'news' | 'github'
-
-export default function Layout({ basePath, mode }: { basePath: string; mode: AppMode }) {
+export default function Layout({ basePath }: { basePath: string }) {
   const mainRef = useRef<HTMLElement>(null)
   const [showBackToTop, setShowBackToTop] = useState(false)
 
@@ -20,7 +18,7 @@ export default function Layout({ basePath, mode }: { basePath: string; mode: App
 
   return (
     <div className="flex flex-col h-screen bg-slate-100">
-      <Header basePath={basePath} mode={mode} />
+      <Header basePath={basePath} />
       <main ref={mainRef} className="flex-1 overflow-auto">
         <Outlet />
       </main>

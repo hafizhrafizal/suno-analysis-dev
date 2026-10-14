@@ -14,12 +14,6 @@ services:
       timeout: 5s
       retries: 5
 
-  qdrant:
-    image: qdrant/qdrant:latest
-    restart: unless-stopped
-    volumes:
-      - qdrant_data:/qdrant/storage
-
   ai_service:
     build:
       context: ./ai_service
@@ -44,14 +38,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      qdrant:
-        condition: service_started
       ai_service:
         condition: service_healthy
     environment:
       DATABASE_URL: postgres://retrieval:${POSTGRES_PASSWORD}@postgres:5432/retrieval
       VECTOR_DB: qdrant
-      QDRANT_URL: http://qdrant:6333
+      QDRANT_URL: http://host.docker.internal:6333
       QDRANT_COLLECTION: ${QDRANT_COLLECTION:-discord_openai}
       QDRANT_API_KEY: ${QDRANT_API_KEY:-}
       APP_MODE: ${APP_MODE:-multi}
@@ -75,6 +67,5 @@ services:
 
 volumes:
   postgres_data:
-  qdrant_data:
   nginx_cache:
   ai_model_cache:   # HuggingFace model weights — persists across rebuilds

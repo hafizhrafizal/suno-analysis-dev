@@ -10,8 +10,12 @@ WORKDIR /app
 COPY requirements.txt .
 # --mount=type=cache persists the pip download cache across builds in a BuildKit
 # cache volume — packages are never re-downloaded even when requirements change.
+#
+# torch is installed first from the CPU-only index: the default PyPI wheel bundles
+# CUDA libraries (several GB) that a CPU-only server never uses.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r requirements.txt
+    pip install torch --index-url https://download.pytorch.org/whl/cpu \
+    && pip install -r requirements.txt
 
 # Models are NOT baked into the image. They are downloaded on first container
 # startup and stored in the named volume ai_model_cache mounted at

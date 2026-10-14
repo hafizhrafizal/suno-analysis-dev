@@ -323,8 +323,9 @@ async fn get_existing_qdrant_ids(
 ) -> std::collections::HashSet<String> {
     let futs = ids.chunks(1000).map(|chunk| {
         let client = client.clone();
-        // Correct endpoint: /points/get (not /points which is the upsert endpoint)
-        let url = format!("{}/collections/{}/points/get", qdrant_url, collection);
+        // Batch retrieval is POST /collections/{c}/points (PUT to the same path
+        // upserts) — /points/get 404s on Qdrant 1.x.
+        let url = format!("{}/collections/{}/points", qdrant_url, collection);
         // Build original→qdrant_id mapping before the async block
         let pairs: Vec<(String, String)> = chunk.iter()
             .map(|id| (id.clone(), to_qdrant_id(id)))

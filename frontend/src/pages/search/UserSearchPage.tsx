@@ -1,712 +1,57 @@
 import { useState, useCallback, useEffect, useRef, useMemo, Fragment } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import {
   BarChart, Bar, AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell,
 } from 'recharts'
 import ReactMarkdown from 'react-markdown'
-import { apiFetch, streamEvents } from '../api/client'
-import { useSearchStore } from '../store/searchStore'
-import { useAuthStore } from '../store/authStore'
-import { usePhaseStore } from '../store/phaseStore'
-import { getUserStyle, getUserColor, highlightText, highlightTerms } from '../utils/colors'
-import type { Message, Upload, UserInRange, Stats, UserTopicsResult, TopicPipelineStep, EmotionResult, EmotionPerMessage, EmotionTimeline } from '../types'
+import { apiFetch, streamEvents } from '../../api/client'
+import { useSearchStore } from '../../store/searchStore'
+import { useAuthStore } from '../../store/authStore'
+import { usePhaseStore } from '../../store/phaseStore'
+import { getUserStyle, getUserColor } from '../../utils/colors'
+import type { Message, Upload, UserInRange, Stats, UserTopicsResult, TopicPipelineStep, EmotionResult } from '../../types'
 import {
-  makeBertopicKey, getBertopicResult, saveBertopicResult,
   makeEmotionKey, checkEmotionCompleted, markEmotionCompleted,
   getEmotionMessages, saveEmotionMessages, buildEmotionResult,
-} from '../lib/analysisCache'
+} from '../../lib/analysisCache'
+import type {
+  SearchTab, MatchType, UsersDataTab, FilterMode,
+  TrendPoint, EngagementLevel, EngagementInfo, CrossPhaseTransition, MsgEmotion,
+} from './types'
+import { ENGAGEMENT_COLORS, TOPIC_COLORS, emotionSentimentColor } from './types'
+import {
+  applyExactFilter, applyAnyFilter, applyFuzzyFilter,
+  classifyEngagement, classifyEngagementSingle, daysBetween, deriveThresholds,
+  deriveUserInRange, downloadChartAsPNG, downloadTableAsCSV, fetchStoredEmotionFromDB,
+  fetchMsgEmotionsBatched, getMondayKey, heatmapColor, mergeEmotionResults, mondayKey, ssGet, ssSet,
+} from './utils'
+import MessageCard from './MessageCard'
+import TopicMsgRow from './TopicMsgRow'
 
-const POSITIVE_EMOTION_SET = new Set([
-  'admiration','amusement','approval','caring','excitement',
-  'gratitude','joy','love','optimism','pride','relief',
-])
-const NEGATIVE_EMOTION_SET = new Set([
-  'anger','annoyance','disappointment','disapproval','disgust',
-  'embarrassment','fear','grief','nervousness','remorse','sadness',
-])
-const emotionSentimentColor = (label: string) =>
-  POSITIVE_EMOTION_SET.has(label) ? '#10b981'
-  : NEGATIVE_EMOTION_SET.has(label) ? '#f43f5e'
-  : '#9ca3af'
-
-const TOPIC_COLORS = [
-  '#6366f1','#ec4899','#f59e0b','#10b981','#3b82f6',
-  '#8b5cf6','#ef4444','#14b8a6','#f97316','#84cc16',
-]
-
-function heatmapColor(positive: number, negative: number, neutral: number, maxCount: number): string {
-  const total = positive + negative + neutral
-  if (total === 0) return '#f3f4f6'
-  const score = (positive - negative) / total
-  const alpha = Math.min(0.18 + (total / maxCount) * 0.72, 0.92)
-  if (score > 0.12) return `rgba(16,185,129,${alpha.toFixed(2)})`
-  if (score < -0.12) return `rgba(244,63,94,${alpha.toFixed(2)})`
-  return `rgba(107,114,128,${alpha.toFixed(2)})`
-}
-
-type SearchTab = 'keyword' | 'semantic' | 'username' | 'range' | 'browse'
-type MatchType = 'fuzzy' | 'exact' | 'any'
-type SearchCat = 'chat' | 'users'
-type UsersDataTab = 'search' | 'phases'
-type TrendBucket = 'month' | 'week' | 'day'
-type AnalysisTab = 'none' | 'summarize' | 'viz'
-type FilterMode = 'exact' | 'any' | 'fuzzy' | 'semantic'
-
-interface TrendPoint {
-  period: string
-  count: number
-  from: string
-  to: string
-}
-
-interface SrLogEntry {
-  step: string
-  label: string
-  msg: string
-}
-
-const LOG_ICONS: Record<string, string> = {
-  filter: '🔍',
-  retrieval: '📡',
-  dedup: '🧹',
-  cluster: '🔮',
-  sample: '🎯',
-  llm: '✨',
-  fallback: '⚠️',
-  meta: '📅',
-  instruction: '📝',
-}
-
-function UsernameTag({ username }: { username: string }) {
-  return (
-    <Link
-      to={`/discord/users/${encodeURIComponent(username)}`}
-      className="ubadge text-xs font-semibold hover:underline"
-      style={getUserStyle(username)}
-      onClick={e => e.stopPropagation()}
-    >
-      {username}
-    </Link>
-  )
-}
-
-// Discord timestamps are stored as UTC strings ("YYYY-MM-DD HH:MM:SS" or ISO).
-// Parse as UTC and display in the browser's local timezone with seconds + tz abbrev.
-function formatMsgDate(raw: string | undefined): string {
-  if (!raw) return ''
-  const normalized = raw.trim().replace(' ', 'T')
-  const iso = /Z$|[+-]\d{2}:\d{2}$/.test(normalized) ? normalized : normalized + 'Z'
-  const d = new Date(iso)
-  if (isNaN(d.getTime())) return raw.slice(0, 19).replace('T', ' ')
-  return d.toLocaleString('en-GB', {
-    year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
-    timeZoneName: 'short', hour12: false,
-  })
-}
-
-type MsgEmotion = { sentiment: string; dominant_emotion: string; top_emotions: { label: string; score: number }[] }
-
-interface MessageCardProps {
-  msg: Message
-  keyword: string
-  tokens: string[]
-  isBookmarked: boolean
-  isSelected: boolean
-  onBookmarkToggle: (msg: Message) => void
-  onSelectToggle: (id: number) => void
-  ctxBefore: number
-  ctxAfter: number
-  isGrouped?: boolean
-  emotion?: MsgEmotion
-}
-
-function MessageCard({ msg, keyword, tokens, isBookmarked, isSelected, onBookmarkToggle, onSelectToggle, ctxBefore, ctxAfter, isGrouped = false, emotion }: MessageCardProps) {
-  const [copied, setCopied] = useState(false)
-  const [ctxOpen, setCtxOpen] = useState(false)
-  const [ctxMessages, setCtxMessages] = useState<Message[]>([])
-  const [ctxLoading, setCtxLoading] = useState(false)
-
-  const [, textColor] = getUserColor(msg.username)
-  const initials = (msg.username || '?').slice(0, 2).toUpperCase()
-
-  const highlighted = tokens.length > 0
-    ? highlightTerms(msg.content, tokens)
-    : keyword
-      ? highlightText(msg.content, keyword)
-      : msg.content
-
-  const handleCopy = () => {
-    navigator.clipboard.writeText(msg.content)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 1500)
-  }
-
-  const handleCtxToggle = async () => {
-    if (ctxOpen) { setCtxOpen(false); return }
-    setCtxLoading(true)
-    setCtxOpen(true)
-    try {
-      const data = await apiFetch<Message[]>(`/context/${msg.id}?before=${ctxBefore}&after=${ctxAfter}`)
-      setCtxMessages(data)
-    } catch { } finally { setCtxLoading(false) }
-  }
-
-  const rowBg = isBookmarked
-    ? 'bg-amber-50 border-l-4 border-amber-300'
-    : 'hover:bg-gray-50 border-l-4 border-transparent'
-
-  return (
-    <div id={`card-${msg.id}`} className={`group flex gap-3 px-2 py-1 rounded-lg transition-colors ${rowBg} ${isGrouped ? 'mt-0' : 'mt-3'}`}>
-      {/* Avatar column */}
-      <div className="w-8 shrink-0 pt-0.5 flex flex-col items-center">
-        {!isGrouped && (
-          <div
-            className="w-8 h-8 rounded-full flex items-center justify-center text-white text-xs font-bold select-none"
-            style={{ background: textColor }}
-          >
-            {initials}
-          </div>
-        )}
-      </div>
-
-      {/* Content */}
-      <div className="flex-1 min-w-0">
-        {!isGrouped && (
-          <div className="flex items-baseline gap-2 flex-wrap mb-0.5">
-            <UsernameTag username={msg.username} />
-            <span className="text-xs text-gray-400 tabular-nums">{formatMsgDate(msg.date)}</span>
-            {(msg.is_suno_team === 'True' || msg.is_suno_team === true || msg.is_suno_team === '1') && (
-              <span className="text-[10px] font-semibold bg-violet-100 text-violet-700 px-1.5 py-0.5 rounded-full">Suno Team</span>
-            )}
-            {msg.similarity != null && (
-              <span className="inline-flex items-center gap-0.5 text-[10px] font-semibold bg-indigo-50 text-indigo-600 border border-indigo-200 px-1.5 py-0.5 rounded-full tabular-nums">
-                <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
-                {(msg.similarity * 100).toFixed(1)}%
-              </span>
-            )}
-            {emotion && (() => {
-              const sentColor = emotion.sentiment === 'positive' ? '#10b981' : emotion.sentiment === 'negative' ? '#f43f5e' : '#9ca3af'
-              const sentBg   = emotion.sentiment === 'positive' ? '#d1fae5' : emotion.sentiment === 'negative' ? '#ffe4e6' : '#f3f4f6'
-              const tooltip = [
-                `Sentiment: ${emotion.sentiment}`,
-                emotion.dominant_emotion ? `Dominant emotion: ${emotion.dominant_emotion}` : '',
-                ...(emotion.top_emotions?.length ? ['Top emotions: ' + emotion.top_emotions.map(e => `${e.label} (${(e.score * 100).toFixed(0)}%)`).join(', ')] : []),
-              ].filter(Boolean).join('\n')
-              return (
-                <span
-                  className="inline-flex items-center gap-1 text-[9px] font-semibold px-1.5 py-0.5 rounded-full capitalize"
-                  style={{ color: sentColor, backgroundColor: sentBg }}
-                  title={tooltip}
-                >
-                  💬 {emotion.sentiment}
-                  {emotion.dominant_emotion && <span className="opacity-70">· {emotion.dominant_emotion}</span>}
-                </span>
-              )
-            })()}
-          </div>
-        )}
-
-        <p
-          className="text-sm text-gray-800 whitespace-pre-wrap break-words leading-relaxed"
-          dangerouslySetInnerHTML={{ __html: highlighted }}
-        />
-
-        {/* Action buttons — horizontal row below text, fade in on hover */}
-        <div className="flex items-center gap-0.5 mt-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-          <button
-            onClick={() => onBookmarkToggle(msg)}
-            className={`flex items-center gap-1 text-xs px-2 py-0.5 rounded-lg transition-colors whitespace-nowrap ${isBookmarked ? 'text-amber-600 hover:bg-amber-100' : 'text-gray-400 hover:bg-gray-100 hover:text-gray-600'}`}
-            title={isBookmarked ? 'Remove bookmark' : 'Save bookmark'}
-          >
-            {isBookmarked ? (
-              <svg className="w-3 h-3 text-amber-500 shrink-0" fill="currentColor" viewBox="0 0 24 24"><path d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z" /></svg>
-            ) : (
-              <svg className="w-3 h-3 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z" /></svg>
-            )}
-            <span>{isBookmarked ? 'Bookmarked' : 'Bookmark'}</span>
-          </button>
-          <button
-            onClick={handleCopy}
-            className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-lg hover:bg-gray-100 transition-colors text-gray-400 hover:text-gray-600 whitespace-nowrap"
-          >
-            {copied ? (
-              <svg className="w-3 h-3 text-green-500 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
-            ) : (
-              <svg className="w-3 h-3 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
-            )}
-            <span>{copied ? 'Copied!' : 'Copy'}</span>
-          </button>
-          <button
-            onClick={handleCtxToggle}
-            className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-lg hover:bg-gray-100 transition-colors text-gray-400 hover:text-gray-600 whitespace-nowrap"
-          >
-            <svg className="w-3 h-3 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" /></svg>
-            <span>View context</span>
-          </button>
-        </div>
-
-        {ctxOpen && (
-          <div className="mt-2 border-t border-gray-100 pt-2">
-            {ctxLoading ? (
-              <p className="text-xs text-gray-400 text-center py-2">Loading context…</p>
-            ) : (
-              <div className="space-y-1">
-                {ctxMessages.map((m) => (
-                  <div
-                    key={m.id}
-                    className={`flex gap-2 text-xs px-2 py-1 rounded ${m.id === msg.id ? 'bg-amber-50 border border-amber-200' : 'bg-gray-50'}`}
-                  >
-                    <Link to={`/discord/users/${encodeURIComponent(m.username)}`} className="shrink-0 font-semibold hover:underline" style={getUserStyle(m.username)} onClick={e => e.stopPropagation()}>{m.username}</Link>
-                    <span className="text-gray-400 shrink-0">{formatMsgDate(m.date)}</span>
-                    <span className="text-gray-700 flex-1">{m.content}</span>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-    </div>
-  )
-}
-
-// --- Chat-style row for Browse All ---
-function BrowseChatRow({
-  msg,
-  isGrouped,
-  isBookmarked,
-  onBookmarkToggle,
-  tokens = [],
-}: {
-  msg: Message
-  isGrouped: boolean
-  isBookmarked: boolean
-  onBookmarkToggle: (msg: Message) => void
-  tokens?: string[]
-}) {
-  const [copied, setCopied] = useState(false)
-  const [, textColor] = getUserColor(msg.username)
-  const initials = (msg.username || '?').slice(0, 2).toUpperCase()
-
-  const handleCopy = () => {
-    navigator.clipboard.writeText(msg.content)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 1500)
-  }
-
-  const rowBg = isBookmarked
-    ? 'bg-amber-50 border-l-4 border-amber-300'
-    : 'hover:bg-gray-50 border-l-4 border-transparent'
-
-  return (
-    <div className={`group flex gap-3 px-2 py-1 rounded-lg transition-colors ${rowBg} ${isGrouped ? 'mt-0' : 'mt-3'}`}>
-      {/* Avatar column — 32 px wide always so messages align */}
-      <div className="w-8 shrink-0 flex flex-col items-center pt-0.5">
-        {!isGrouped && (
-          <div
-            className="w-8 h-8 rounded-full flex items-center justify-center text-white text-xs font-bold select-none"
-            style={{ background: textColor }}
-          >
-            {initials}
-          </div>
-        )}
-      </div>
-
-      {/* Message body */}
-      <div className="flex-1 min-w-0">
-        {!isGrouped && (
-          <div className="flex items-baseline gap-2 mb-0.5">
-            <Link
-              to={`/discord/users/${encodeURIComponent(msg.username)}`}
-              className="text-sm font-semibold hover:underline"
-              style={{ color: textColor }}
-              onClick={e => e.stopPropagation()}
-            >{msg.username}</Link>
-            <span className="text-xs text-gray-400 tabular-nums">{formatMsgDate(msg.date)}</span>
-            {(msg.is_suno_team === 'True' || msg.is_suno_team === true || msg.is_suno_team === '1') && (
-              <span className="text-[10px] font-semibold bg-violet-100 text-violet-700 px-1.5 py-0.5 rounded-full">Suno Team</span>
-            )}
-          </div>
-        )}
-        <p
-          className="text-sm text-gray-800 whitespace-pre-wrap break-words leading-relaxed"
-          dangerouslySetInnerHTML={{ __html: tokens.length > 0 ? highlightTerms(msg.content, tokens) : msg.content }}
-        />
-
-        {/* Action buttons — horizontal row below text, fade in on hover */}
-        <div className="flex items-center gap-0.5 mt-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-          <button
-            onClick={() => onBookmarkToggle(msg)}
-            className={`flex items-center gap-1 text-xs px-2 py-0.5 rounded-lg transition-colors whitespace-nowrap ${isBookmarked ? 'text-amber-600 hover:bg-amber-100' : 'text-gray-400 hover:bg-gray-100 hover:text-gray-600'}`}
-            title={isBookmarked ? 'Remove bookmark' : 'Bookmark'}
-          >
-            {isBookmarked ? (
-              <svg className="w-3 h-3 text-amber-500 shrink-0" fill="currentColor" viewBox="0 0 24 24"><path d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z" /></svg>
-            ) : (
-              <svg className="w-3 h-3 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z" /></svg>
-            )}
-            <span>{isBookmarked ? 'Bookmarked' : 'Bookmark'}</span>
-          </button>
-          <button
-            onClick={handleCopy}
-            className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-lg hover:bg-gray-100 transition-colors text-gray-400 hover:text-gray-600 whitespace-nowrap"
-            title="Copy message"
-          >
-            {copied ? (
-              <svg className="w-3 h-3 text-green-500 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
-            ) : (
-              <svg className="w-3 h-3 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
-            )}
-            <span>{copied ? 'Copied!' : 'Copy'}</span>
-          </button>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// --- Client-side filter helpers ---
-
-function fuzzyMatch(text: string, pattern: string): boolean {
-  // Each char in pattern must appear in text in order
-  let pi = 0
-  const lText = text.toLowerCase()
-  const lPat = pattern.toLowerCase()
-  for (let i = 0; i < lText.length && pi < lPat.length; i++) {
-    if (lText[i] === lPat[pi]) pi++
-  }
-  return pi === lPat.length
-}
-
-function applyExactFilter(messages: Message[], term: string): Message[] {
-  if (!term.trim()) return messages
-  const words = term.trim().toLowerCase().split(/\s+/)
-  return messages.filter((m) => {
-    const lc = m.content.toLowerCase()
-    return words.every((w) => lc.includes(w))
-  })
-}
-
-function applyAnyFilter(messages: Message[], term: string): Message[] {
-  if (!term.trim()) return messages
-  const words = term.trim().toLowerCase().split(/\s+/)
-  return messages.filter((m) => {
-    const lc = m.content.toLowerCase()
-    return words.some((w) => lc.includes(w))
-  })
-}
-
-function applyFuzzyFilter(messages: Message[], term: string): Message[] {
-  if (!term.trim()) return messages
-  const words = term.trim().split(/\s+/)
-  return messages.filter((m) =>
-    words.every((w) => fuzzyMatch(m.content, w))
-  )
-}
-
-function computeFilterTokens(mode: FilterMode, term: string): string[] {
-  if (!term.trim()) return []
-  const words = term.trim().split(/\s+/).filter(Boolean)
-  if (mode === 'exact') {
-    return words.length > 1 ? [term.trim(), ...words] : [term.trim()]
-  }
-  if (mode === 'any' || mode === 'fuzzy') {
-    return words
-  }
-  // semantic: no highlighting
-  return []
-}
-
-// Returns the Monday date string (YYYY-MM-DD) for any date
-function getMondayKey(dateStr: string): string {
-  const d = new Date(dateStr)
-  const day = d.getUTCDay()
-  const diff = day === 0 ? -6 : 1 - day
-  d.setUTCDate(d.getUTCDate() + diff)
-  return d.toISOString().slice(0, 10)
-}
-
-// --- Engagement analysis helpers ---
-
-type EngagementLevel = 'high' | 'medium' | 'low'
-interface EngagementInfo {
-  level: EngagementLevel
-  pctWeeks: number
-}
-
-type CrossPhaseTransition = 'dropout-high' | 'dropout-med' | 'dropout-low' | 'dec-hm' | 'dec-hl' | 'dec-ml'
-
-function daysBetween(dateA: string, dateB: string): number {
-  return Math.round((new Date(dateB).getTime() - new Date(dateA).getTime()) / 86400000)
-}
-
-function deriveThresholds(windowDays: number) {
-  const w = Math.max(14, windowDays)
-  const wk = w / 7
-  const extraWks = Math.max(0, wk - 7)
-  return {
-    minMessages:       Math.max(5,  Math.round(wk * 1.0)),
-    activeMinMessages: Math.max(15, Math.round(wk * 3.0)),
-    minAvgWords:       3,
-    minPctWeeks:   Math.min(20, Math.round(12 + extraWks * 0.10)),
-    activePctWeeks: 40,
-    activeMinWeeks: Math.max(3, Math.ceil(wk * 0.12)),
-    silenceDays: Math.min(120, Math.max(21, Math.round(w * 0.28))),
-  }
-}
-
-function classifyEngagement(u: UserInRange, filterStart: string, filterEnd: string): EngagementInfo {
-  const windowDays = filterStart ? Math.max(14, daysBetween(filterStart, filterEnd)) : 90
-  const windowWeeks = windowDays / 7
-  const pctWeeks = windowWeeks > 0 ? Math.round(((u.weeks_active ?? 0) / windowWeeks) * 100) : 0
-  // Floor = 20 × 50% of total phase weeks — fixed target regardless of how many weeks the user was active
-  // High: ≥50% weeks present AND total msgs ≥ floor
-  // Low: <20% weeks present
-  // Medium: everything else
-  const msgFloor = 20 * Math.ceil(windowWeeks * 0.5)
-  let level: EngagementLevel
-  if (pctWeeks >= 50 && u.total_messages >= msgFloor) level = 'high'
-  else if (pctWeeks < 20) level = 'low'
-  else level = 'medium'
-  return { level, pctWeeks }
-}
-
-function classifyEngagementSingle(u: UserInRange, filterStart: string, filterEnd: string): EngagementInfo {
-  const windowDays = filterStart ? Math.max(14, daysBetween(filterStart, filterEnd)) : 90
-  const windowWeeks = windowDays / 7
-  const pctWeeks = windowWeeks > 0 ? Math.round(((u.weeks_active ?? 0) / windowWeeks) * 100) : 0
-  const msgFloor = 20 * Math.ceil(windowWeeks * 0.5)
-  let level: EngagementLevel
-  if (pctWeeks >= 50 && u.total_messages >= msgFloor) level = 'high'
-  else if (pctWeeks < 20) level = 'low'
-  else level = 'medium'
-  return { level, pctWeeks }
-}
-
-const ENGAGEMENT_COLORS: Record<EngagementLevel, { bg: string; text: string; dot: string; border: string }> = {
-  high:   { bg: 'bg-emerald-50',  text: 'text-emerald-700', dot: 'bg-emerald-500',  border: 'border-emerald-200'  },
-  medium: { bg: 'bg-sky-50',      text: 'text-sky-700',     dot: 'bg-sky-500',      border: 'border-sky-200'      },
-  low:    { bg: 'bg-amber-50',    text: 'text-amber-600',   dot: 'bg-amber-400',    border: 'border-amber-200'    },
-}
-
-
-// --- Shared utilities ---
-
-function mondayKey(iso: string): string {
-  const d = new Date(iso)
-  const diff = (d.getUTCDay() + 6) % 7
-  const mon = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - diff))
-  return mon.toISOString().slice(0, 10)
-}
-
-function deriveUserInRange(username: string, messages: Message[]): UserInRange {
-  if (messages.length === 0) return { username, total_messages: 0 }
-  const dates = messages.map(m => m.date?.slice(0, 10) ?? '').filter(Boolean).sort()
-  const total_words = messages.reduce(
-    (sum, m) => sum + m.content.split(/\s+/).filter(Boolean).length, 0
-  )
-  const weekSet = new Set(messages.map(m => (m.date ? mondayKey(m.date) : '')).filter(Boolean))
-  return {
-    username,
-    total_messages: messages.length,
-    first_date: dates[0],
-    last_date: dates[dates.length - 1],
-    avg_words: Math.round((total_words / messages.length) * 10) / 10,
-    weeks_active: weekSet.size,
-    is_suno_team: messages.some(
-      m => m.is_suno_team === 'True' || m.is_suno_team === true || m.is_suno_team === '1'
-    ),
-  }
-}
-
-// --- Main component ---
-
-// Safe sessionStorage helpers
-function ssGet<T>(key: string, fallback: T): T {
-  try { const v = sessionStorage.getItem(key); return v !== null ? (JSON.parse(v) as T) : fallback } catch { return fallback }
-}
-function ssSet(key: string, value: unknown) {
-  try { sessionStorage.setItem(key, JSON.stringify(value)) } catch {}
-}
-
-const SEARCHING_MESSAGES = [
-  'Scanning the archives…',
-  'Hunting through thousands of messages…',
-  'Finding the signal in the noise…',
-  'Sifting through the data…',
-  'Turning over every stone…',
-  'Almost there…',
-]
-
-function SearchingAnimation() {
-  const [msgIdx, setMsgIdx] = useState(0)
-  useEffect(() => {
-    const t = setInterval(() => setMsgIdx((i) => (i + 1) % SEARCHING_MESSAGES.length), 1800)
-    return () => clearInterval(t)
-  }, [])
-  return (
-    <div className="bg-white rounded-2xl shadow px-6 py-12 flex flex-col items-center gap-5">
-      <div className="relative w-14 h-14">
-        <div className="absolute inset-0 rounded-full border-[3px] border-gray-100" />
-        <div
-          className="absolute inset-0 rounded-full border-[3px] border-transparent border-t-indigo-500 border-r-indigo-300 animate-spin"
-          style={{ animationDuration: '0.85s' }}
-        />
-      </div>
-      <p
-        key={msgIdx}
-        className="text-sm font-medium text-gray-500 tracking-wide"
-      >
-        {SEARCHING_MESSAGES[msgIdx]}
-      </p>
-    </div>
-  )
-}
-
-function mergeEmotionResults(a: EmotionResult, b: EmotionResult): EmotionResult {
-  const perMessage = [...a.per_message, ...b.per_message]
-  const sentCounts = { positive: 0, negative: 0, neutral: 0 }
-  for (const m of perMessage) sentCounts[m.sentiment]++
-  const total = perMessage.length || 1
-  const sentiment_ratio = {
-    positive: sentCounts.positive / total,
-    negative: sentCounts.negative / total,
-    neutral: sentCounts.neutral / total,
-  }
-  const emotionMap = new Map<string, number>()
-  for (const e of [...a.summary.top_emotions, ...b.summary.top_emotions]) {
-    emotionMap.set(e.label, (emotionMap.get(e.label) ?? 0) + e.score)
-  }
-  const top_emotions = [...emotionMap.entries()]
-    .map(([label, score]) => ({ label, score: score / 2 }))
-    .sort((x, y) => y.score - x.score)
-    .slice(0, 10)
-  const timelineMap = new Map<string, EmotionTimeline>()
-  for (const t of [...a.summary.timeline, ...b.summary.timeline]) {
-    const ex = timelineMap.get(t.period)
-    if (ex) {
-      timelineMap.set(t.period, {
-        period: t.period,
-        positive: ex.positive + t.positive,
-        negative: ex.negative + t.negative,
-        neutral: ex.neutral + t.neutral,
-        count: ex.count + t.count,
-      })
-    } else {
-      timelineMap.set(t.period, { ...t })
-    }
-  }
-  const timeline = [...timelineMap.values()].sort((x, y) => x.period.localeCompare(y.period))
-  return {
-    per_message: perMessage,
-    summary: { sentiment_ratio, top_emotions, timeline },
-    total_messages: a.total_messages + b.total_messages,
-    analyzed_messages: a.analyzed_messages + b.analyzed_messages,
-  }
-}
-
-async function fetchStoredEmotionFromDB(
-  uuids: string[],
-  dateByUuid: Map<string, string>,
-  totalCount: number,
-): Promise<EmotionResult | null> {
-  if (uuids.length === 0) return null
-  try {
-    const resp = await apiFetch<Record<string, { sentiment: string; top_emotions: { label: string; score: number }[] }>>(
-      '/messages/emotions',
-      { method: 'POST', body: JSON.stringify({ msg_uuids: uuids }) }
-    )
-    const perMessage: EmotionPerMessage[] = uuids
-      .filter(uuid => resp[uuid])
-      .map(uuid => ({
-        msg_uuid: uuid,
-        date: dateByUuid.get(uuid) ?? '',
-        sentiment: resp[uuid].sentiment as 'positive' | 'negative' | 'neutral',
-        top_emotions: resp[uuid].top_emotions,
-      }))
-    if (perMessage.length === 0) return null
-    const result = buildEmotionResult(perMessage)
-    result.total_messages = totalCount
-    return result
-  } catch {
-    return null
-  }
-}
-
-function downloadChartAsPNG(container: HTMLElement | null, filename: string): void {
-  if (!container) return
-  const svg = container.querySelector('svg')
-  if (!svg) return
-  const { width, height } = svg.getBoundingClientRect()
-  const serialized = new XMLSerializer().serializeToString(svg)
-  const blob = new Blob([serialized], { type: 'image/svg+xml' })
-  const url = URL.createObjectURL(blob)
-  const img = new Image()
-  img.onload = () => {
-    const scale = 2
-    const canvas = document.createElement('canvas')
-    canvas.width = width * scale
-    canvas.height = height * scale
-    const ctx = canvas.getContext('2d')!
-    ctx.scale(scale, scale)
-    ctx.fillStyle = '#ffffff'
-    ctx.fillRect(0, 0, width, height)
-    ctx.drawImage(img, 0, 0, width, height)
-    URL.revokeObjectURL(url)
-    const a = document.createElement('a')
-    a.download = filename
-    a.href = canvas.toDataURL('image/png')
-    a.click()
-  }
-  img.src = url
-}
-
-function downloadTableAsCSV(headers: string[], rows: (string | number | null)[][], filename: string): void {
-  const esc = (v: string | number | null) => {
-    const s = String(v ?? '')
-    return /[,"\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
-  }
-  const csv = [headers, ...rows].map(r => r.map(esc).join(',')).join('\n')
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = filename
-  a.click()
-  URL.revokeObjectURL(url)
-}
-
-export default function SearchPage() {
+export default function UserSearchPage() {
   const PHASE_DEFS = usePhaseStore(s => s.defs)
-  const { results, setResults, selectedIds, toggleSelected, selectAll, clearSelected, bookmarkedIds, setBookmarkedIds, toggleBookmarked } = useSearchStore()
+  const { results, setResults, bookmarkedIds, setBookmarkedIds, toggleBookmarked } = useSearchStore()
   const { setShowKeyModal } = useAuthStore()
   const { username: routeUsername } = useParams<{ username?: string }>()
   const navigate = useNavigate()
 
   // Search state
-  const [searchCat, setSearchCat] = useState<SearchCat>(() => (localStorage.getItem('search_cat') as SearchCat) || 'chat')
-  const [activeTab, setActiveTab] = useState<SearchTab>(() => (localStorage.getItem('search_tab') as SearchTab) || 'keyword')
-  const [matchType, setMatchType] = useState<MatchType>(() => ssGet('sr_match_type', 'any'))
-  const [query, setQuery] = useState(() => ssGet('sr_query', ''))
-  const [filterUsername, setFilterUsername] = useState(() => ssGet('sr_filter_username', ''))
+  const [activeTab] = useState<SearchTab>(() => (localStorage.getItem('search_tab') as SearchTab) || 'keyword')
+  const [matchType] = useState<MatchType>(() => ssGet('sr_match_type', 'any'))
+  const [query] = useState(() => ssGet('sr_query', ''))
+  const [filterUsername] = useState(() => ssGet('sr_filter_username', ''))
   const [dateFrom, setDateFrom] = useState(() => ssGet('sr_date_from', ''))
   const [dateTo, setDateTo] = useState(() => ssGet('sr_date_to', ''))
-  const [rangeDateFrom, setRangeDateFrom] = useState(() => ssGet('sr_range_date_from', ''))
-  const [rangeDateTo, setRangeDateTo] = useState(() => ssGet('sr_range_date_to', ''))
+  const [rangeDateFrom] = useState(() => ssGet('sr_range_date_from', ''))
+  const [rangeDateTo] = useState(() => ssGet('sr_range_date_to', ''))
   const [sunoTeam, setSunoTeam] = useState('all')
-  const [maxResults, setMaxResults] = useState(1000000)
+  const [maxResults] = useState(1000000)
   const [minWords, setMinWords] = useState(0)
   const [minMessages, setMinMessages] = useState(0)
-  const [ctxBefore, setCtxBefore] = useState(10)
-  const [ctxAfter, setCtxAfter] = useState(10)
-  const [sortBy, setSortBy] = useState('similarity')
-  const [showOptions, setShowOptions] = useState(false)
   const [searching, setSearching] = useState(false)
-  const [didSearch, setDidSearch] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [bookmarkError, setBookmarkError] = useState<string | null>(null)
+  const [, setError] = useState<string | null>(null)
+  const [, setBookmarkError] = useState<string | null>(null)
   const [uploads, setUploads] = useState<Upload[]>([])
   const [selectedUploads, setSelectedUploads] = useState<Set<string>>(new Set())
   const [userStats, setUserStats] = useState<UserInRange[]>(() => ssGet<UserInRange[]>('sr_user_stats', []))
@@ -714,7 +59,10 @@ export default function SearchPage() {
   const [selectedPhases, setSelectedPhases] = useState<Set<string>>(new Set())
   const [phaseData, setPhaseData] = useState<Record<string, UserInRange[]>>({})
   const [phaseLoadingSet, setPhaseLoadingSet] = useState<Set<string>>(new Set())
-  const [expandedPhaseSections, setExpandedPhaseSections] = useState<Set<string>>(new Set(['cross-active', 'username-trend']))
+  // phaseKey → { username → primaryPersona } — fetched from DB per phase
+  const [phasePersonas, setPhasePersonas] = useState<Record<string, Record<string, string>>>({})
+  const [phaseSecondaryPersonas, setPhaseSecondaryPersonas] = useState<Record<string, Record<string, string>>>({})
+  const [expandedPhaseSections, setExpandedPhaseSections] = useState<Set<string>>(new Set(['cross-active', 'username-trend', 'archetype-trend', 'sentiment-trend', 'archetype-engagement']))
   const [phaseUsernameSearch, setPhaseUsernameSearch] = useState('')
   const [phaseChartStatuses, setPhaseChartStatuses] = useState<Set<string>>(new Set(['High', 'Medium', 'Low']))
   const [userSortCol, setUserSortCol] = useState<'username' | 'total_messages' | 'first_date' | 'last_date' | 'avg_words' | 'weeks_active' | 'pct_weeks'>('total_messages')
@@ -727,42 +75,20 @@ export default function SearchPage() {
   const [refineMinWeeks, setRefineMinWeeks] = useState('')
   const [refineAvgWordsMin, setRefineAvgWordsMin] = useState('')
   const [refineAvgWordsMax, setRefineAvgWordsMax] = useState('')
-  const [trendData, setTrendData] = useState<TrendPoint[]>(() => ssGet<TrendPoint[]>('sr_trend_data', []))
-  const [trendBucket, setTrendBucket] = useState<TrendBucket>('month')
-  const [lastKeyword, setLastKeyword] = useState(() => ssGet('sr_last_keyword', ''))
-  const [lastTokens, setLastTokens] = useState<string[]>(() => ssGet<string[]>('sr_last_tokens', []))
+  const [trendData] = useState<TrendPoint[]>(() => ssGet<TrendPoint[]>('sr_trend_data', []))
+  const [lastKeyword] = useState(() => ssGet('sr_last_keyword', ''))
+  const [lastTokens] = useState<string[]>(() => ssGet<string[]>('sr_last_tokens', []))
   const [showSearchPanel, setShowSearchPanel] = useState(true)
-  const [rangeLimit, setRangeLimit] = useState(200)
-  const [rangeOffset, setRangeOffset] = useState(0)
-  const [rangeMode, setRangeMode] = useState<'exact' | 'month'>('exact')
 
-  // Analysis tabs
-  const [analysisTab, setAnalysisTab] = useState<AnalysisTab>('none')
 
-  // Summarize & Analyse state
-  const [summarizeQuery, setSummarizeQuery] = useState('')
-  const [summarizeResult, setSummarizeResult] = useState('')
-  const [summarizeLoading, setSummarizeLoading] = useState(false)
-  const [summarizeFollowUp, setSummarizeFollowUp] = useState<{ role: 'user' | 'assistant'; content: string }[]>([])
-  const [summarizeFollowUpLoading, setSummarizeFollowUpLoading] = useState(false)
-  const [summarizeFollowUpInput, setSummarizeFollowUpInput] = useState('')
-  const [srModel, setSrModel] = useState('gpt-4o')
-  const [srRetrievalMode, setSrRetrievalMode] = useState<'cluster' | 'all'>('cluster')
-  const [srLog, setSrLog] = useState<SrLogEntry[]>([])
-  const [srLogVisible, setSrLogVisible] = useState(true)
-  const [showSrResultsPanel, setShowSrResultsPanel] = useState(false)
-  const stopSummarizeRef = useRef<(() => void) | null>(null)
 
   // Results filter bar state
-  const [filterMode, setFilterMode] = useState<FilterMode>('any')
-  const [filterText, setFilterText] = useState('')
+  const [filterMode] = useState<FilterMode>('any')
+  const [filterText] = useState('')
   const [displayedResults, setDisplayedResults] = useState<Message[]>([])
-  const [filterCount, setFilterCount] = useState<{ shown: number; total: number } | null>(null)
-  const [filterLoading, setFilterLoading] = useState(false)
-  const [filterTokens, setFilterTokens] = useState<string[]>([])
 
   // Chart range filter
-  const [chartRange, setChartRange] = useState<{ from: string; to: string; label: string } | null>(null)
+  const [chartRange] = useState<{ from: string; to: string; label: string } | null>(null)
 
   // User detail panel state
   const [selectedUser, setSelectedUser] = useState<UserInRange | null>(null)
@@ -779,7 +105,6 @@ export default function SearchPage() {
   const [userSumInstructions, setUserSumInstructions] = useState('')
   const [userSumResult, setUserSumResult] = useState('')
   const [userSumLoading, setUserSumLoading] = useState(false)
-  const [userSumVisible, setUserSumVisible] = useState(false)
   const [userSumFollowUp, setUserSumFollowUp] = useState<{ role: 'user' | 'assistant'; content: string }[]>([])
   const [userSumFollowUpInput, setUserSumFollowUpInput] = useState('')
   const [userSumFollowUpLoading, setUserSumFollowUpLoading] = useState(false)
@@ -790,31 +115,59 @@ export default function SearchPage() {
   // BERTopic analysis state
   const [userTopicsResult, setUserTopicsResult] = useState<UserTopicsResult | null>(null)
   const [userTopicsLoading, setUserTopicsLoading] = useState(false)
-  const [userTopicsVisible, setUserTopicsVisible] = useState(false)
+  const [topicsDbLoading, setTopicsDbLoading] = useState(false)  // true while fetching saved result from DB
   const [expandedTopicSamples, setExpandedTopicSamples] = useState<Set<number>>(new Set())
+  // Topic label editing in user-detail panel
+  const [editingTopicId, setEditingTopicId] = useState<number | null>(null)
+  const [editingLabelValue, setEditingLabelValue] = useState('')
+  const [relabelingTopicId, setRelabelingTopicId] = useState<number | null>(null)
   const [userTopicsSteps, setUserTopicsSteps] = useState<TopicPipelineStep[]>([])
   const [topicModalId, setTopicModalId] = useState<number | null>(null)
+  // Stats-table topic message modal (separate from the user-detail panel modal)
+  const [statsTopicModal, setStatsTopicModal] = useState<{
+    topicId: number; label: string; keywords: string[]; username: string; messageCount: number
+  } | null>(null)
+  const [statsTopicMessages, setStatsTopicMessages] = useState<Message[]>([])
+  const [statsTopicLoading, setStatsTopicLoading] = useState(false)
   const [userAnalysisTab, setUserAnalysisTab] = useState<'topics' | 'emotion' | 'timeline' | 'dropout' | 'summary' | 'strategy' | 'persona'>('dropout')
   const [dropoutSubTab, setDropoutSubTab] = useState<'current' | 'phases' | 'cross'>('cross')
   const [crossPhaseNarrative, setCrossPhaseNarrative] = useState<string | null>(null)
   const [narrativeLoading, setNarrativeLoading] = useState(false)
   const [msgEmotions, setMsgEmotions] = useState<Record<string, MsgEmotion>>({})
+  const requestedMsgEmotionUuidsRef = useRef(new Set<string>())
 
-  // Persona classification state
-  type PersonaResult = { persona: string; confidence: number; reasoning: string; created_at?: string }
-  type UserPersonas = Record<string, { rule_based?: PersonaResult; llm?: PersonaResult }>
+  // Persona / archetype classification state
+  // Single-method ("archetype"); each user/phase has one primary + optional secondary.
+  type PersonaResult = {
+    persona: string
+    confidence: number
+    secondary_persona?: string | null
+    secondary_confidence?: number | null
+    reasoning: string
+    created_at?: string
+  }
+  type UserPersonas = Record<string, PersonaResult>  // keyed by phase key, for one selected user
   const [userPersonas, setUserPersonas] = useState<UserPersonas>({})
   const [personaClassifying, setPersonaClassifying] = useState<Set<string>>(new Set())
   const [personaSummary, setPersonaSummary] = useState<
     { phase: string; phase_label: string; method: string; persona: string; count: number }[]
   >([])
-  const [personaSummaryMethod, setPersonaSummaryMethod] = useState<'rule_based' | 'llm'>('rule_based')
   const [personaSummaryLoading, setPersonaSummaryLoading] = useState(false)
+  const [phaseSentiment, setPhaseSentiment] = useState<
+    { phase: string; positive: number; negative: number; neutral: number; total: number }[]
+  >([])
   const [batchPersonaClassifying, setBatchPersonaClassifying] = useState(false)
   const [batchPersonaProgress, setBatchPersonaProgress] = useState<{ done: number; total: number; errors: number } | null>(null)
+  const [reanalyzingPhases, setReanalyzingPhases] = useState<Set<string>>(new Set())
   const [batchTopicRunning, setBatchTopicRunning] = useState(false)
   const [batchTopicProgress, setBatchTopicProgress] = useState<{ done: number; total: number; errors: number } | null>(null)
-  const [tablePersonas, setTablePersonas] = useState<Record<string, { rule_based?: PersonaResult; llm?: PersonaResult }>>({})
+  const [batchTopicCurrentUser, setBatchTopicCurrentUser] = useState<string | null>(null)
+  const [showOnlyFailedTopics, setShowOnlyFailedTopics] = useState(false)
+  const [showOnlyAnomalyTopics, setShowOnlyAnomalyTopics] = useState(false)
+  const [relabelingInTable, setRelabelingInTable] = useState<Record<string, Set<number>>>({})
+  const [relabelAllProgress, setRelabelAllProgress] = useState<{ done: number; total: number; errors: number } | null>(null)
+  // Keyed by username (one entry per user for the current phase).
+  const [tablePersonas, setTablePersonas] = useState<Record<string, PersonaResult>>({})
   type EmotionEntry = { label: string; score: number }
   type SentBucket = { count: number; top_emotions: EmotionEntry[] }
   type TableSentiment = {
@@ -857,6 +210,8 @@ export default function SearchPage() {
 
   // Dropout analysis parameters
   const [dropoutStatusFilter, setDropoutStatusFilter] = useState<'all' | EngagementLevel | 'decreased' | 'dropout'>('all')
+  const [archetypeFilter, setArchetypeFilter] = useState<string>('all')
+  const [secondaryArchetypeFilter, setSecondaryArchetypeFilter] = useState<string>('all')
 
   // Timeline interactivity
   const [selectedTopicIds, setSelectedTopicIds] = useState<Set<number> | null>(null)
@@ -873,6 +228,8 @@ export default function SearchPage() {
   const chartTrendsRef    = useRef<HTMLDivElement>(null)
   const chartStackedRef   = useRef<HTMLDivElement>(null)
   const chartUserTrendRef = useRef<HTMLDivElement>(null)
+  const chartArchetypeRef  = useRef<HTMLDivElement>(null)
+  const chartSentimentRef  = useRef<HTMLDivElement>(null)
 
   // Semantic filter debounce ref
   const semanticFilterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -890,19 +247,13 @@ export default function SearchPage() {
 
   // Browse All tab — server-side pagination
   const [browseMessages, setBrowseMessages] = useState<Message[]>([])
-  const [browseFetching, setBrowseFetching] = useState(false)
-  const [browseHasMore, setBrowseHasMore] = useState(true)
-  const [browseExporting, setBrowseExporting] = useState(false)
   const resultsAnchorRef = useRef<HTMLDivElement>(null)
   const browseOffsetRef = useRef(0)
   const browseHasMoreRef = useRef(true)
   const browseIsFetchingRef = useRef(false)
   const browseSentinelRef = useRef<HTMLDivElement>(null)
-  // Browse filters (date: server-side re-fetch; username+keyword: client-side)
-  const [browseUsernameFilter, setBrowseUsernameFilter] = useState('')
-  const [browseKeywordFilter, setBrowseKeywordFilter] = useState('')
-  const [browseDateFrom, setBrowseDateFrom] = useState('')
-  const [browseDateTo, setBrowseDateTo] = useState('')
+  const [browseDateFrom] = useState('')
+  const [browseDateTo] = useState('')
   const browseDateFromRef = useRef('')
   const browseDateToRef = useRef('')
   const browseScopeRef = useRef('')
@@ -910,7 +261,6 @@ export default function SearchPage() {
   const { data: _uploads } = useQuery<Upload[]>({ queryKey: ['uploads'], queryFn: () => apiFetch('/uploads') })
   const { data: _bookmarkIds } = useQuery<number[]>({ queryKey: ['bookmark-ids'], queryFn: () => apiFetch('/bookmarks/ids') })
   const { data: _stats } = useQuery<Stats>({ queryKey: ['stats'], queryFn: () => apiFetch('/stats') })
-  const vdbName = _stats?.vector_db_label ?? 'ChromaDB'
   useEffect(() => { if (_uploads) setUploads(_uploads) }, [_uploads])
   useEffect(() => { if (_bookmarkIds) setBookmarkedIds(_bookmarkIds) }, [_bookmarkIds])
 
@@ -923,28 +273,62 @@ export default function SearchPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Fetch stored emotions for newly loaded message results
+  // Fetch stored emotions only for currently rendered rows. Large searches can
+  // contain tens of thousands of messages, so avoid one giant metadata request.
   useEffect(() => {
-    const uuids = results.map(m => m.msg_uuid).filter((u): u is string => !!u)
-    if (uuids.length === 0) { setMsgEmotions({}); return }
-    apiFetch<Record<string, MsgEmotion>>('/messages/emotions', {
-      method: 'POST',
-      body: JSON.stringify({ msg_uuids: uuids }),
-    }).then(data => setMsgEmotions(data)).catch(() => {})
-  }, [results])
+    const visible = displayedResults.slice(0, visibleCount)
+    const uuids = visible
+      .map(m => m.msg_uuid)
+      .filter((u): u is string => !!u && !requestedMsgEmotionUuidsRef.current.has(u))
+    if (results.length === 0) {
+      requestedMsgEmotionUuidsRef.current.clear()
+      setMsgEmotions({})
+      return
+    }
+    if (uuids.length === 0) return
+    let cancelled = false
+    for (const uuid of uuids) requestedMsgEmotionUuidsRef.current.add(uuid)
+    ;(async () => {
+      for (let i = 0; i < uuids.length; i += 500) {
+        const batch = uuids.slice(i, i + 500)
+        try {
+          const data = await fetchMsgEmotionsBatched(batch)
+          if (!cancelled) setMsgEmotions(prev => ({ ...prev, ...data }))
+        } catch {
+          for (const uuid of batch) requestedMsgEmotionUuidsRef.current.delete(uuid)
+        }
+      }
+    })()
+    return () => { cancelled = true }
+  }, [displayedResults, visibleCount, results.length])
 
   // Fetch stored emotions for user detail messages and merge into msgEmotions
   useEffect(() => {
-    const uuids = userMsgs.map(m => m.msg_uuid).filter((u): u is string => !!u)
+    const uuids = userMsgs
+      .map(m => m.msg_uuid)
+      .filter((u): u is string => !!u && !requestedMsgEmotionUuidsRef.current.has(u))
     if (uuids.length === 0) return
-    apiFetch<Record<string, MsgEmotion>>('/messages/emotions', {
-      method: 'POST',
-      body: JSON.stringify({ msg_uuids: uuids }),
-    }).then(data => setMsgEmotions(prev => ({ ...prev, ...data }))).catch(() => {})
+    let cancelled = false
+    for (const uuid of uuids) requestedMsgEmotionUuidsRef.current.add(uuid)
+    ;(async () => {
+      for (let i = 0; i < uuids.length; i += 500) {
+        const batch = uuids.slice(i, i + 500)
+        try {
+          const data = await fetchMsgEmotionsBatched(batch)
+          if (!cancelled) setMsgEmotions(prev => ({ ...prev, ...data }))
+        } catch {
+          for (const uuid of batch) requestedMsgEmotionUuidsRef.current.delete(uuid)
+        }
+      }
+    })()
+    return () => { cancelled = true }
   }, [userMsgs])
 
   // Sync key state to sessionStorage so it survives navigation and page refresh
-  useEffect(() => { ssSet('sr_results', results) }, [results])
+  useEffect(() => {
+    if (results.length <= 5000) ssSet('sr_results', results)
+    else sessionStorage.removeItem('sr_results')
+  }, [results])
   useEffect(() => { ssSet('sr_query', query) }, [query])
   useEffect(() => { ssSet('sr_match_type', matchType) }, [matchType])
   useEffect(() => { ssSet('sr_date_from', dateFrom) }, [dateFrom])
@@ -983,7 +367,7 @@ export default function SearchPage() {
   // Reset users table page when search result or any filter changes
   useEffect(() => {
     setVisibleUserCount(50)
-  }, [userStats, dropoutStatusFilter, userNameFilter, refineMinMessages, refineMaxMessages, refineMinWeeks,
+  }, [userStats, dropoutStatusFilter, archetypeFilter, secondaryArchetypeFilter, userNameFilter, refineMinMessages, refineMaxMessages, refineMinWeeks,
       refineFirstMsgIn, refineLastMsgFrom, refineAvgWordsMin, refineAvgWordsMax,
       userSortCol, userSortDir])
 
@@ -1036,39 +420,10 @@ export default function SearchPage() {
     })
   }
 
-  const buildTrend = useCallback((data: Message[], bucket: TrendBucket) => {
-    const counts: Record<string, number> = {}
-    const mins: Record<string, string> = {}
-    const maxs: Record<string, string> = {}
-    data.forEach((m) => {
-      if (!m.date) return
-      let key: string
-      if (bucket === 'month') key = m.date.slice(0, 7)
-      else if (bucket === 'day') key = m.date.slice(0, 10)
-      else {
-        const d = new Date(m.date)
-        const monday = new Date(d)
-        monday.setDate(d.getDate() - ((d.getDay() + 6) % 7))
-        key = monday.toISOString().slice(0, 10)
-      }
-      counts[key] = (counts[key] || 0) + 1
-      const day = m.date.slice(0, 10)
-      if (!mins[key] || day < mins[key]) mins[key] = day
-      if (!maxs[key] || day > maxs[key]) maxs[key] = day
-    })
-    const sorted = Object.keys(counts).sort()
-    setTrendData(sorted.map((period) => ({
-      period,
-      count: counts[period],
-      from: mins[period],
-      to: maxs[period],
-    })))
-  }, [])
 
   const fetchBrowsePage = useCallback(async () => {
     if (browseIsFetchingRef.current || !browseHasMoreRef.current) return
     browseIsFetchingRef.current = true
-    setBrowseFetching(true)
     const offset = browseOffsetRef.current
     try {
       const p = new URLSearchParams({ limit: '50', offset: String(offset) })
@@ -1078,12 +433,11 @@ export default function SearchPage() {
       const data = await apiFetch<Message[]>(`/search/range?${p}`)
       setBrowseMessages((prev) => (offset === 0 ? data : [...prev, ...data]))
       browseOffsetRef.current = offset + data.length
-      if (data.length < 50) { browseHasMoreRef.current = false; setBrowseHasMore(false) }
+      if (data.length < 50) { browseHasMoreRef.current = false }
     } catch {
       // silent
     } finally {
       browseIsFetchingRef.current = false
-      setBrowseFetching(false)
     }
   }, [])
 
@@ -1104,8 +458,6 @@ export default function SearchPage() {
     browseHasMoreRef.current = true
     browseIsFetchingRef.current = false
     setBrowseMessages([])
-    setBrowseFetching(false)
-    setBrowseHasMore(true)
     fetchBrowsePage()
   // fetchBrowsePage is stable; we intentionally skip it from deps to avoid double-fire on tab switch
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1126,64 +478,9 @@ export default function SearchPage() {
     return () => observer.disconnect()
   }, [activeTab, browseMessages.length, fetchBrowsePage])
 
-  const formatTrendPeriod = useCallback((period: string) => {
-    if (trendBucket === 'month') {
-      const [y, m] = period.split('-').map(Number)
-      const d = new Date(y, m - 1, 1)
-      return d.toLocaleDateString('en-US', { month: 'short', year: 'numeric' })
-    }
-    if (trendBucket === 'week') {
-      const [y, m, day] = period.split('-').map(Number)
-      const d = new Date(y, m - 1, day)
-      const weekOfMonth = Math.ceil(day / 7)
-      return d.toLocaleDateString('en-US', { month: 'short', year: 'numeric' }) + ` W${weekOfMonth}`
-    }
-    return period
-  }, [trendBucket])
 
-  const browseTokens = useMemo(() => {
-    if (!browseKeywordFilter.trim()) return []
-    return browseKeywordFilter.trim().split(/\s+/).filter(Boolean)
-  }, [browseKeywordFilter])
 
-  const filteredBrowseMessages = useMemo(() => {
-    let msgs = browseMessages
-    if (browseUsernameFilter.trim()) {
-      const lc = browseUsernameFilter.toLowerCase()
-      msgs = msgs.filter((m) => m.username?.toLowerCase().includes(lc))
-    }
-    if (browseTokens.length > 0) {
-      const words = browseTokens.map((w) => w.toLowerCase())
-      msgs = msgs.filter((m) => {
-        const lc = m.content.toLowerCase()
-        return words.some((w) => lc.includes(w))
-      })
-    }
-    return msgs
-  }, [browseMessages, browseUsernameFilter, browseTokens])
 
-  const handleBrowseDownloadCsv = useCallback(async () => {
-    setBrowseExporting(true)
-    try {
-      const p = new URLSearchParams()
-      if (browseDateFrom) p.set('date_from', browseDateFrom)
-      if (browseDateTo) p.set('date_to', browseDateTo)
-      if (scopeParam) p.set('upload_ids', scopeParam)
-      const res = await fetch(`/api/messages/export?${p}`, { credentials: 'include' })
-      if (!res.ok) throw new Error(`Export failed: HTTP ${res.status}`)
-      const blob = await res.blob()
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `chat_export_${new Date().toISOString().slice(0, 10)}.csv`
-      a.click()
-      URL.revokeObjectURL(url)
-    } catch (err) {
-      console.error('CSV export error:', err)
-    } finally {
-      setBrowseExporting(false)
-    }
-  }, [browseDateFrom, browseDateTo, scopeParam])
 
   // Apply text filter + optional chart range filter on top of full results
   const applyFilters = useCallback((
@@ -1191,7 +488,6 @@ export default function SearchPage() {
     mode: FilterMode,
     text: string,
     range: { from: string; to: string; label: string } | null,
-    tokens: string[],
   ) => {
     let filtered = allResults
 
@@ -1216,33 +512,22 @@ export default function SearchPage() {
     }
 
     setDisplayedResults(filtered)
-    setFilterTokens(tokens)
-    const hasFilter = text.trim() || range
-    setFilterCount(hasFilter ? { shown: filtered.length, total: allResults.length } : null)
   }, [])
 
   const runSemanticFilter = useCallback(async (text: string, allResults: Message[]) => {
     if (!text.trim()) {
       setDisplayedResults(allResults)
-      setFilterCount(null)
-      setFilterTokens([])
       return
     }
     if (!localStorage.getItem('openai_api_key')) { setShowKeyModal(true); return }
-    setFilterLoading(true)
     try {
       const data = await apiFetch<Message[]>('/filter/semantic', {
         method: 'POST',
         body: JSON.stringify({ query: text, messages: allResults }),
       })
       setDisplayedResults(data)
-      setFilterTokens([])
-      setFilterCount({ shown: data.length, total: allResults.length })
     } catch {
       setDisplayedResults(allResults)
-      setFilterCount(null)
-    } finally {
-      setFilterLoading(false)
     }
   }, [setShowKeyModal])
 
@@ -1255,108 +540,13 @@ export default function SearchPage() {
         runSemanticFilter(filterText, results)
       }, 500)
     } else {
-      const tokens = computeFilterTokens(filterMode, filterText)
-      applyFilters(results, filterMode, filterText, chartRange, tokens)
+      applyFilters(results, filterMode, filterText, chartRange)
     }
   }, [filterText, filterMode, results, chartRange, applyFilters, runSemanticFilter])
 
-  const handleChartBarClick = (pt: TrendPoint) => {
-    if (chartRange?.from === pt.from) {
-      // Deselect
-      setChartRange(null)
-      const tokens = computeFilterTokens(filterMode, filterText)
-      applyFilters(results, filterMode, filterText, null, tokens)
-    } else {
-      const range = { from: pt.from, to: pt.to, label: pt.period }
-      setChartRange(range)
-      const tokens = computeFilterTokens(filterMode, filterText)
-      applyFilters(results, filterMode, filterText, range, tokens)
-    }
-  }
 
-  const doSearch = useCallback(async () => {
-    setSearching(true)
-    setTimeout(() => resultsAnchorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 30)
-    setError(null)
-    setTrendData([])
-    clearSelected()
-    setFilterText('')
-    setFilterMode('any')
-    setFilterCount(null)
-    setFilterTokens([])
-    setChartRange(null)
-    setAnalysisTab('none')
-    setResults([])
-    setDisplayedResults([])
 
-    // Range tab validation
-    if (activeTab === 'range' && !rangeDateFrom && !rangeDateTo) {
-      setError('Please enter at least one date before searching.')
-      setSearching(false)
-      return
-    }
-
-    try {
-      const params = buildParams()
-      let data: Message[] = []
-      let kw = ''
-      let toks: string[] = []
-
-      if (activeTab === 'keyword') {
-        if (!query.trim()) { setSearching(false); return }
-        params.set('q', query)
-        params.set('match_type', matchType === 'any' ? 'any_word' : matchType)
-        if (filterUsername) params.set('username', filterUsername)
-        data = await apiFetch<Message[]>(`/search/keyword?${params}`)
-        kw = query
-        if (matchType === 'exact') toks = [query]
-        else if (matchType === 'any') toks = query.split(/\s+/).filter(Boolean)
-      } else if (activeTab === 'semantic') {
-        if (!query.trim()) { setSearching(false); return }
-        if (!localStorage.getItem('openai_api_key')) { setShowKeyModal(true); setSearching(false); return }
-        params.set('q', query)
-        if (filterUsername) params.set('username', filterUsername)
-        if (sortBy !== 'similarity') params.set('sort_by', sortBy)
-        const raw = await apiFetch<Message[] | { error: string; results: [] }>(`/search/semantic?${params}`)
-        if (Array.isArray(raw)) {
-          data = raw
-        } else {
-          setError((raw as { error: string }).error || `Semantic search unavailable (${vdbName} may not be running)`)
-          data = []
-        }
-        kw = query
-      } else if (activeTab === 'username') {
-        if (!query.trim()) { setSearching(false); return }
-        params.set('q', query)
-        data = await apiFetch<Message[]>(`/search/username?${params}`)
-      } else if (activeTab === 'range') {
-        const p = new URLSearchParams()
-        if (rangeDateFrom) p.set('date_from', rangeDateFrom)
-        if (rangeDateTo) p.set('date_to', rangeDateTo)
-        if (sunoTeam === 'only') p.set('is_suno_team', 'only')
-        else if (sunoTeam === 'exclude') p.set('is_suno_team', 'exclude')
-        if (minWords > 0) p.set('min_words', String(minWords))
-        if (scopeParam) p.set('upload_ids', scopeParam)
-        p.set('limit', String(maxResults))
-        p.set('offset', String(rangeOffset))
-        data = await apiFetch<Message[]>(`/search/range?${p}`)
-      }
-
-      setResults(data)
-      setDisplayedResults(data)
-      setLastKeyword(kw)
-      setLastTokens(toks)
-      if (data.length > 0) buildTrend(data, trendBucket)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Search failed')
-    } finally {
-      setSearching(false)
-      setDidSearch(true)
-      setTimeout(() => resultsAnchorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 60)
-    }
-  }, [query, activeTab, matchType, filterUsername, buildParams, rangeLimit, rangeOffset, sortBy, trendBucket, setResults, clearSelected, buildTrend, dateFrom, dateTo, rangeDateFrom, rangeDateTo, sunoTeam, minWords, scopeParam, setShowKeyModal])
-
-  // When rendered at /discord/users/:username, auto-load that user's detail panel
+  // When rendered at /discord/search/users/:username, auto-load that user's detail panel
   useEffect(() => {
     if (!routeUsername || routeLoadedRef.current === routeUsername) return
     routeLoadedRef.current = routeUsername
@@ -1369,10 +559,8 @@ export default function SearchPage() {
       setUserDetailMinWords(0)
       setUserDetailPage(0)
       setUserSumResult('')
-      setUserSumVisible(false)
       setUserSumFollowUp([])
       setUserTopicsResult(null)
-      setUserTopicsVisible(false)
       setUserTopicsSteps([])
       setUserEmotionResult(null)
       setStrategyResult(null)
@@ -1441,7 +629,6 @@ export default function SearchPage() {
       setError(err instanceof Error ? err.message : 'Search failed')
     } finally {
       setSearching(false)
-      setDidSearch(true)
       setTimeout(() => resultsAnchorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 60)
     }
   }
@@ -1492,218 +679,11 @@ export default function SearchPage() {
     }
   }
 
-  const handleTabSwitch = (tab: SearchTab) => {
-    localStorage.setItem('search_tab', tab)
-    setActiveTab(tab)
-    setResults([])
-    setDisplayedResults([])
-    setTrendData([])
-    setLastKeyword('')
-    setLastTokens([])
-    setFilterText('')
-    setFilterCount(null)
-    setFilterTokens([])
-    setChartRange(null)
-    setAnalysisTab('none')
-    setDidSearch(false)
-    clearSelected()
-    if (tab === 'browse') {
-      browseOffsetRef.current = 0
-      browseHasMoreRef.current = true
-      browseIsFetchingRef.current = false
-      browseDateFromRef.current = ''
-      browseDateToRef.current = ''
-      browseScopeRef.current = scopeParam
-      setBrowseMessages([])
-      setBrowseFetching(false)
-      setBrowseHasMore(true)
-      setBrowseUsernameFilter('')
-      setBrowseKeywordFilter('')
-      setBrowseDateFrom('')
-      setBrowseDateTo('')
-    }
-  }
 
-  const handleCatSwitch = (cat: SearchCat) => {
-    localStorage.setItem('search_cat', cat)
-    setSearchCat(cat)
-    setResults([])
-    setDisplayedResults([])
-    setUserStats([])
-    setTrendData([])
-    setFilterText('')
-    setFilterCount(null)
-    setFilterTokens([])
-    setChartRange(null)
-    setAnalysisTab('none')
-    setDidSearch(false)
-    clearSelected()
-    // flush browse all data so switching back starts fresh
-    browseOffsetRef.current = 0
-    browseHasMoreRef.current = true
-    browseIsFetchingRef.current = false
-    setBrowseMessages([])
-    setBrowseFetching(false)
-    setBrowseHasMore(true)
-  }
 
-  const exportCSV = () => {
-    const sel = results.filter((r) => selectedIds.has(r.id))
-    const rows = sel.length > 0 ? sel : results
-    if (rows.length === 0) return
 
-    const normSunoTeam = (v: string | boolean | null | undefined): string => {
-      if (v === true) return 'true'
-      if (v === false) return 'false'
-      if (typeof v === 'string' && v.length > 0) {
-        const l = v.toLowerCase()
-        if (l === 'true' || l === '1') return 'true'
-        if (l === 'false' || l === '0') return 'false'
-      }
-      return ''
-    }
 
-    const header = ['id', 'username', 'date', 'content', 'is_suno_team']
-    const lines = rows.map((r) =>
-      [r.id, r.username, r.date, `"${(r.content || '').replace(/"/g, '""')}"`, normSunoTeam(r.is_suno_team)].join(',')
-    )
-    const csv = [header.join(','), ...lines].join('\n')
-    const blob = new Blob([csv], { type: 'text/csv' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
 
-    const isRange = activeTab === 'range'
-    const from = isRange ? rangeDateFrom : dateFrom
-    const to = isRange ? rangeDateTo : dateTo
-    const parts: string[] = ['discord', activeTab]
-    if (from) parts.push(from)
-    if (from && to) parts.push('to')
-    if (to) parts.push(to)
-    if (sunoTeam === 'only') parts.push('suno-only')
-    else if (sunoTeam === 'exclude') parts.push('suno-exclude')
-    if (minWords > 0) parts.push(`min${minWords}w`)
-    a.download = parts.join('_') + '.csv'
-
-    a.click()
-    URL.revokeObjectURL(url)
-  }
-
-  const copySelected = () => {
-    const sel = results.filter((r) => selectedIds.has(r.id))
-    if (sel.length === 0) return
-    const text = sel.map((r) => `[${r.username} @ ${r.date?.slice(0, 19).replace('T', ' ')}]\n${r.content}`).join('\n\n---\n\n')
-    navigator.clipboard.writeText(text)
-  }
-
-  const handleSummarize = () => {
-    if (!localStorage.getItem('openai_api_key')) { setShowKeyModal(true); return }
-    const sel = results.filter((r) => selectedIds.has(r.id))
-    const msgs = sel.length > 0 ? sel : results
-    if (msgs.length === 0) return
-    setSummarizeResult('')
-    setSummarizeFollowUp([])
-    setSummarizeLoading(true)
-    setSrLog([])
-    setShowSrResultsPanel(true)
-
-    if (stopSummarizeRef.current) stopSummarizeRef.current()
-
-    stopSummarizeRef.current = streamEvents(
-      '/summarize-results',
-      {
-        messages: msgs.map((m) => ({ username: m.username, date: m.date, content: m.content, msg_uuid: m.msg_uuid })),
-        prompt: summarizeQuery,
-        model: srModel,
-        retrieval_mode: srRetrievalMode,
-      },
-      (event) => {
-        if (event.type === 'log') {
-          setSrLog((prev) => [...prev, {
-            step: String(event.step ?? ''),
-            label: String(event.label ?? event.step ?? ''),
-            msg: String(event.message ?? event.msg ?? ''),
-          }])
-        } else if (event.content) {
-          setSummarizeResult((prev) => prev + String(event.content))
-        }
-      },
-      () => setSummarizeLoading(false),
-      (err) => {
-        setSummarizeResult(`Error: ${err.message}`)
-        setSummarizeLoading(false)
-      },
-    )
-  }
-
-  const handleSumFollowUp = () => {
-    if (!summarizeFollowUpInput.trim() || summarizeFollowUpLoading) return
-    if (!localStorage.getItem('openai_api_key')) { setShowKeyModal(true); return }
-    const q = summarizeFollowUpInput.trim()
-    setSummarizeFollowUpInput('')
-    setSummarizeFollowUp((prev) => [...prev, { role: 'user', content: q }])
-    setSummarizeFollowUpLoading(true)
-    let answer = ''
-    streamEvents(
-      '/summarize-results/followup',
-      { question: q, summary: summarizeResult, history: summarizeFollowUp },
-      (event) => {
-        if (event.type === 'chunk') {
-          answer += String(event.content ?? '')
-          setSummarizeFollowUp((prev) => {
-            const last = prev[prev.length - 1]
-            if (last?.role === 'assistant') return [...prev.slice(0, -1), { role: 'assistant', content: answer }]
-            return [...prev, { role: 'assistant', content: answer }]
-          })
-        } else if (event.type === 'result') {
-          answer = String(event.content ?? answer)
-          setSummarizeFollowUp((prev) => {
-            const last = prev[prev.length - 1]
-            if (last?.role === 'assistant') return [...prev.slice(0, -1), { role: 'assistant', content: answer }]
-            return [...prev, { role: 'assistant', content: answer }]
-          })
-        }
-      },
-      () => setSummarizeFollowUpLoading(false),
-      (err) => {
-        setSummarizeFollowUp((prev) => [...prev, { role: 'assistant', content: `Error: ${err.message}` }])
-        setSummarizeFollowUpLoading(false)
-      },
-    )
-  }
-
-  const handleExportPDF = () => {
-    if (!summarizeResult) return
-    const win = window.open('', '_blank')
-    if (!win) return
-    win.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Analysis Export</title>
-      <style>
-        body { font-family: Georgia, serif; max-width: 800px; margin: 40px auto; padding: 20px; line-height: 1.6; color: #1a1a1a; }
-        h1, h2, h3 { color: #1e1b4b; }
-        pre { background: #f5f5f5; padding: 12px; border-radius: 4px; overflow-x: auto; }
-        blockquote { border-left: 4px solid #818cf8; margin: 0; padding-left: 16px; color: #555; }
-        .followup { margin-top: 32px; border-top: 2px solid #e5e7eb; padding-top: 16px; }
-        .q { font-weight: bold; color: #3730a3; margin-bottom: 4px; }
-        .a { margin-bottom: 16px; }
-      </style>
-    </head><body>`)
-    win.document.write(`<h1>Analysis Results</h1>`)
-    win.document.write(`<div>${summarizeResult.replace(/\n/g, '<br>')}</div>`)
-    if (summarizeFollowUp.length > 0) {
-      win.document.write(`<div class="followup"><h2>Follow-up Q&amp;A</h2>`)
-      summarizeFollowUp.forEach((h) => {
-        if (h.role === 'user') {
-          win.document.write(`<div class="q">Q: ${h.content}</div>`)
-        } else {
-          win.document.write(`<div class="a">${h.content.replace(/\n/g, '<br>')}</div>`)
-        }
-      })
-      win.document.write(`</div>`)
-    }
-    win.document.write(`</body></html>`)
-    win.document.close()
-    win.print()
-  }
 
   // Filter end date: explicit dateTo or max last_date in dataset
   const filterEndDate = useMemo(() => {
@@ -1735,12 +715,15 @@ export default function SearchPage() {
     return map
   }, [userStats, filterStartDate, filterEndDate])
 
+  // Matched against the RAW dateFrom/dateTo (not the resolved filterStartDate/
+  // filterEndDate, which fall back to the actual last message date and drift
+  // as new data is ingested). Topic runs are cached by the raw window too
+  // (see runBatchTopicForUsers), so archetype lookups/saves must key off the
+  // same raw strings or an open-ended phase (dateTo === '') never matches.
   const currentBatchPhaseKey = useMemo(() => {
-    const matched = PHASE_DEFS.find(def =>
-      def.from === filterStartDate && (def.to === filterEndDate || (!def.to && !filterEndDate))
-    )
-    return matched ? matched.key : `custom|${filterStartDate || 'start'}|${filterEndDate || 'end'}`
-  }, [filterStartDate, filterEndDate])
+    const matched = PHASE_DEFS.find(def => def.from === dateFrom && def.to === dateTo)
+    return matched ? matched.key : `custom|${dateFrom || 'start'}|${dateTo || 'end'}`
+  }, [PHASE_DEFS, dateFrom, dateTo])
 
   // Cross-phase transition map: for users relative to the previous phase
   const crossPhaseMap = useMemo(() => {
@@ -1773,44 +756,139 @@ export default function SearchPage() {
     return result
   }, [PHASE_DEFS, currentBatchPhaseKey, phaseData, userStats, dropoutMap])
 
-  const dropoutUsersFromPrev = useMemo(() =>
-    [...crossPhaseMap.entries()].filter(([, v]) => v.startsWith('dropout-')).map(([u]) => u).sort()
-  , [crossPhaseMap])
 
   useEffect(() => {
-    apiFetch<{ username: string; method: string; persona: string; confidence: number; reasoning: string; created_at?: string }[]>(
-      `/persona/by-phase?phase=${encodeURIComponent(currentBatchPhaseKey)}`
+    apiFetch<{
+      username: string; method: string;
+      persona: string; confidence: number;
+      secondary_persona?: string | null; secondary_confidence?: number | null;
+      reasoning: string; created_at?: string;
+    }[]>(
+      `/persona/by-phase?phase=${encodeURIComponent(currentBatchPhaseKey)}&method=archetype`
     )
       .then(rows => {
-        const map: Record<string, { rule_based?: PersonaResult; llm?: PersonaResult }> = {}
+        const map: Record<string, PersonaResult> = {}
         for (const r of rows) {
-          if (!map[r.username]) map[r.username] = {}
-          const pr: PersonaResult = { persona: r.persona, confidence: r.confidence, reasoning: r.reasoning, created_at: r.created_at }
-          if (r.method === 'rule_based') map[r.username].rule_based = pr
-          else if (r.method === 'llm') map[r.username].llm = pr
+          map[r.username] = {
+            persona: r.persona,
+            confidence: r.confidence,
+            secondary_persona: r.secondary_persona ?? null,
+            secondary_confidence: r.secondary_confidence ?? null,
+            reasoning: r.reasoning,
+            created_at: r.created_at,
+          }
         }
         setTablePersonas(map)
       })
       .catch(() => {})
   }, [currentBatchPhaseKey])
 
-  // Load BERTopic results from IndexedDB for all users in the current search
+  // Fetch per-phase sentiment aggregate + refresh archetype summary whenever new phases are loaded
+  useEffect(() => {
+    const loadedKeys = Object.keys(phaseData)
+    if (loadedKeys.length === 0) return
+    const payload = loadedKeys.map(key => {
+      const def = PHASE_DEFS.find(p => p.key === key)
+      if (!def) return null
+      return { phase: key, date_from: def.from, date_to: def.to }
+    }).filter(Boolean)
+    if (payload.length > 0) {
+      apiFetch<typeof phaseSentiment>('/persona/phase-sentiment', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }).then(d => setPhaseSentiment(d)).catch(() => {})
+    }
+    // Also refresh archetype summary so Section C populates without needing to open the Archetype tab
+    apiFetch<typeof personaSummary>('/persona/phase-summary?method=archetype')
+      .then(d => setPersonaSummary(d))
+      .catch(() => {})
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phaseData])
+
+  // Fetch per-phase archetypes from DB for the cross-tab visualization
+  useEffect(() => {
+    const toFetch = Object.keys(phaseData).filter(k => !(k in phasePersonas))
+    for (const key of toFetch) {
+      apiFetch<{ username: string; persona: string; secondary_persona?: string }[]>(
+        `/persona/by-phase?phase=${encodeURIComponent(key)}&method=archetype`
+      ).then(rows => {
+        const map: Record<string, string> = {}
+        const secMap: Record<string, string> = {}
+        for (const r of rows) {
+          map[r.username] = r.persona
+          if (r.secondary_persona) secMap[r.username] = r.secondary_persona
+        }
+        setPhasePersonas(prev => ({ ...prev, [key]: map }))
+        setPhaseSecondaryPersonas(prev => ({ ...prev, [key]: secMap }))
+      }).catch(() => {})
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phaseData])
+
+  // Map a message date string to the phase key it falls in
+  const dateToPhaseKey = useCallback((date: string): string | null => {
+    const d = date?.slice(0, 10) ?? ''
+    if (!d) return null
+    for (const def of PHASE_DEFS) {
+      if (d >= def.from && (!def.to || d <= def.to)) return def.key
+    }
+    return null
+  }, [PHASE_DEFS])
+
+  // Track which phase persona requests have been fired to avoid duplicate fetches
+  const requestedPhasePersonasRef = useRef(new Set<string>())
+
+  // When search results arrive, pre-fetch phase personas for any phase represented in results
+  useEffect(() => {
+    if (results.length === 0) return
+    const phaseKeys = new Set<string>()
+    for (const msg of results) {
+      const key = dateToPhaseKey(msg.date ?? '')
+      if (key) phaseKeys.add(key)
+    }
+    for (const key of phaseKeys) {
+      if (requestedPhasePersonasRef.current.has(key)) continue
+      requestedPhasePersonasRef.current.add(key)
+      apiFetch<{ username: string; persona: string; secondary_persona?: string }[]>(
+        `/persona/by-phase?phase=${encodeURIComponent(key)}&method=archetype`
+      ).then(rows => {
+        const map: Record<string, string> = {}
+        const secMap: Record<string, string> = {}
+        for (const r of rows) {
+          map[r.username] = r.persona
+          if (r.secondary_persona) secMap[r.username] = r.secondary_persona
+        }
+        setPhasePersonas(prev => ({ ...prev, [key]: map }))
+        setPhaseSecondaryPersonas(prev => ({ ...prev, [key]: secMap }))
+      }).catch(() => {})
+    }
+  }, [results, dateToPhaseKey])
+
+  // Load BERTopic results from DB for all users in the current search
   useEffect(() => {
     if (userStats.length === 0) { setTableTopics({}); return }
     let cancelled = false
-    const load = async () => {
+    const body: Record<string, unknown> = { usernames: userStats.map(u => u.username) }
+    // Use raw dateFrom/dateTo (not computed filterStartDate/filterEndDate) so that
+    // open-ended phases (3, 3D) with empty dateTo match topic runs saved by the
+    // user-detail panel which also uses empty date_to.
+    if (dateFrom) body.date_from = dateFrom
+    if (dateTo) body.date_to = dateTo
+    if (scopeParam) body.upload_ids = scopeParam
+    apiFetch<{ results: Record<string, UserTopicsResult | null> }>(
+      '/topics/batch-get',
+      { method: 'POST', body: JSON.stringify(body) }
+    ).then(data => {
+      if (cancelled) return
       const entries: Record<string, UserTopicsResult> = {}
-      await Promise.all(userStats.map(async (u) => {
-        const key = makeBertopicKey(u.username, filterStartDate, filterEndDate, scopeParam)
-        const result = await getBertopicResult(key).catch(() => null)
-        if (result) entries[u.username] = result
-      }))
-      if (!cancelled) setTableTopics(entries)
-    }
-    load()
+      for (const [username, result] of Object.entries(data.results)) {
+        if (result) entries[username] = result
+      }
+      setTableTopics(entries)
+    }).catch(() => {})
     return () => { cancelled = true }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [userStats, filterStartDate, filterEndDate, scopeParam])
+  }, [userStats, dateFrom, dateTo, scopeParam])
 
   const filteredUsers = userStats.filter((u) => {
     if (userNameFilter.trim() && !u.username.toLowerCase().includes(userNameFilter.trim().toLowerCase())) return false
@@ -1832,6 +910,27 @@ export default function SearchPage() {
         const info = dropoutMap.get(u.username)
         if (!info || info.level !== dropoutStatusFilter) return false
       }
+    }
+    if (archetypeFilter !== 'all') {
+      const p = tablePersonas[u.username]
+      if (!p || p.persona !== archetypeFilter) return false
+    }
+    if (secondaryArchetypeFilter !== 'all') {
+      const p = tablePersonas[u.username]
+      const sec = p?.secondary_persona ?? 'None'
+      if (sec !== secondaryArchetypeFilter) return false
+    }
+    if (showOnlyFailedTopics) {
+      const t = tableTopics[u.username]
+      // Only show users where BERTopic actually failed (warning + non-empty fallback topics).
+      // Exclude users whose warning is just "no meaningful content" (topics array is empty).
+      if (!t?.warning || (t.topics?.length ?? 0) === 0) return false
+    }
+    if (showOnlyAnomalyTopics) {
+      const topics = (tableTopics[u.username]?.topics ?? []).filter(tp => tp.id !== -1)
+      const topicCount = topics.length
+      const msgCount = u.total_messages ?? 0
+      if (topicCount === 0 || msgCount === 0 || topicCount <= msgCount) return false
     }
     return true
   })
@@ -1864,11 +963,10 @@ export default function SearchPage() {
     setRefineAvgWordsMin('')
     setRefineAvgWordsMax('')
     setDropoutStatusFilter('all')
+    setArchetypeFilter('all')
+    setSecondaryArchetypeFilter('all')
   }
 
-  const toggleAnalysisTab = (tab: 'summarize' | 'viz') => {
-    setAnalysisTab((prev) => prev === tab ? 'none' : tab)
-  }
 
   // User detail derived state
   const userDetailFiltered = useMemo(() => {
@@ -2008,23 +1106,28 @@ export default function SearchPage() {
     setUserTopicsResult(null)
     setUserEmotionResult(null)
 
-    // Try BERTopic from IndexedDB for this date range
-    const bertopicKey = makeBertopicKey(selectedUser.username, userDetailDateFrom, userDetailDateTo, scopeParam)
-    getBertopicResult(bertopicKey)
-      .then(cached => {
-        if (cached) {
-          setUserTopicsResult(cached)
-          setUserTopicsVisible(true)
+    // Try BERTopic from in-memory cache or DB for this date range
+    const mem = topicsCacheRef.current.get(currentKey)
+    if (mem) {
+      setUserTopicsResult(mem.result)
+    } else {
+      setTopicsDbLoading(true)
+      const topicsParams = new URLSearchParams()
+      if (userDetailDateFrom) topicsParams.set('date_from', userDetailDateFrom)
+      if (userDetailDateTo) topicsParams.set('date_to', userDetailDateTo)
+      if (scopeParam) topicsParams.set('upload_ids', scopeParam)
+      apiFetch<UserTopicsResult | null>(
+        `/topics/user/${encodeURIComponent(selectedUser.username)}?${topicsParams}`
+      ).then(result => {
+        if (result) {
+          setUserTopicsResult(result)
           topicsCacheRef.current.set(currentKey, {
-            result: cached,
+            result,
             uuids: new Set(userMsgs.map(m => m.msg_uuid ?? '')),
           })
-        } else {
-          const mem = topicsCacheRef.current.get(currentKey)
-          if (mem) { setUserTopicsResult(mem.result); setUserTopicsVisible(true) }
         }
-      })
-      .catch(() => null)
+      }).catch(() => {}).finally(() => setTopicsDbLoading(false))
+    }
 
     // Restore emotion — try IndexedDB, then in-memory cache, then stored DB rows
     const emotionFilteredUuids = userMsgs
@@ -2132,12 +1235,11 @@ export default function SearchPage() {
 
   const openUserDetail = async (u: UserInRange) => {
     // Capture filter values before state updates so we can build the cache key
-    const initialTopicsKey = makeBertopicKey(u.username, dateFrom, dateTo, scopeParam)
     const initialAnalysisKey = makeAnalysisKey(u.username, dateFrom, dateTo)
     openedWithKeyRef.current = initialAnalysisKey
     // Mark as loaded so the route effect doesn't double-fetch when the URL changes
     routeLoadedRef.current = u.username
-    navigate(`/discord/users/${encodeURIComponent(u.username)}`)
+    navigate(`/discord/search/users/${encodeURIComponent(u.username)}`)
 
     setSelectedUser(u)
     setUserMsgsLoading(true)
@@ -2147,12 +1249,11 @@ export default function SearchPage() {
     setUserDetailContains('')
     setUserDetailMinWords(0)
     setUserSumResult('')
-    setUserSumVisible(false)
     setUserSumFollowUp([])
     setUserDetailPage(0)
     setUserTopicsResult(null)
-    setUserTopicsVisible(false)
     setUserTopicsSteps([])
+    setTopicsDbLoading(true)
     setUserEmotionResult(null)
     setEmotionMsgFilter(null)
     setSelectedTopicIds(null)
@@ -2169,31 +1270,48 @@ export default function SearchPage() {
       const userMsgParams = new URLSearchParams({ username: u.username, limit: '1000000' })
       if (scopeParam) userMsgParams.set('upload_ids', scopeParam)
 
-      // Fetch messages, BERTopic cache, and saved personas in parallel
+      // Fetch messages, BERTopic from DB, and saved personas in parallel
+      const topicsParams = new URLSearchParams()
+      if (dateFrom) topicsParams.set('date_from', dateFrom)
+      if (dateTo) topicsParams.set('date_to', dateTo)
+      if (scopeParam) topicsParams.set('upload_ids', scopeParam)
       const [data, cachedTopics, savedPersonas] = await Promise.all([
         apiFetch<Message[]>(`/search/user-messages?${userMsgParams}`),
-        getBertopicResult(initialTopicsKey).catch(() => null),
-        apiFetch<{ phase: string; method: string; persona: string; confidence: number; reasoning: string; created_at: string }[]>(
-          `/persona/user/${encodeURIComponent(u.username)}`
-        ).catch(() => [] as { phase: string; method: string; persona: string; confidence: number; reasoning: string; created_at: string }[]),
+        apiFetch<UserTopicsResult | null>(
+          `/topics/user/${encodeURIComponent(u.username)}?${topicsParams}`
+        ).catch(() => null),
+        apiFetch<{
+          phase: string; method: string; persona: string; confidence: number;
+          secondary_persona?: string | null; secondary_confidence?: number | null;
+          reasoning: string; created_at: string;
+        }[]>(
+          `/persona/user/${encodeURIComponent(u.username)}?method=archetype`
+        ).catch(() => [] as Array<{
+          phase: string; method: string; persona: string; confidence: number;
+          secondary_persona?: string | null; secondary_confidence?: number | null;
+          reasoning: string; created_at: string;
+        }>),
       ])
-      // Organize saved personas into per-phase map
+      // Organize saved personas into per-phase map (single archetype per phase)
       if (savedPersonas.length > 0) {
         const personaMap: UserPersonas = {}
         for (const p of savedPersonas) {
-          if (!personaMap[p.phase]) personaMap[p.phase] = {}
-          personaMap[p.phase][p.method as 'rule_based' | 'llm'] = {
-            persona: p.persona, confidence: p.confidence, reasoning: p.reasoning, created_at: p.created_at,
+          personaMap[p.phase] = {
+            persona: p.persona,
+            confidence: p.confidence,
+            secondary_persona: p.secondary_persona ?? null,
+            secondary_confidence: p.secondary_confidence ?? null,
+            reasoning: p.reasoning,
+            created_at: p.created_at,
           }
         }
         setUserPersonas(personaMap)
       }
       setUserMsgs(data)
 
-      // Restore BERTopic from IndexedDB
+      // Restore BERTopic from DB / in-memory cache
       if (cachedTopics) {
         setUserTopicsResult(cachedTopics)
-        setUserTopicsVisible(true)
         topicsCacheRef.current.set(initialAnalysisKey, {
           result: cachedTopics,
           uuids: new Set(data.map(m => m.msg_uuid ?? '')),
@@ -2203,9 +1321,9 @@ export default function SearchPage() {
         const mem = topicsCacheRef.current.get(initialAnalysisKey)
         if (mem) {
           setUserTopicsResult(mem.result)
-          setUserTopicsVisible(true)
         }
       }
+      setTopicsDbLoading(false)
 
       // Restore emotion — try IndexedDB, then in-memory cache, then stored DB rows
       const emotionFilteredUuids = data
@@ -2245,6 +1363,8 @@ export default function SearchPage() {
           }
         }
       }
+    } catch {
+      setTopicsDbLoading(false)
     } finally {
       setUserMsgsLoading(false)
     }
@@ -2256,12 +1376,11 @@ export default function SearchPage() {
     setUserSumResult('')
     setUserSumFollowUp([])
     setUserSumLoading(true)
-    setUserSumVisible(true)
     if (userSumStopRef.current) userSumStopRef.current()
     userSumStopRef.current = streamEvents(
       '/summarize-results',
       {
-        messages: userDetailFiltered.map(m => ({ username: m.username, date: m.date, content: m.content })),
+        messages: userDetailFiltered.map(m => ({ username: m.username, date: m.date, content: m.content, msg_uuid: m.msg_uuid })),
         prompt: userSumInstructions,
         model: userSumModel,
         retrieval_mode: userSumRetrievalMode,
@@ -2283,7 +1402,6 @@ export default function SearchPage() {
     setUserAnalysisTab('topics')
     setUserTopicsLoading(true)
     setUserTopicsResult(null)
-    setUserTopicsVisible(true)
     setExpandedTopicSamples(new Set())
     setUserTopicsSteps([
       { stage: 'prepare',          status: 'pending', message: 'Collecting messages…' },
@@ -2296,10 +1414,16 @@ export default function SearchPage() {
     const docs = msgs.map(m => m.content)
     const msg_uuids = msgs.map(m => m.msg_uuid ?? '')
     const username = selectedUser.username
-    const topicsKey = makeBertopicKey(username, userDetailDateFrom, userDetailDateTo, scopeParam)
     topicsStopRef.current = streamEvents(
       '/user-topics/stream',
-      { docs, msg_uuids },
+      {
+        docs,
+        msg_uuids,
+        username,
+        date_from: userDetailDateFrom || undefined,
+        date_to: userDetailDateTo || undefined,
+        upload_ids: scopeParam || undefined,
+      },
       (event) => {
         const stage = event.stage as string
         const status = event.status as string
@@ -2309,8 +1433,8 @@ export default function SearchPage() {
           setUserTopicsResult(result)
           const allUuids = new Set(userDetailFiltered.map(m => m.msg_uuid ?? ''))
           topicsCacheRef.current.set(topicsAnalysisKey, { result, uuids: allUuids })
-          // Persist to IndexedDB
-          saveBertopicResult(topicsKey, result).catch(console.error)
+          // Also update the table column live
+          setTableTopics(prev => ({ ...prev, [username]: result }))
         }
         setUserTopicsSteps(prev =>
           prev.map(s => s.stage === stage ? { ...s, status: status as TopicPipelineStep['status'], message } : s)
@@ -2338,7 +1462,6 @@ export default function SearchPage() {
     setUserAnalysisTab('emotion')
     setUserEmotionLoading(true)
     setUserEmotionResult(null)
-    const username = selectedUser.username
     try {
       const result = await apiFetch<EmotionResult>('/user-emotion', {
         method: 'POST',
@@ -2368,124 +1491,349 @@ export default function SearchPage() {
     }
   }
 
-  const classifyPersona = async (
-    phaseKey: string,
-    phaseLabel: string,
-    features: {
-      msg_count: number; avg_words: number; pct_weeks: number; weeks_active: number
-      dropout_status: string | null
-      sentiment_positive: number | null; sentiment_negative: number | null; sentiment_neutral: number | null
-      top_emotions: string[] | null; top_topics: string[] | null
-    },
-    sampleMessages: { content: string; date: string }[],
-    methods: ('rule_based' | 'llm')[],
+  // Single shared archetype response shape from POST /persona/compute-batch
+  type ArchetypeRow = {
+    username: string
+    persona: string
+    confidence: number
+    secondary_persona?: string | null
+    secondary_confidence?: number | null
+    reasoning: string
+    scores?: Record<string, number>
+  }
+
+  // Helper: build the `users` payload for compute-batch from a UserInRange list.
+  // Pulls activity stats AND the precomputed engagement level — backend uses
+  // the engagement string as its authoritative tier signal (only "high" users
+  // are eligible for Power Contributor).  Without this, percentile-rank-based
+  // tiering on the backend lets low-volume users in quiet phases slip into PC.
+  const buildUsersPayload = (
+    users: UserInRange[],
+    windowFrom?: string,
+    windowTo?: string,
   ) => {
-    if (!selectedUser) return
-    const key = `${phaseKey}:${methods.join(',')}`
-    setPersonaClassifying(prev => new Set([...prev, key]))
+    const from = windowFrom ?? filterStartDate
+    const to   = windowTo   ?? filterEndDate
+    return users.map(u => ({
+      username:       u.username,
+      total_messages: u.total_messages,
+      weeks_active:   u.weeks_active ?? 0,
+      pct_weeks:      u.pct_weeks ?? 0,
+      avg_words:      u.avg_words ?? 0,
+      engagement:     classifyEngagement(u, from, to).level,  // "high"|"medium"|"low"
+    }))
+  }
+
+  // Recompute archetypes for a batch of users in one round-trip.  Replaces the
+  // old per-user /persona/classify loop (rule_based + LLM); now everything is
+  // computed server-side from already-stored sentiment + topics + activity.
+  const computeBatchArchetypes = async (users: UserInRange[]) => {
+    if (batchPersonaClassifying || users.length === 0) return
+    // Match against the RAW dateFrom/dateTo — same reasoning as currentBatchPhaseKey:
+    // topic runs are cached under the raw window, so the compute-batch request must
+    // send that same raw window (and a stable phase key) or an open-ended phase
+    // (dateTo === '') never finds its topics and the custom-key fallback drifts
+    // every time filterEndDate resolves to a newer "last message" date.
+    const matched = PHASE_DEFS.find(def => def.from === dateFrom && def.to === dateTo)
+    const phaseKey   = matched ? matched.key   : `custom|${dateFrom || 'start'}|${dateTo || 'end'}`
+    const phaseLabel = matched ? matched.label : `${dateFrom || 'start'} → ${dateTo || 'present'}`
+
+    setBatchPersonaClassifying(true)
+    setBatchPersonaProgress({ done: 0, total: users.length, errors: 0 })
     try {
-      const result = await apiFetch<{
-        rule_based?: PersonaResult; llm?: PersonaResult
-      }>('/persona/classify', {
-        method: 'POST',
-        body: JSON.stringify({
-          username: selectedUser.username,
-          phase: phaseKey,
-          phase_label: phaseLabel,
-          features,
-          sample_messages: sampleMessages.slice(0, 15),
-          methods,
-        }),
-      })
-      setUserPersonas(prev => {
-        const next = { ...prev, [phaseKey]: { ...(prev[phaseKey] ?? {}) } }
-        if (result.rule_based) next[phaseKey].rule_based = result.rule_based
-        if (result.llm) next[phaseKey].llm = result.llm
+      const resp = await apiFetch<{ results: ArchetypeRow[]; count: number }>(
+        '/persona/compute-batch',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            phase: phaseKey,
+            phase_label: phaseLabel,
+            date_from: dateFrom || undefined,
+            date_to: dateTo || undefined,
+            upload_ids: scopeParam || undefined,
+            users: buildUsersPayload(users),
+          }),
+        }
+      )
+      // Single bulk update of tablePersonas — no per-user setState churn
+      setTablePersonas(prev => {
+        const next = { ...prev }
+        for (const r of resp.results) {
+          next[r.username] = {
+            persona: r.persona,
+            confidence: r.confidence,
+            secondary_persona: r.secondary_persona ?? null,
+            secondary_confidence: r.secondary_confidence ?? null,
+            reasoning: r.reasoning,
+          }
+        }
         return next
       })
+      setBatchPersonaProgress({ done: resp.results.length, total: users.length, errors: 0 })
     } catch (err) {
-      console.error('Persona classification failed:', err)
+      console.error('Archetype batch compute failed:', err)
+      setBatchPersonaProgress({ done: 0, total: users.length, errors: users.length })
+    } finally {
+      setBatchPersonaClassifying(false)
+    }
+
+    // Refresh aggregate summary so Persona tab updates
+    apiFetch<typeof personaSummary>('/persona/phase-summary?method=archetype')
+      .then(d => setPersonaSummary(d))
+      .catch(() => {})
+  }
+
+  // Recompute archetypes for ALL users in a specific phase (called from Phase Summary table).
+  const reanalyzePhaseFull = async (phaseKey: string, phaseLabel: string, phaseFrom: string, phaseTo: string) => {
+    if (reanalyzingPhases.has(phaseKey)) return
+    const users = phaseData[phaseKey] ?? []
+    if (users.length === 0) return
+    // phaseTo is the RAW phase end (empty for an open-ended phase like 3D) — it
+    // must stay raw in the request body so it matches the window topics were
+    // cached under. But classifyEngagement needs a real end date to compute
+    // windowDays; feeding it '' makes daysBetween() return NaN (new Date('') is
+    // Invalid Date), which forces every user's engagement to "low". Resolve a
+    // real end date from the loaded batch's own data just for that calculation.
+    const engagementEnd = phaseTo || users.reduce((mx, u) =>
+      (u.last_date && u.last_date > mx ? u.last_date.slice(0, 10) : mx), '')
+    setReanalyzingPhases(prev => new Set([...prev, phaseKey]))
+    try {
+      const resp = await apiFetch<{ results: ArchetypeRow[] }>(
+        '/persona/compute-batch',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            phase: phaseKey,
+            phase_label: phaseLabel,
+            date_from: phaseFrom || undefined,
+            date_to: phaseTo || undefined,
+            upload_ids: scopeParam || undefined,
+            users: buildUsersPayload(users, phaseFrom, engagementEnd),
+          }),
+        }
+      )
+      // Update per-phase persona maps so the cross-phase visualization refreshes immediately
+      const map: Record<string, string> = {}
+      const secMap: Record<string, string> = {}
+      for (const r of resp.results) {
+        map[r.username] = r.persona
+        if (r.secondary_persona) secMap[r.username] = r.secondary_persona
+      }
+      setPhasePersonas(prev => ({ ...prev, [phaseKey]: map }))
+      setPhaseSecondaryPersonas(prev => ({ ...prev, [phaseKey]: secMap }))
+      // Refresh the aggregate summary counts shown in the table
+      apiFetch<typeof personaSummary>('/persona/phase-summary?method=archetype')
+        .then(d => setPersonaSummary(d))
+        .catch(() => {})
+    } catch (err) {
+      console.error('Phase reanalyze failed:', err)
+    } finally {
+      setReanalyzingPhases(prev => { const next = new Set(prev); next.delete(phaseKey); return next })
+    }
+  }
+
+  // Recompute archetype for the currently-selected user in a single phase.
+  // Uses the same batch endpoint with a one-user payload so all rules stay in one place.
+  const recomputeOneArchetype = async (phaseKey: string, phaseLabel: string, phaseFrom: string, phaseTo: string) => {
+    if (!selectedUser) return
+    // Prefer per-phase stats (so total_messages / weeks_active reflect THIS phase,
+    // not the global filter window).  Fall back to userStats if per-phase data
+    // hasn't been fetched yet.
+    const phaseUsers = phaseData[phaseKey] ?? []
+    const u = phaseUsers.find(x => x.username === selectedUser.username)
+            ?? userStats.find(x => x.username === selectedUser.username)
+    if (!u) return
+    // phaseTo is the RAW phase end (empty for an open-ended phase like 3D) — kept
+    // raw in the request body so it matches the window topics were cached under.
+    // But classifyEngagement needs a real end date: feeding it '' makes
+    // daysBetween() return NaN, forcing engagement to "low" for every user.
+    // Resolve a real end date from whichever batch we found `u` in.
+    const engagementUsers = phaseUsers.length > 0 ? phaseUsers : userStats
+    const engagementEnd = phaseTo || engagementUsers.reduce((mx, x) =>
+      (x.last_date && x.last_date > mx ? x.last_date.slice(0, 10) : mx), '')
+    setPersonaClassifying(prev => new Set([...prev, phaseKey]))
+    try {
+      const resp = await apiFetch<{ results: ArchetypeRow[] }>(
+        '/persona/compute-batch',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            phase: phaseKey,
+            phase_label: phaseLabel,
+            date_from: phaseFrom || undefined,
+            date_to: phaseTo || undefined,
+            upload_ids: scopeParam || undefined,
+            users: buildUsersPayload([u], phaseFrom, engagementEnd),  // engagement scoped to phase window
+          }),
+        }
+      )
+      const r = resp.results[0]
+      if (r) {
+        setUserPersonas(prev => ({
+          ...prev,
+          [phaseKey]: {
+            persona: r.persona,
+            confidence: r.confidence,
+            secondary_persona: r.secondary_persona ?? null,
+            secondary_confidence: r.secondary_confidence ?? null,
+            reasoning: r.reasoning,
+          },
+        }))
+      }
+    } catch (err) {
+      console.error('Archetype recompute failed:', err)
     } finally {
       setPersonaClassifying(prev => {
-        const next = new Set(prev); next.delete(key); return next
+        const next = new Set(prev); next.delete(phaseKey); return next
       })
     }
   }
 
-  const batchClassifyPersonas = async (method: 'rule_based' | 'llm') => {
-    if (batchPersonaClassifying || filteredUsers.length === 0) return
-    // Determine the phase key from the current filter dates
-    const matched = PHASE_DEFS.find(def =>
-      def.from === filterStartDate && (def.to === filterEndDate || (!def.to && !filterEndDate))
-    )
-    const phaseKey   = matched ? matched.key   : `custom|${filterStartDate || 'start'}|${filterEndDate || 'end'}`
-    const phaseLabel = matched ? matched.label : `${filterStartDate || 'start'} → ${filterEndDate || 'present'}`
-
-    setBatchPersonaClassifying(true)
-    setBatchPersonaProgress({ done: 0, total: filteredUsers.length, errors: 0 })
-    let errors = 0
-
-    for (let i = 0; i < filteredUsers.length; i++) {
-      const u = filteredUsers[i]
-      const di = dropoutMap.get(u.username)
-      try {
-        let sampleMessages: { content: string; date: string }[] = []
-        if (method === 'llm') {
-          const params = new URLSearchParams({ username: u.username, limit: '20' })
-          if (scopeParam) params.set('upload_ids', scopeParam)
-          if (filterStartDate) params.set('date_from', filterStartDate)
-          if (filterEndDate) params.set('date_to', filterEndDate)
-          const msgs = await apiFetch<Message[]>(`/search/user-messages?${params}`).catch(() => [] as Message[])
-          sampleMessages = msgs.slice(-15).map(m => ({ content: m.content, date: m.date ?? '' }))
+  // Apply a new label to a single topic — updates DB and local state for both
+  // the per-user detail view (userTopicsResult) and the result-table snapshot
+  // (tableTopics) so the rename is visible everywhere immediately.
+  const applyTopicLabelLocally = (topicId: number, newLabel: string) => {
+    setUserTopicsResult(prev => prev ? {
+      ...prev,
+      topics: prev.topics.map(t => t.id === topicId ? { ...t, label: newLabel } : t),
+    } : prev)
+    if (selectedUser) {
+      setTableTopics(prev => {
+        const existing = prev[selectedUser.username]
+        if (!existing) return prev
+        return {
+          ...prev,
+          [selectedUser.username]: {
+            ...existing,
+            topics: existing.topics.map(t => t.id === topicId ? { ...t, label: newLabel } : t),
+          },
         }
-        await apiFetch('/persona/classify', {
-          method: 'POST',
-          body: JSON.stringify({
-            username: u.username,
-            phase: phaseKey,
-            phase_label: phaseLabel,
-            features: {
-              msg_count: u.total_messages,
-              avg_words: u.avg_words ?? 0,
-              pct_weeks: u.pct_weeks ?? 0,
-              weeks_active: u.weeks_active ?? 0,
-              dropout_status: di?.level ?? null,
-              sentiment_positive: null,
-              sentiment_negative: null,
-              sentiment_neutral: null,
-              top_emotions: null,
-              top_topics: null,
-            },
-            sample_messages: sampleMessages,
-            methods: [method],
-          }),
-        })
-      } catch {
-        errors++
-      }
-      setBatchPersonaProgress({ done: i + 1, total: filteredUsers.length, errors })
-    }
-
-    setBatchPersonaClassifying(false)
-    // Refresh aggregate summary so Persona tab updates
-    apiFetch<typeof personaSummary>('/persona/phase-summary')
-      .then(d => setPersonaSummary(d))
-      .catch(() => {})
-    // Refresh table persona columns
-    apiFetch<{ username: string; method: string; persona: string; confidence: number; reasoning: string; created_at?: string }[]>(
-      `/persona/by-phase?phase=${encodeURIComponent(phaseKey)}`
-    )
-      .then(rows => {
-        const map: Record<string, { rule_based?: PersonaResult; llm?: PersonaResult }> = {}
-        for (const r of rows) {
-          if (!map[r.username]) map[r.username] = {}
-          const pr: PersonaResult = { persona: r.persona, confidence: r.confidence, reasoning: r.reasoning, created_at: r.created_at }
-          if (r.method === 'rule_based') map[r.username].rule_based = pr
-          else if (r.method === 'llm') map[r.username].llm = pr
-        }
-        setTablePersonas(map)
       })
-      .catch(() => {})
+    }
+  }
+
+  const saveTopicLabel = async (topicId: number, label: string) => {
+    if (!selectedUser || !label.trim()) return
+    try {
+      await apiFetch('/topics/label', {
+        method: 'POST',
+        body: JSON.stringify({
+          username:   selectedUser.username,
+          topic_id:   topicId,
+          date_from:  userDetailDateFrom || undefined,
+          date_to:    userDetailDateTo   || undefined,
+          upload_ids: scopeParam         || undefined,
+          label:      label.trim(),
+        }),
+      })
+      applyTopicLabelLocally(topicId, label.trim())
+    } catch (err) {
+      console.error('Topic label save failed:', err)
+      window.alert('Failed to save label — see console for details.')
+    } finally {
+      setEditingTopicId(null)
+      setEditingLabelValue('')
+    }
+  }
+
+  const relabelTopicWithAI = async (topicId: number) => {
+    if (!selectedUser) return
+    setRelabelingTopicId(topicId)
+    try {
+      const resp = await apiFetch<{ label: string }>('/topics/relabel', {
+        method: 'POST',
+        body: JSON.stringify({
+          username:   selectedUser.username,
+          topic_id:   topicId,
+          date_from:  userDetailDateFrom || undefined,
+          date_to:    userDetailDateTo   || undefined,
+          upload_ids: scopeParam         || undefined,
+        }),
+      })
+      applyTopicLabelLocally(topicId, resp.label)
+    } catch (err) {
+      console.error('AI relabel failed:', err)
+      window.alert('AI relabel failed — check OpenAI key and console.')
+    } finally {
+      setRelabelingTopicId(null)
+    }
+  }
+
+  const relabelTopicInTable = async (username: string, topicId: number, silent = false) => {
+    setRelabelingInTable(prev => {
+      const s = new Set(prev[username] ?? [])
+      s.add(topicId)
+      return { ...prev, [username]: s }
+    })
+    try {
+      const resp = await apiFetch<{ label: string }>('/topics/relabel', {
+        method: 'POST',
+        body: JSON.stringify({
+          username,
+          topic_id:   topicId,
+          date_from:  filterStartDate || undefined,
+          date_to:    filterEndDate   || undefined,
+          upload_ids: scopeParam      || undefined,
+        }),
+      })
+      setTableTopics(prev => {
+        const t = prev[username]
+        if (!t) return prev
+        return { ...prev, [username]: { ...t, topics: t.topics.map(tp => tp.id === topicId ? { ...tp, label: resp.label } : tp) } }
+      })
+    } catch (err) {
+      console.error('Table relabel failed:', err)
+      if (silent) throw err
+      window.alert('AI relabel failed — check OpenAI key and console.')
+    } finally {
+      setRelabelingInTable(prev => {
+        const s = new Set(prev[username] ?? [])
+        s.delete(topicId)
+        return { ...prev, [username]: s }
+      })
+    }
+  }
+
+  const relabelAllTopicsInTable = async (username: string, topicIds: number[]) => {
+    for (const id of topicIds) {
+      try {
+        await relabelTopicInTable(username, id, true)
+      } catch {
+        // individual topic failure — continue with remaining topics
+      }
+    }
+  }
+
+  const openStatsTopicModal = useCallback(async (
+    username: string, topicId: number, label: string, keywords: string[], messageCount: number,
+    dateFrom: string, dateTo: string, uploadIds: string,
+  ) => {
+    setStatsTopicModal({ topicId, label, keywords, username, messageCount })
+    setStatsTopicMessages([])
+    setStatsTopicLoading(true)
+    try {
+      const p = new URLSearchParams({ topic_id: String(topicId), date_from: dateFrom, date_to: dateTo, upload_ids: uploadIds })
+      const data = await apiFetch<Message[]>(`/topics/user/${encodeURIComponent(username)}/messages?${p}`)
+      setStatsTopicMessages(Array.isArray(data) ? data : [])
+    } catch {
+      setStatsTopicMessages([])
+    } finally {
+      setStatsTopicLoading(false)
+    }
+  }, [])
+
+  const runRelabelAllUsers = async (usersWithTopics: { username: string; topicIds: number[] }[]) => {
+    if (usersWithTopics.length === 0) return
+    setRelabelAllProgress({ done: 0, total: usersWithTopics.length, errors: 0 })
+    for (const { username, topicIds } of usersWithTopics) {
+      try {
+        await relabelAllTopicsInTable(username, topicIds)
+        setRelabelAllProgress(prev => prev ? { ...prev, done: prev.done + 1 } : null)
+      } catch {
+        setRelabelAllProgress(prev => prev ? { ...prev, done: prev.done + 1, errors: prev.errors + 1 } : null)
+      }
+    }
+    setRelabelAllProgress(null)
   }
 
   const SENTIMENT_CONCURRENCY = 5 // users analyzed in parallel via SSE
@@ -2591,10 +1939,9 @@ export default function SearchPage() {
       setSentimentProgress(null)
       const detailUuids = userMsgs.map(m => m.msg_uuid).filter((u): u is string => !!u)
       if (detailUuids.length > 0) {
-        apiFetch<Record<string, MsgEmotion>>('/messages/emotions', {
-          method: 'POST',
-          body: JSON.stringify({ msg_uuids: detailUuids }),
-        }).then(data => setMsgEmotions(prev => ({ ...prev, ...data }))).catch(() => {})
+        fetchMsgEmotionsBatched(detailUuids)
+          .then(data => setMsgEmotions(prev => ({ ...prev, ...data })))
+          .catch(() => {})
       }
     }
   }
@@ -2609,49 +1956,65 @@ export default function SearchPage() {
 
   const runBatchTopicForUsers = async (analyzeNewOnly: boolean) => {
     if (batchTopicRunning || filteredUsers.length === 0) return
+    // Snapshot before any awaits — re-renders that remove users from filteredUsers
+    // (e.g. anomalous users dropping out after a successful reanalysis) must not
+    // truncate the loop.
+    const targetUsers = [...filteredUsers]
     setBatchTopicRunning(true)
-    setBatchTopicProgress({ done: 0, total: filteredUsers.length, errors: 0 })
+    setBatchTopicProgress({ done: 0, total: targetUsers.length, errors: 0 })
     let errors = 0
 
-    for (let i = 0; i < filteredUsers.length; i++) {
-      const u = filteredUsers[i]
-      const topicsKey = makeBertopicKey(u.username, filterStartDate, filterEndDate, scopeParam)
+    // "New Only": skip users that already have a result in tableTopics.
+    const alreadyAnalyzed = new Set(Object.keys(tableTopics))
+
+    for (let i = 0; i < targetUsers.length; i++) {
+      const u = targetUsers[i]
       try {
-        let skip = false
-        if (analyzeNewOnly) {
-          const existing = await getBertopicResult(topicsKey)
-          if (existing) skip = true
+        if (analyzeNewOnly && alreadyAnalyzed.has(u.username)) {
+          setBatchTopicProgress({ done: i + 1, total: targetUsers.length, errors })
+          continue
         }
-        if (!skip) {
-          const params = new URLSearchParams({ username: u.username, limit: '1000000' })
-          if (scopeParam) params.set('upload_ids', scopeParam)
-          if (filterStartDate) params.set('date_from', filterStartDate)
-          if (filterEndDate) params.set('date_to', filterEndDate)
-          const msgs = await apiFetch<Message[]>(`/search/user-messages?${params}`).catch(() => [] as Message[])
-          if (msgs.length > 0) {
-            await new Promise<void>((resolve) => {
-              streamEvents(
-                '/user-topics/stream',
-                { docs: msgs.map(m => m.content), msg_uuids: msgs.map(m => m.msg_uuid ?? '') },
-                (event) => {
-                  if (event.stage === 'complete' && event.result) {
-                    const result = event.result as UserTopicsResult
-                    saveBertopicResult(topicsKey, result).catch(console.error)
-                    setTableTopics(prev => ({ ...prev, [u.username]: result }))
-                  }
-                },
-                () => resolve(),
-                () => { errors++; resolve() },
-              )
-            })
-          }
+        setBatchTopicCurrentUser(u.username)
+        const params = new URLSearchParams({ username: u.username, limit: '1000000' })
+        if (scopeParam) params.set('upload_ids', scopeParam)
+        // Use raw dateFrom/dateTo for message fetch AND save — consistent with
+        // batch-get which also keys on the explicit user filter, not computed dates.
+        // When dateTo is empty (open-ended phase 3/3D), the backend returns all
+        // messages from dateFrom onward without an upper bound.
+        if (dateFrom) params.set('date_from', dateFrom)
+        if (dateTo) params.set('date_to', dateTo)
+        const msgs = await apiFetch<Message[]>(`/search/user-messages?${params}`).catch(() => [] as Message[])
+        if (msgs.length > 0) {
+          await new Promise<void>((resolve) => {
+            streamEvents(
+              '/user-topics/stream',
+              {
+                docs: msgs.map(m => m.content),
+                msg_uuids: msgs.map(m => m.msg_uuid ?? ''),
+                username: u.username,
+                date_from: dateFrom || undefined,
+                date_to: dateTo || undefined,
+                upload_ids: scopeParam || undefined,
+              },
+              (event) => {
+                if (event.stage === 'complete' && event.result) {
+                  const result = event.result as UserTopicsResult
+                  setTableTopics(prev => ({ ...prev, [u.username]: result }))
+                }
+              },
+              () => resolve(),
+              () => { errors++; resolve() },
+            )
+          })
         }
       } catch {
         errors++
       }
-      setBatchTopicProgress({ done: i + 1, total: filteredUsers.length, errors })
+      setBatchTopicCurrentUser(null)
+      setBatchTopicProgress({ done: i + 1, total: targetUsers.length, errors })
     }
 
+    setBatchTopicCurrentUser(null)
     setBatchTopicRunning(false)
     setBatchTopicProgress(null)
   }
@@ -2685,33 +2048,9 @@ export default function SearchPage() {
   }
 
   const inputCls = 'search-input'
-  const tabs: { id: SearchTab; label: string }[] = [
-    { id: 'browse', label: 'Browse All' },
-    { id: 'keyword', label: 'Keyword Search' },
-    { id: 'semantic', label: 'Semantic Search' },
-    { id: 'username', label: 'Username Search' },
-    { id: 'range', label: 'Time Range' },
-  ]
 
-  const selectedCount = selectedIds.size
 
-  // Determine which tokens to use for card highlighting
-  const activeTokens = filterText.trim() ? filterTokens : lastTokens
-  const activeKeyword = filterText.trim() ? '' : lastKeyword
 
-  // Filter mode placeholder text
-  const filterPlaceholder: Record<FilterMode, string> = {
-    exact: 'Filter: all words must match…',
-    any: 'Filter: any word matches…',
-    fuzzy: 'Filter: fuzzy char-order match…',
-    semantic: 'Filter: semantic similarity…',
-  }
-
-  // Retrieval mode hint
-  const retrievalHint: Record<'cluster' | 'all', string> = {
-    cluster: 'Groups messages by topic and samples representatives. Best for large result sets.',
-    all: 'Passes all messages directly to the model. Use for small result sets (<100 msgs).',
-  }
 
   // User detail full-panel view
   if (selectedUser) {
@@ -2947,7 +2286,7 @@ export default function SearchPage() {
                   setUserAnalysisTab('persona')
                   if (personaSummary.length === 0 && !personaSummaryLoading) {
                     setPersonaSummaryLoading(true)
-                    apiFetch<typeof personaSummary>('/persona/phase-summary')
+                    apiFetch<typeof personaSummary>('/persona/phase-summary?method=archetype')
                       .then(d => setPersonaSummary(d))
                       .catch(() => {})
                       .finally(() => setPersonaSummaryLoading(false))
@@ -2960,7 +2299,7 @@ export default function SearchPage() {
                 <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z" />
                 </svg>
-                Persona
+                Archetype
               </button>
               <button
                 onClick={() => setUserAnalysisTab('summary')}
@@ -2978,10 +2317,21 @@ export default function SearchPage() {
 
           {userAnalysisTab === 'topics' && (
             <div className="border-t border-gray-100 px-4 pb-4 pt-3 space-y-3">
+              {!userMsgsLoading && userDetailFiltered.length === 0 ? (
+                <p className="text-sm text-gray-400 text-center py-6">No messages in this phase.</p>
+              ) : topicsDbLoading && !userTopicsResult ? (
+                <div className="flex items-center gap-2 text-xs text-gray-400">
+                  <svg className="w-3.5 h-3.5 animate-spin text-violet-400 shrink-0" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+                  </svg>
+                  Loading saved topics from database…
+                </div>
+              ) : (
               <div className="flex items-center gap-2 flex-wrap">
                 {!userTopicsResult ? (
                   <button onClick={() => runUserTopics('all')} disabled={userTopicsLoading} className="search-btn">
-                    {userTopicsLoading ? 'Analysing…' : 'Run Analysis'}
+                    {userTopicsLoading ? 'Analysing…' : 'Analyze Topics'}
                   </button>
                 ) : (
                   <>
@@ -3001,12 +2351,19 @@ export default function SearchPage() {
                 )}
                 {userTopicsResult && (
                   <span className="text-xs text-gray-400">
-                    {userTopicsResult.filtered_docs.toLocaleString()} of {userTopicsResult.total_docs.toLocaleString()} messages analysed · real BERTopic
+                    {userTopicsResult.filtered_docs.toLocaleString()} of {userTopicsResult.total_docs.toLocaleString()} msgs
+                    {userTopicsResult.warning ? ' · keyword fallback' : ' · BERTopic'}
+                    {userTopicsResult.date_from || userTopicsResult.date_to ? (
+                      <span className="ml-1 text-amber-500" title="Topics from a different date window than your current filter">
+                        · from {userTopicsResult.date_from || '—'} → {userTopicsResult.date_to || '—'}
+                      </span>
+                    ) : null}
                   </span>
                 )}
               </div>
+              )}
 
-              {userTopicsSteps.length > 0 && (
+              {userDetailFiltered.length > 0 && userTopicsSteps.length > 0 && (
                 <div className={`rounded-xl border px-3 py-2.5 space-y-1.5 transition-colors ${
                   userTopicsLoading ? 'bg-violet-50 border-violet-200' : 'bg-gray-50 border-gray-200'
                 }`}>
@@ -3045,11 +2402,11 @@ export default function SearchPage() {
                 </div>
               )}
 
-              {userTopicsResult && userTopicsResult.topics.length === 0 && !userTopicsLoading && (
+              {userDetailFiltered.length > 0 && userTopicsResult && userTopicsResult.topics.length === 0 && !userTopicsLoading && (
                 <p className="text-sm text-gray-400">No topics identified — not enough message content.</p>
               )}
 
-              {userTopicsResult && userTopicsResult.topics.length > 0 && (
+              {userDetailFiltered.length > 0 && userTopicsResult && userTopicsResult.topics.length > 0 && (
                 <div className="space-y-2">
                   {userTopicsResult.topics.map((topic) => {
                     const pct = userTopicsResult.filtered_docs > 0
@@ -3075,14 +2432,63 @@ export default function SearchPage() {
                     const colorIdx = topic.id % colors.length
                     const samplesOpen = expandedTopicSamples.has(topic.id)
                     const hasSamples = topic.representative_docs && topic.representative_docs.length > 0
+                    const isEditing = editingTopicId === topic.id
+                    const isRelabeling = relabelingTopicId === topic.id
+                    const isOutlier = topic.id === -1
                     return (
                       <div key={topic.id} className={`rounded-xl border px-3 py-2.5 ${colors[colorIdx]}`}>
                         <div className="flex items-center justify-between gap-2 mb-1.5">
-                          <div className="flex items-center gap-2">
+                          <div className="flex items-center gap-2 min-w-0 flex-1">
                             <span className="text-[10px] font-bold text-gray-400 uppercase w-6 shrink-0">#{topic.id}</span>
-                            <span className="text-sm font-semibold text-gray-800">{topic.label}</span>
+                            {isEditing ? (
+                              <input
+                                type="text"
+                                autoFocus
+                                value={editingLabelValue}
+                                onChange={e => setEditingLabelValue(e.target.value)}
+                                onKeyDown={e => {
+                                  if (e.key === 'Enter') saveTopicLabel(topic.id, editingLabelValue)
+                                  if (e.key === 'Escape') { setEditingTopicId(null); setEditingLabelValue('') }
+                                }}
+                                className="text-sm font-semibold text-gray-800 bg-white/90 border border-violet-300 rounded px-2 py-0.5 flex-1 min-w-0 focus:outline-none focus:ring-1 focus:ring-violet-400"
+                              />
+                            ) : (
+                              <span className="text-sm font-semibold text-gray-800 truncate">{topic.label}</span>
+                            )}
                           </div>
-                          <span className="text-xs text-gray-500 shrink-0">{topic.message_count.toLocaleString()} msgs · {pct}%</span>
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            {!isOutlier && (
+                              isEditing ? (
+                                <>
+                                  <button
+                                    onClick={() => saveTopicLabel(topic.id, editingLabelValue)}
+                                    title="Save (Enter)"
+                                    className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 hover:bg-emerald-200 font-semibold"
+                                  >✓</button>
+                                  <button
+                                    onClick={() => { setEditingTopicId(null); setEditingLabelValue('') }}
+                                    title="Cancel (Esc)"
+                                    className="text-[10px] px-1.5 py-0.5 rounded bg-gray-100 text-gray-600 hover:bg-gray-200 font-semibold"
+                                  >✕</button>
+                                </>
+                              ) : (
+                                <>
+                                  <button
+                                    onClick={() => { setEditingTopicId(topic.id); setEditingLabelValue(topic.label) }}
+                                    title="Edit label manually"
+                                    className="text-[10px] px-1.5 py-0.5 rounded bg-white/70 text-gray-600 hover:bg-white hover:text-gray-900 border border-white/80"
+                                  >✏️</button>
+                                  <button
+                                    disabled={isRelabeling}
+                                    onClick={() => relabelTopicWithAI(topic.id)}
+                                    title="Regenerate label with GPT-4o-mini"
+                                    className="text-[10px] px-1.5 py-0.5 rounded bg-white/70 text-violet-600 hover:bg-white hover:text-violet-800 border border-white/80 disabled:opacity-50"
+                                  >{isRelabeling ? '⏳' : '🤖'}</button>
+                                </>
+                              )
+                            )}
+                            <span className="text-xs text-gray-500">{topic.message_count.toLocaleString()} msgs · {pct}%</span>
+                          </div>
                         </div>
                         {/* Proportion bar */}
                         <div className="w-full h-1.5 bg-white/60 rounded-full mb-2">
@@ -3205,20 +2611,14 @@ export default function SearchPage() {
                     <p className="text-sm text-gray-400 text-center py-10">No messages found.</p>
                   ) : (
                     activeMessages.map((msg, i) => (
-                      <div key={msg.id ?? i} className="px-5 py-3 hover:bg-gray-50 transition-colors">
-                        <div className="flex items-center gap-2 mb-1">
-                          <span
-                            className="text-[11px] font-semibold"
-                            style={{ color: getUserColor(msg.username)[1] }}
-                          >
-                            {msg.username}
-                          </span>
-                          <span className="text-[10px] text-gray-400">{msg.date}</span>
-                        </div>
-                        <p className="text-xs text-gray-700 leading-relaxed whitespace-pre-wrap break-words">
-                          {msg.content}
-                        </p>
-                      </div>
+                      <TopicMsgRow
+                        key={msg.id ?? i}
+                        msg={msg}
+                        isBookmarked={bookmarkedIds.has(msg.id)}
+                        onBookmarkToggle={handleBookmarkToggle}
+                        ctxBefore={userDetailCtxBefore}
+                        ctxAfter={userDetailCtxAfter}
+                      />
                     ))
                   )}
                 </div>
@@ -3314,39 +2714,40 @@ export default function SearchPage() {
 
           {userAnalysisTab === 'persona' && (() => {
             const PERSONA_COLORS: Record<string, string> = {
-              'Power Technical User':           'bg-blue-100 text-blue-800 border-blue-300',
-              'Community Mentor':               'bg-emerald-100 text-emerald-800 border-emerald-300',
-              'Community Moderator and Mentor': 'bg-teal-100 text-teal-800 border-teal-300',
-              'Scrutinizer':                    'bg-rose-100 text-rose-800 border-rose-300',
-              'Help-Seeker':                    'bg-amber-100 text-amber-800 border-amber-300',
-              'Casual Explorer':                'bg-gray-100 text-gray-700 border-gray-300',
+              'Suno Team':     'bg-fuchsia-100 text-fuchsia-800 border-fuchsia-300',
+              'Contributor':   'bg-blue-100 text-blue-800 border-blue-300',
+              'Help-Seeker':   'bg-amber-100 text-amber-800 border-amber-300',
+              'Evangelist':    'bg-emerald-100 text-emerald-800 border-emerald-300',
+              'Scrutinizer':   'bg-rose-100 text-rose-800 border-rose-300',
+              'Explorer':      'bg-violet-100 text-violet-800 border-violet-300',
+              'Uncategorized': 'bg-slate-100 text-slate-600 border-slate-300',
             }
-            const PersonaChip = ({ persona }: { persona: string }) => (
-              <span className={`inline-block text-[9px] font-semibold px-1.5 py-0.5 rounded border ${PERSONA_COLORS[persona] ?? 'bg-gray-100 text-gray-600 border-gray-300'}`}>
+            const PersonaChip = ({ persona, secondary }: { persona: string; secondary?: boolean }) => (
+              <span className={`inline-block text-[9px] font-semibold px-1.5 py-0.5 rounded border ${PERSONA_COLORS[persona] ?? 'bg-gray-100 text-gray-600 border-gray-300'} ${secondary ? 'opacity-70' : ''}`}>
                 {persona}
               </span>
             )
 
-            // This user's persona across phases
-            const hasAnyPersona = Object.values(userPersonas).some(p => p.rule_based || p.llm)
+            // This user's archetype across phases
+            const hasAnyPersona = Object.values(userPersonas).some(p => p && p.persona)
 
-            // Aggregate summary — split by method
-            const summaryByPhase: Record<string, { rule_based: Record<string, number>; llm: Record<string, number> }> = {}
+            // Aggregate summary — single method now ("archetype").
+            // Tolerant of legacy rows (rule_based/llm); they're folded in for backwards compat.
+            const summaryByPhase: Record<string, Record<string, number>> = {}
             for (const row of personaSummary) {
-              if (!summaryByPhase[row.phase]) summaryByPhase[row.phase] = { rule_based: {}, llm: {} }
-              const m = row.method === 'rule_based' ? 'rule_based' : 'llm'
-              summaryByPhase[row.phase][m][row.persona] = (summaryByPhase[row.phase][m][row.persona] ?? 0) + row.count
+              if (!summaryByPhase[row.phase]) summaryByPhase[row.phase] = {}
+              summaryByPhase[row.phase][row.persona] = (summaryByPhase[row.phase][row.persona] ?? 0) + row.count
             }
 
             return (
               <div className="border-t border-gray-100 px-4 pb-4 pt-3 space-y-5">
-                {/* This user's personas */}
+                {/* This user's archetypes */}
                 <div>
-                  <p className="text-[11px] font-semibold text-gray-500 uppercase tracking-wide mb-2">This User's Persona Per Phase</p>
+                  <p className="text-[11px] font-semibold text-gray-500 uppercase tracking-wide mb-2">This User's Archetype Per Phase</p>
                   {!hasAnyPersona ? (
                     <p className="text-[11px] text-gray-400">
-                      No personas classified yet. Go to <button onClick={() => { setUserAnalysisTab('dropout'); setDropoutSubTab('phases') }}
-                        className="text-indigo-600 hover:underline">Dropout → Per Phase</button> and click ⚡ or 🤖 to classify.
+                      No archetypes computed yet. Go to <button onClick={() => { setUserAnalysisTab('dropout'); setDropoutSubTab('phases') }}
+                        className="text-indigo-600 hover:underline">Dropout → Per Phase</button> and click ↻ Recompute, or use the batch button in the result table.
                     </p>
                   ) : (
                     <div className="overflow-x-auto rounded-xl border border-gray-200">
@@ -3354,35 +2755,30 @@ export default function SearchPage() {
                         <thead>
                           <tr className="bg-gray-50 border-b border-gray-200">
                             <th className="text-left px-3 py-2 font-semibold text-gray-600">Phase</th>
-                            <th className="text-center px-3 py-2 font-semibold text-indigo-600">⚡ Rule-Based</th>
-                            <th className="text-center px-3 py-2 font-semibold text-violet-600">🤖 LLM</th>
-                            <th className="text-center px-3 py-2 font-semibold text-gray-400">Agreement</th>
+                            <th className="text-center px-3 py-2 font-semibold text-indigo-600">Primary Archetype</th>
+                            <th className="text-center px-3 py-2 font-semibold text-gray-500">Secondary</th>
                           </tr>
                         </thead>
                         <tbody>
                           {PHASE_DEFS.map(def => {
-                            const p = userPersonas[def.key] ?? {}
-                            if (!p.rule_based && !p.llm) return null
-                            const agree = p.rule_based && p.llm && p.rule_based.persona === p.llm.persona
+                            const p = userPersonas[def.key]
+                            if (!p) return null
+                            const conf = Math.round(p.confidence * 100)
+                            const sConf = p.secondary_confidence != null ? Math.round(p.secondary_confidence * 100) : null
                             return (
                               <tr key={def.key} className="border-b border-gray-100 hover:bg-gray-50">
                                 <td className="px-3 py-2">
                                   <span className={`inline-block px-2 py-0.5 rounded-full text-[10px] font-semibold border ${def.chipCls}`}>{def.label}</span>
                                 </td>
                                 <td className="text-center px-3 py-2">
-                                  {p.rule_based
-                                    ? <span title={p.rule_based.reasoning}><PersonaChip persona={p.rule_based.persona} /></span>
-                                    : <span className="text-[9px] text-gray-300">—</span>}
+                                  <span title={p.reasoning} className="cursor-help">
+                                    <PersonaChip persona={p.persona} /> <span className="text-[9px] text-gray-400">{conf}%</span>
+                                  </span>
                                 </td>
                                 <td className="text-center px-3 py-2">
-                                  {p.llm
-                                    ? <span title={p.llm.reasoning}><PersonaChip persona={p.llm.persona} /></span>
-                                    : <span className="text-[9px] text-gray-300">—</span>}
-                                </td>
-                                <td className="text-center px-3 py-2">
-                                  {p.rule_based && p.llm
-                                    ? <span className={`text-[9px] font-semibold ${agree ? 'text-emerald-600' : 'text-amber-600'}`}>
-                                        {agree ? '✓ Match' : '≠ Differ'}
+                                  {p.secondary_persona
+                                    ? <span title={p.reasoning} className="cursor-help">
+                                        <PersonaChip persona={p.secondary_persona} secondary /> <span className="text-[9px] text-gray-400">{sConf}%</span>
                                       </span>
                                     : <span className="text-[9px] text-gray-300">—</span>}
                                 </td>
@@ -3398,29 +2794,17 @@ export default function SearchPage() {
                 {/* Phase-level aggregate from DB */}
                 <div>
                   <div className="flex items-center justify-between mb-2">
-                    <p className="text-[11px] font-semibold text-gray-500 uppercase tracking-wide">Population Persona Distribution (All Classified Users)</p>
-                    <div className="flex items-center gap-2">
-                      <div className="flex rounded-lg overflow-hidden border border-gray-200 text-[10px] font-semibold">
-                        {(['rule_based', 'llm'] as const).map(m => (
-                          <button key={m} onClick={() => setPersonaSummaryMethod(m)}
-                            className={`px-2.5 py-1 transition-colors border-r border-gray-200 last:border-0 ${
-                              personaSummaryMethod === m ? 'bg-gray-800 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'
-                            }`}>
-                            {m === 'rule_based' ? '⚡ Rule' : '🤖 LLM'}
-                          </button>
-                        ))}
-                      </div>
-                      <button
-                        onClick={() => {
-                          setPersonaSummaryLoading(true)
-                          apiFetch<typeof personaSummary>('/persona/phase-summary')
-                            .then(d => setPersonaSummary(d))
-                            .catch(() => {})
-                            .finally(() => setPersonaSummaryLoading(false))
-                        }}
-                        className="text-[10px] px-2 py-1 rounded border border-gray-200 text-gray-500 hover:bg-gray-50 transition-colors"
-                      >↻ Refresh</button>
-                    </div>
+                    <p className="text-[11px] font-semibold text-gray-500 uppercase tracking-wide">Population Archetype Distribution (All Computed Users)</p>
+                    <button
+                      onClick={() => {
+                        setPersonaSummaryLoading(true)
+                        apiFetch<typeof personaSummary>('/persona/phase-summary?method=archetype')
+                          .then(d => setPersonaSummary(d))
+                          .catch(() => {})
+                          .finally(() => setPersonaSummaryLoading(false))
+                      }}
+                      className="text-[10px] px-2 py-1 rounded border border-gray-200 text-gray-500 hover:bg-gray-50 transition-colors"
+                    >↻ Refresh</button>
                   </div>
 
                   {personaSummaryLoading ? (
@@ -3429,17 +2813,17 @@ export default function SearchPage() {
                       <p className="text-[11px] text-gray-400">Loading…</p>
                     </div>
                   ) : personaSummary.length === 0 ? (
-                    <p className="text-[11px] text-gray-400 py-2">No persona classifications saved yet. Classify users via Dropout → Per Phase first.</p>
+                    <p className="text-[11px] text-gray-400 py-2">No archetypes computed yet. Run the Archetype batch button in the user result table.</p>
                   ) : (() => {
                     const ALL_PERSONAS = [
-                      'Power Technical User', 'Community Mentor', 'Community Moderator and Mentor',
-                      'Scrutinizer', 'Help-Seeker', 'Casual Explorer',
+                      'Contributor', 'Explorer', 'Help-Seeker',
+                      'Evangelist', 'Scrutinizer', 'Suno Team', 'Uncategorized',
                     ]
                     const phases = PHASE_DEFS.filter(def =>
-                      personaSummary.some(r => r.phase === def.key && r.method === personaSummaryMethod)
+                      personaSummary.some(r => r.phase === def.key)
                     )
                     if (phases.length === 0) return (
-                      <p className="text-[11px] text-gray-400 py-2">No data for {personaSummaryMethod === 'rule_based' ? 'rule-based' : 'LLM'} method yet.</p>
+                      <p className="text-[11px] text-gray-400 py-2">No archetype data yet.</p>
                     )
                     return (
                       <div className="overflow-x-auto rounded-xl border border-gray-200">
@@ -3455,7 +2839,7 @@ export default function SearchPage() {
                           </thead>
                           <tbody>
                             {phases.map(def => {
-                              const row = summaryByPhase[def.key]?.[personaSummaryMethod] ?? {}
+                              const row = summaryByPhase[def.key] ?? {}
                               const total = Object.values(row).reduce((s, c) => s + c, 0)
                               return (
                                 <tr key={def.key} className="border-b border-gray-100 hover:bg-gray-50">
@@ -3643,44 +3027,63 @@ export default function SearchPage() {
 
               {userEmotionResult && !userEmotionLoading && userEmotionResult.analyzed_messages > 0 && (
                 <>
-                  {/* Sentiment ratio bar */}
-                  <div>
-                    <p className="text-[11px] font-semibold text-gray-500 uppercase tracking-wide mb-2">Sentiment Distribution</p>
-                    <div className="flex rounded-lg overflow-hidden h-7 text-xs font-semibold text-white">
-                      {userEmotionResult.summary.sentiment_ratio.positive > 0 && (
-                        <div
-                          style={{ width: `${userEmotionResult.summary.sentiment_ratio.positive * 100}%` }}
-                          className="bg-emerald-500 flex items-center justify-center"
-                          title="Positive"
-                        >
-                          {(userEmotionResult.summary.sentiment_ratio.positive * 100).toFixed(0)}%
+                  {/* Sentiment ratio bar — click a segment to see all messages in that bucket */}
+                  {(() => {
+                    const ratio = userEmotionResult.summary.sentiment_ratio
+                    const total = userEmotionResult.analyzed_messages
+                    const segments = [
+                      { key: 'positive' as const, label: 'Positive',  bg: 'bg-emerald-500', hover: 'hover:bg-emerald-400', text: 'text-emerald-600' },
+                      { key: 'negative' as const, label: 'Negative',  bg: 'bg-rose-500',    hover: 'hover:bg-rose-400',    text: 'text-rose-500'    },
+                      { key: 'neutral'  as const, label: 'Neutral',   bg: 'bg-gray-400',    hover: 'hover:bg-gray-300',    text: 'text-gray-400'    },
+                    ]
+                    const anyActive = emotionMsgFilter?.type === 'sentiment' && !emotionMsgFilter.period
+                    return (
+                      <div>
+                        <p className="text-[11px] font-semibold text-gray-500 uppercase tracking-wide mb-2">
+                          Sentiment Distribution
+                          <span className="ml-1.5 normal-case font-normal text-gray-400">— click to view messages</span>
+                        </p>
+                        <div className="flex rounded-lg overflow-hidden h-8 text-xs font-semibold text-white">
+                          {segments.map(({ key, label, bg, hover }) => {
+                            const r = ratio[key]
+                            if (r === 0) return null
+                            const isActive = anyActive && emotionMsgFilter?.label === key
+                            const isDimmed = anyActive && !isActive
+                            return (
+                              <button
+                                key={key}
+                                style={{ width: `${r * 100}%` }}
+                                className={`flex items-center justify-center transition-all ${bg} ${hover} ${
+                                  isActive ? 'ring-2 ring-inset ring-white/70' : isDimmed ? 'opacity-40' : ''
+                                }`}
+                                title={`${Math.round(r * total).toLocaleString()} ${label.toLowerCase()} messages — click to view`}
+                                onClick={() => setEmotionMsgFilter(isActive ? null : { type: 'sentiment', label: key })}
+                              >
+                                {r >= 0.10 ? `${(r * 100).toFixed(0)}%` : ''}
+                              </button>
+                            )
+                          })}
                         </div>
-                      )}
-                      {userEmotionResult.summary.sentiment_ratio.negative > 0 && (
-                        <div
-                          style={{ width: `${userEmotionResult.summary.sentiment_ratio.negative * 100}%` }}
-                          className="bg-rose-500 flex items-center justify-center"
-                          title="Negative"
-                        >
-                          {(userEmotionResult.summary.sentiment_ratio.negative * 100).toFixed(0)}%
+                        <div className="flex flex-wrap gap-x-4 gap-y-1 mt-1.5">
+                          {segments.map(({ key, label, text }) => {
+                            const r = ratio[key]
+                            if (r === 0) return null
+                            const count = Math.round(r * total)
+                            const isActive = anyActive && emotionMsgFilter?.label === key
+                            return (
+                              <button
+                                key={key}
+                                onClick={() => setEmotionMsgFilter(isActive ? null : { type: 'sentiment', label: key })}
+                                className={`text-xs font-medium ${text} hover:opacity-70 transition-opacity ${isActive ? 'underline underline-offset-2' : ''}`}
+                              >
+                                ● {label} · {count.toLocaleString()}
+                              </button>
+                            )
+                          })}
                         </div>
-                      )}
-                      {userEmotionResult.summary.sentiment_ratio.neutral > 0 && (
-                        <div
-                          style={{ width: `${userEmotionResult.summary.sentiment_ratio.neutral * 100}%` }}
-                          className="bg-gray-400 flex items-center justify-center"
-                          title="Neutral"
-                        >
-                          {(userEmotionResult.summary.sentiment_ratio.neutral * 100).toFixed(0)}%
-                        </div>
-                      )}
-                    </div>
-                    <div className="flex gap-4 mt-1.5">
-                      <span className="text-xs text-emerald-600 font-medium">● Positive</span>
-                      <span className="text-xs text-rose-500 font-medium">● Negative</span>
-                      <span className="text-xs text-gray-400 font-medium">● Neutral/Ambiguous</span>
-                    </div>
-                  </div>
+                      </div>
+                    )
+                  })()}
 
                   {/* Top emotions horizontal bar chart */}
                   {userEmotionResult.summary.top_emotions.length > 0 && (
@@ -4489,6 +3892,91 @@ export default function SearchPage() {
                     )}
 
 
+                    {/* Archetype evolution strip */}
+                    {phaseStatuses.some(ps => userPersonas[ps.def.key]) && (() => {
+                      const ARC_BG: Record<string, string> = {
+                        'Contributor': '#eff6ff', 'Explorer': '#f5f3ff',
+                        'Help-Seeker': '#fffbeb', 'Suno Team': '#fdf4ff',
+                        'Uncategorized': '#f1f5f9',
+                      }
+                      const ARC_BORDER: Record<string, string> = {
+                        'Contributor': '#93c5fd', 'Explorer': '#c4b5fd',
+                        'Help-Seeker': '#fcd34d', 'Suno Team': '#e879f9',
+                        'Uncategorized': '#94a3b8',
+                      }
+                      const ARC_TEXT: Record<string, string> = {
+                        'Contributor': '#1d4ed8', 'Explorer': '#7c3aed',
+                        'Help-Seeker': '#92400e', 'Suno Team': '#86198f',
+                        'Uncategorized': '#475569',
+                      }
+                      const SEC_BG: Record<string, string> = {
+                        'Evangelist': '#ecfdf5', 'Scrutinizer': '#fff1f2',
+                      }
+                      const SEC_TEXT: Record<string, string> = {
+                        'Evangelist': '#065f46', 'Scrutinizer': '#9f1239',
+                      }
+                      return (
+                        <div>
+                          <p className="text-[11px] font-semibold text-gray-500 uppercase tracking-wide mb-2">Archetype Evolution</p>
+                          <div className="flex gap-0 rounded-xl overflow-hidden border border-gray-200">
+                            {phaseStatuses.map(({ def, msgCount }, i) => {
+                              const saved = userPersonas[def.key]
+                              const isPreJoin = msgCount === 0 && !phaseStatuses.slice(0, i).some(p => p.msgCount > 0)
+                              const prevSaved = i > 0 ? userPersonas[phaseStatuses[i - 1].def.key] : null
+                              const changed = !!(saved && prevSaved && saved.persona !== prevSaved.persona)
+                              const bg     = saved ? (ARC_BG[saved.persona]     ?? '#f9fafb') : '#f9fafb'
+                              const border = saved ? (ARC_BORDER[saved.persona] ?? '#e5e7eb') : '#e5e7eb'
+                              const tc     = saved ? (ARC_TEXT[saved.persona]   ?? '#6b7280') : '#9ca3af'
+                              return (
+                                <div
+                                  key={def.key}
+                                  className="flex-1 relative px-2 py-3 text-center border-r last:border-r-0 border-gray-200"
+                                  style={{ backgroundColor: bg, borderTopColor: border, borderTopWidth: 3 }}
+                                >
+                                  {changed && (
+                                    <div className="absolute top-0 right-0">
+                                      <span className="text-[8px] font-bold px-1 py-0.5 bg-indigo-500 text-white" title="Archetype changed from previous phase">↺</span>
+                                    </div>
+                                  )}
+                                  <p className="text-[10px] font-bold text-gray-700 mt-1">{def.label}</p>
+                                  <p className="text-[9px] text-gray-400 mb-1.5">{def.sub}</p>
+                                  {msgCount === 0 ? (
+                                    <span className="text-[9px] text-gray-300">{isPreJoin ? '—' : 'No data'}</span>
+                                  ) : saved ? (
+                                    <div className="flex flex-col items-center gap-0.5">
+                                      <span
+                                        className="text-[9px] font-bold px-1.5 py-0.5 rounded border"
+                                        style={{ color: tc, backgroundColor: bg, borderColor: border }}
+                                        title={saved.reasoning}
+                                      >
+                                        {saved.persona}
+                                      </span>
+                                      <span className="text-[9px] text-gray-400">{Math.round(saved.confidence * 100)}%</span>
+                                      {saved.secondary_persona && (
+                                        <span
+                                          className="text-[8px] font-semibold px-1 py-0.5 rounded border"
+                                          style={{
+                                            color: SEC_TEXT[saved.secondary_persona] ?? '#6b7280',
+                                            backgroundColor: SEC_BG[saved.secondary_persona] ?? '#f9fafb',
+                                            borderColor: SEC_TEXT[saved.secondary_persona] ?? '#e5e7eb',
+                                          }}
+                                        >
+                                          {saved.secondary_persona}
+                                        </span>
+                                      )}
+                                    </div>
+                                  ) : (
+                                    <span className="text-[9px] text-gray-300">—</span>
+                                  )}
+                                </div>
+                              )
+                            })}
+                          </div>
+                          <p className="text-[9px] text-gray-400 mt-1">↺ marks an archetype change from the previous phase. Hover any badge for the reasoning.</p>
+                        </div>
+                      )
+                    })()}
+
                     {userMsgs.length === 0 && (
                       <p className="text-sm text-gray-400 text-center py-6">No messages loaded for this user.</p>
                     )}
@@ -4498,86 +3986,25 @@ export default function SearchPage() {
                 {/* ── PER PHASE ──────────────────────────────────────────────── */}
                 {dropoutSubTab === 'phases' && (
                   <div className="space-y-3">
-                    {/* Classify all phases button */}
+                    {/* Recompute all phases button */}
                     <div className="flex items-center justify-between">
-                      <p className="text-[10px] text-gray-400">Status and persona computed from all messages within each phase's date window.</p>
-                      <div className="flex gap-1.5">
-                        {(['rule_based', 'llm'] as const).map(method => {
-                          const anyClassifying = phaseStatuses.some(ps =>
-                            personaClassifying.has(`${ps.def.key}:${method}`) ||
-                            personaClassifying.has(`${ps.def.key}:rule_based,llm`)
-                          )
-                          return (
-                            <button
-                              key={method}
-                              disabled={anyClassifying}
-                              onClick={async () => {
-                                for (const ps of phaseStatuses) {
-                                  if (ps.msgCount === 0) continue
-                                  const filterEnd = ps.def.to || allMsgsMaxDate
-                                  const phaseMsgs = userMsgs.filter(m => {
-                                    const d = m.date?.slice(0, 10) ?? ''
-                                    return d >= ps.def.from && (!filterEnd || d <= filterEnd)
-                                  })
-                                  // Compute per-phase emotion from emotionPerMsgMap
-                                  const phaseUuids = new Set(phaseMsgs.map(m => m.msg_uuid).filter(Boolean))
-                                  const phaseEmo = [...phaseUuids].flatMap(uuid => {
-                                    const e = uuid ? emotionPerMsgMap.get(uuid) : undefined
-                                    return e ? [e] : []
-                                  })
-                                  const emoTotal = phaseEmo.length || 1
-                                  const negSent = phaseEmo.filter(e => e.sentiment === 'negative').length / emoTotal
-                                  const posSent = phaseEmo.filter(e => e.sentiment === 'positive').length / emoTotal
-                                  const neuSent = phaseEmo.filter(e => e.sentiment === 'neutral').length / emoTotal
-                                  const emoCount: Record<string, number> = {}
-                                  for (const e of phaseEmo) for (const em of e.top_emotions) {
-                                    emoCount[em.label] = (emoCount[em.label] ?? 0) + 1
-                                  }
-                                  const topEmotions = Object.entries(emoCount).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([l])=>l)
-                                  // Top topics
-                                  const topTopics: string[] = []
-                                  if (userTopicsResult?.doc_assignments) {
-                                    const tCounts: Record<number, number> = {}
-                                    for (const m of phaseMsgs) {
-                                      const tid = m.msg_uuid ? userTopicsResult.doc_assignments[m.msg_uuid] : undefined
-                                      if (tid !== undefined) tCounts[tid] = (tCounts[tid] ?? 0) + 1
-                                    }
-                                    Object.entries(tCounts).sort(([,a],[,b])=>b-a).slice(0,3).forEach(([tid]) => {
-                                      const topic = userTopicsResult.topics.find(t => t.id === Number(tid))
-                                      if (topic) topTopics.push(topic.label)
-                                    })
-                                  }
-                                  const phaseAvgWords = phaseMsgs.length > 0
-                                    ? phaseMsgs.reduce((s, m) => s + m.content.split(/\s+/).filter(Boolean).length, 0) / phaseMsgs.length
-                                    : 0
-                                  const phaseWeeksActive = new Set(phaseMsgs.map(m => m.date ? mondayKey(m.date) : '').filter(Boolean)).size
-                                  await classifyPersona(
-                                    ps.def.key, ps.def.label,
-                                    {
-                                      msg_count: ps.msgCount,
-                                      avg_words: phaseAvgWords,
-                                      pct_weeks: ps.info?.pctWeeks ?? 0,
-                                      weeks_active: phaseWeeksActive,
-                                      dropout_status: ps.status,
-                                      sentiment_positive: phaseEmo.length > 0 ? posSent : null,
-                                      sentiment_negative: phaseEmo.length > 0 ? negSent : null,
-                                      sentiment_neutral: phaseEmo.length > 0 ? neuSent : null,
-                                      top_emotions: topEmotions.length > 0 ? topEmotions : null,
-                                      top_topics: topTopics.length > 0 ? topTopics : null,
-                                    },
-                                    phaseMsgs.slice(-15).map(m => ({ content: m.content, date: m.date ?? '' })),
-                                    [method],
-                                  )
-                                }
-                              }}
-                              className="text-[10px] font-semibold px-2.5 py-1 rounded-lg border disabled:opacity-50 transition-colors
-                                bg-white text-gray-600 border-gray-300 hover:bg-gray-50"
-                            >
-                              {anyClassifying ? '⏳' : method === 'rule_based' ? '⚡ All (Rule)' : '🤖 All (LLM)'}
-                            </button>
-                          )
-                        })}
-                      </div>
+                      <p className="text-[10px] text-gray-400">Archetype computed from stored sentiment + topics + activity for this phase window.</p>
+                      <button
+                        disabled={phaseStatuses.some(ps => personaClassifying.has(ps.def.key))}
+                        onClick={async () => {
+                          for (const ps of phaseStatuses) {
+                            if (ps.msgCount === 0) continue
+                            // Raw def.to (not resolved to allMsgsMaxDate) — topic runs are
+                            // cached under the raw window, so an open-ended phase (to === '')
+                            // must be queried the same way or its topics never match.
+                            await recomputeOneArchetype(ps.def.key, ps.def.label, ps.def.from, ps.def.to ?? '')
+                          }
+                        }}
+                        className="text-[10px] font-semibold px-2.5 py-1 rounded-lg border disabled:opacity-50 transition-colors
+                          bg-indigo-50 text-indigo-700 border-indigo-200 hover:bg-indigo-100"
+                      >
+                        {phaseStatuses.some(ps => personaClassifying.has(ps.def.key)) ? '⏳' : '↻ Recompute All Phases'}
+                      </button>
                     </div>
 
                     <div className="overflow-x-auto rounded-xl border border-gray-200">
@@ -4589,9 +4016,9 @@ export default function SearchPage() {
                             <th className="text-center px-3 py-2 font-semibold text-sky-600">Flow</th>
                             <th className="text-right px-3 py-2 font-semibold text-gray-600">Msgs</th>
                             <th className="text-right px-3 py-2 font-semibold text-gray-600">% Wks</th>
-                            <th className="text-center px-3 py-2 font-semibold text-indigo-600">Rule Persona</th>
-                            <th className="text-center px-3 py-2 font-semibold text-violet-600">LLM Persona</th>
-                            <th className="text-center px-2 py-2 font-semibold text-gray-400">Classify</th>
+                            <th className="text-center px-3 py-2 font-semibold text-indigo-600">Primary Archetype</th>
+                            <th className="text-center px-3 py-2 font-semibold text-gray-500">Secondary</th>
+                            <th className="text-center px-2 py-2 font-semibold text-gray-400">Action</th>
                           </tr>
                         </thead>
                         <tbody>
@@ -4631,69 +4058,22 @@ export default function SearchPage() {
                                 : 'bg-slate-100 text-slate-500 border-slate-200'
                             }
 
-                            const filterEnd = def.to || allMsgsMaxDate
-                            const phaseMsgs = userMsgs.filter(m => {
-                              const d = m.date?.slice(0, 10) ?? ''
-                              return d >= def.from && (!filterEnd || d <= filterEnd)
-                            })
-                            // Per-phase emotion from emotionPerMsgMap
-                            const phaseUuids = new Set(phaseMsgs.map(m => m.msg_uuid).filter(Boolean))
-                            const phaseEmo = [...phaseUuids].flatMap(uuid => {
-                              const e = uuid ? emotionPerMsgMap.get(uuid) : undefined
-                              return e ? [e] : []
-                            })
-                            const emoTotal = phaseEmo.length || 1
-                            const negSent = phaseEmo.filter(e => e.sentiment === 'negative').length / emoTotal
-                            const posSent = phaseEmo.filter(e => e.sentiment === 'positive').length / emoTotal
-                            const neuSent = phaseEmo.filter(e => e.sentiment === 'neutral').length / emoTotal
-                            const emoCount: Record<string, number> = {}
-                            for (const e of phaseEmo) for (const em of e.top_emotions) {
-                              emoCount[em.label] = (emoCount[em.label] ?? 0) + 1
+                            const saved = userPersonas[def.key]
+                            const loading = personaClassifying.has(def.key)
+                            const PERSONA_COLORS_LOCAL: Record<string, string> = {
+                              'Suno Team':     'bg-fuchsia-50 text-fuchsia-700 border-fuchsia-200',
+                              'Contributor':   'bg-blue-50 text-blue-700 border-blue-200',
+                              'Help-Seeker':   'bg-amber-50 text-amber-700 border-amber-200',
+                              'Evangelist':    'bg-emerald-50 text-emerald-700 border-emerald-200',
+                              'Scrutinizer':   'bg-rose-50 text-rose-700 border-rose-200',
+                              'Explorer':      'bg-violet-50 text-violet-700 border-violet-200',
+                              'Uncategorized': 'bg-slate-50 text-slate-500 border-slate-200',
                             }
-                            const topEmotions = Object.entries(emoCount).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([l])=>l)
-                            const topTopics: string[] = []
-                            if (userTopicsResult?.doc_assignments) {
-                              const tCounts: Record<number, number> = {}
-                              for (const m of phaseMsgs) {
-                                const tid = m.msg_uuid ? userTopicsResult.doc_assignments[m.msg_uuid] : undefined
-                                if (tid !== undefined) tCounts[tid] = (tCounts[tid] ?? 0) + 1
-                              }
-                              Object.entries(tCounts).sort(([,a],[,b])=>b-a).slice(0,3).forEach(([tid]) => {
-                                const topic = userTopicsResult.topics.find(t => t.id === Number(tid))
-                                if (topic) topTopics.push(topic.label)
-                              })
-                            }
-                            const phaseAvgWords = phaseMsgs.length > 0
-                              ? phaseMsgs.reduce((s, m) => s + m.content.split(/\s+/).filter(Boolean).length, 0) / phaseMsgs.length
-                              : 0
-                            const phaseWeeksActive = new Set(phaseMsgs.map(m => m.date ? mondayKey(m.date) : '').filter(Boolean)).size
-                            const features = {
-                              msg_count: msgCount,
-                              avg_words: phaseAvgWords,
-                              pct_weeks: info?.pctWeeks ?? 0,
-                              weeks_active: phaseWeeksActive,
-                              dropout_status: status,
-                              sentiment_positive: phaseEmo.length > 0 ? posSent : null,
-                              sentiment_negative: phaseEmo.length > 0 ? negSent : null,
-                              sentiment_neutral: phaseEmo.length > 0 ? neuSent : null,
-                              top_emotions: topEmotions.length > 0 ? topEmotions : null,
-                              top_topics: topTopics.length > 0 ? topTopics : null,
-                            }
-                            const sample = phaseMsgs.slice(-15).map(m => ({ content: m.content, date: m.date ?? '' }))
-                            const saved = userPersonas[def.key] ?? {}
-                            const ruleKey = `${def.key}:rule_based`
-                            const llmKey = `${def.key}:llm`
-                            const bothKey = `${def.key}:rule_based,llm`
-                            const ruleLoading = personaClassifying.has(ruleKey) || personaClassifying.has(bothKey)
-                            const llmLoading  = personaClassifying.has(llmKey)  || personaClassifying.has(bothKey)
-
-                            const PersonaBadge = ({ result, color }: { result?: PersonaResult; color: 'indigo' | 'violet' }) => {
-                              if (!result) return <span className="text-[9px] text-gray-300">—</span>
-                              const bg = color === 'indigo' ? 'bg-indigo-50 text-indigo-700 border-indigo-200' : 'bg-violet-50 text-violet-700 border-violet-200'
-                              const pct = Math.round(result.confidence * 100)
+                            const ArchetypeBadge = ({ name, conf, secondary }: { name: string; conf: number; secondary?: boolean }) => {
+                              const cls = PERSONA_COLORS_LOCAL[name] ?? 'bg-gray-50 text-gray-600 border-gray-200'
                               return (
-                                <span title={result.reasoning} className={`inline-block text-[9px] font-semibold px-1.5 py-0.5 rounded border ${bg} cursor-help`}>
-                                  {result.persona} <span className="opacity-60">{pct}%</span>
+                                <span className={`inline-block text-[9px] font-semibold px-1.5 py-0.5 rounded border ${cls} ${secondary ? 'opacity-75' : ''}`}>
+                                  {name} <span className="opacity-60">{Math.round(conf * 100)}%</span>
                                 </span>
                               )
                             }
@@ -4711,33 +4091,32 @@ export default function SearchPage() {
                                 <td className="text-right px-3 py-2 text-gray-700">{msgCount > 0 ? msgCount : '—'}</td>
                                 <td className="text-right px-3 py-2 text-gray-600">{info ? `${info.pctWeeks}%` : '—'}</td>
                                 <td className="text-center px-2 py-2">
-                                  {ruleLoading
+                                  {loading
                                     ? <span className="text-[9px] text-indigo-400">⏳</span>
-                                    : <PersonaBadge result={saved.rule_based} color="indigo" />
+                                    : msgCount === 0
+                                      ? <span className="text-[9px] text-gray-300">No data</span>
+                                      : saved
+                                        ? <span title={saved.reasoning} className="cursor-help"><ArchetypeBadge name={saved.persona} conf={saved.confidence} /></span>
+                                        : <span className="text-[9px] text-gray-300">—</span>
                                   }
                                 </td>
                                 <td className="text-center px-2 py-2">
-                                  {llmLoading
-                                    ? <span className="text-[9px] text-violet-400">⏳</span>
-                                    : <PersonaBadge result={saved.llm} color="violet" />
-                                  }
+                                  {msgCount === 0
+                                    ? <span className="text-[9px] text-gray-300">No data</span>
+                                    : saved?.secondary_persona
+                                      ? <span title={saved.reasoning} className="cursor-help">
+                                          <ArchetypeBadge name={saved.secondary_persona} conf={saved.secondary_confidence ?? 0} secondary />
+                                        </span>
+                                      : <span className="text-[9px] text-gray-300">—</span>}
                                 </td>
                                 <td className="text-center px-2 py-1.5">
                                   {msgCount > 0 ? (
-                                    <div className="flex items-center justify-center gap-1">
-                                      <button
-                                        disabled={ruleLoading}
-                                        title="Rule-based classification"
-                                        onClick={() => classifyPersona(def.key, def.label, features, sample, ['rule_based'])}
-                                        className="text-[9px] px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700 hover:bg-indigo-200 disabled:opacity-40 transition-colors font-semibold"
-                                      >⚡</button>
-                                      <button
-                                        disabled={llmLoading}
-                                        title="LLM classification (requires OpenAI key)"
-                                        onClick={() => classifyPersona(def.key, def.label, features, sample, ['llm'])}
-                                        className="text-[9px] px-1.5 py-0.5 rounded bg-violet-100 text-violet-700 hover:bg-violet-200 disabled:opacity-40 transition-colors font-semibold"
-                                      >🤖</button>
-                                    </div>
+                                    <button
+                                      disabled={loading}
+                                      title="Recompute archetype from stored signals"
+                                      onClick={() => recomputeOneArchetype(def.key, def.label, def.from, def.to ?? '')}
+                                      className="text-[9px] px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700 hover:bg-indigo-200 disabled:opacity-40 transition-colors font-semibold"
+                                    >↻</button>
                                   ) : <span className="text-[9px] text-gray-300">—</span>}
                                 </td>
                               </tr>
@@ -4747,8 +4126,7 @@ export default function SearchPage() {
                       </table>
                     </div>
                     <p className="text-[9px] text-gray-400">
-                      <span className="font-medium text-indigo-600">⚡ Rule</span> = deterministic rules (no API key).&nbsp;
-                      <span className="font-medium text-violet-600">🤖 LLM</span> = GPT-4o-mini (requires OpenAI key). Hover persona badge to see reasoning.
+                      Archetype is computed from already-stored sentiment + topic + activity signals; no LLM calls. Hover any badge to see the score breakdown.
                     </p>
 
                     {/* Criteria reference */}
@@ -5082,12 +4460,16 @@ export default function SearchPage() {
                   keyword={userDetailContains}
                   tokens={[]}
                   isBookmarked={bookmarkedIds.has(msg.id)}
-                  isSelected={selectedIds.has(msg.id)}
                   onBookmarkToggle={handleBookmarkToggle}
-                  onSelectToggle={toggleSelected}
                   ctxBefore={userDetailCtxBefore}
                   ctxAfter={userDetailCtxAfter}
                   emotion={msg.msg_uuid ? msgEmotions[msg.msg_uuid] : undefined}
+                  archetype={(() => {
+                    const phaseKey = dateToPhaseKey(msg.date ?? '')
+                    return phaseKey && phasePersonas[phaseKey]
+                      ? phasePersonas[phaseKey][msg.username]
+                      : tablePersonas[msg.username]?.persona
+                  })()}
                 />
               ))
             )}
@@ -5174,8 +4556,7 @@ export default function SearchPage() {
           if (e.key !== 'Enter') return
           const tag = (e.target as HTMLElement).tagName.toLowerCase()
           if (tag === 'button' || tag === 'textarea') return
-          if (searchCat === 'users') doUserSearch()
-          else doSearch()
+          doUserSearch()
         }}
       >
         <div className="flex items-center justify-between mb-3">
@@ -5190,14 +4571,8 @@ export default function SearchPage() {
 
         {showSearchPanel && (
           <>
-            {/* Chat / Users top toggle */}
-            <div className="flex gap-1 mb-4">
-              <button onClick={() => handleCatSwitch('chat')} className={`subtab-btn${searchCat === 'chat' ? ' subtab-btn-active' : ''}`}>Chat Data</button>
-              <button onClick={() => handleCatSwitch('users')} className={`subtab-btn${searchCat === 'users' ? ' subtab-btn-active' : ''}`}>Users Data</button>
-            </div>
-
             {/* Users Data sub-tab toggle */}
-            {searchCat === 'users' && (
+            {(
               <div className="flex border-b mb-4">
                 <button
                   onClick={() => setUsersDataTab('search')}
@@ -5214,359 +4589,8 @@ export default function SearchPage() {
               </div>
             )}
 
-            {/* Chat search */}
-            {searchCat === 'chat' && (
-              <>
-                <div className="flex border-b mb-4 overflow-x-auto">
-                  {tabs.map((t) => (
-                    <button key={t.id} onClick={() => handleTabSwitch(t.id)} className={`search-tab whitespace-nowrap${activeTab === t.id ? ' tab-active' : ''}`}>
-                      {t.label}
-                    </button>
-                  ))}
-                </div>
-
-                {/* Keyword tab */}
-                {activeTab === 'keyword' && (
-                  <>
-                    <div className="flex gap-2 mb-4 items-center">
-                      <div className="inline-flex shrink-0">
-                        {(['any', 'fuzzy', 'exact'] as MatchType[]).map((m) => (
-                          <button key={m} onClick={() => setMatchType(m)} className={`range-mode-btn${matchType === m ? ' range-mode-active' : ''}`}>
-                            {m === 'any' ? 'Any Word' : m === 'fuzzy' ? 'Fuzzy' : 'Exact'}
-                          </button>
-                        ))}
-                      </div>
-                      <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Keyword or phrase…" className={`${inputCls} flex-1`} />
-                      <button onClick={doSearch} disabled={searching} className="search-btn">{searching ? 'Searching…' : 'Search'}</button>
-                    </div>
-                    <button onClick={() => setShowOptions((v) => !v)} className="flex items-center gap-1 text-xs text-gray-500 hover:text-indigo-600 mb-2 transition-colors">
-                      <svg className={`w-3 h-3 transition-transform duration-200${showOptions ? ' rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M19 9l-7 7-7-7"/>
-                      </svg>
-                      <span>Options</span>
-                    </button>
-                    {showOptions && (
-                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-4 gap-y-3">
-                        <div className="flex flex-col gap-1">
-                          <label className="filter-label">Username</label>
-                          <input value={filterUsername} onChange={(e) => setFilterUsername(e.target.value)} placeholder="Optional username…" className={inputCls} />
-                        </div>
-                        <div className="flex flex-col gap-1">
-                          <label className="filter-label">From</label>
-                          <input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} className={inputCls} />
-                        </div>
-                        <div className="flex flex-col gap-1">
-                          <label className="filter-label">To</label>
-                          <input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} className={inputCls} />
-                        </div>
-                        <div className="flex flex-col gap-1">
-                          <label className="filter-label">Suno Team</label>
-                          <select value={sunoTeam} onChange={(e) => setSunoTeam(e.target.value)} className={inputCls}>
-                            <option value="all">All</option>
-                            <option value="only">Only Suno Team</option>
-                            <option value="exclude">Exclude Suno Team</option>
-                          </select>
-                        </div>
-                        <div className="flex flex-col gap-1">
-                          <label className="filter-label">Limit</label>
-                          <input type="text" inputMode="numeric" value={String(maxResults)} onChange={(e) => { const d = e.target.value.replace(/\D/g, ''); setMaxResults(d ? parseInt(d) : 1000000) }} className={inputCls} />
-                        </div>
-                        <div className="flex flex-col gap-1">
-                          <label className="filter-label">Min Words</label>
-                          <input type="text" inputMode="numeric" value={String(minWords)} onChange={(e) => { const d = e.target.value.replace(/\D/g, ''); setMinWords(d ? parseInt(d) : 0) }} className={inputCls} />
-                        </div>
-                      </div>
-                    )}
-                  </>
-                )}
-
-                {/* Semantic tab */}
-                {activeTab === 'semantic' && (
-                  <>
-                    <div className="flex gap-2 mb-4">
-                      <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Describe what you're looking for…" className={`${inputCls} flex-1`} />
-                      <button onClick={doSearch} disabled={searching} className="search-btn">{searching ? 'Searching…' : 'Search'}</button>
-                    </div>
-                    <button onClick={() => setShowOptions((v) => !v)} className="flex items-center gap-1 text-xs text-gray-500 hover:text-indigo-600 mb-2 transition-colors">
-                      <svg className={`w-3 h-3 transition-transform duration-200${showOptions ? ' rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M19 9l-7 7-7-7"/>
-                      </svg>
-                      <span>Options</span>
-                    </button>
-                    {showOptions && (
-                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-4 gap-y-3">
-                        <div className="flex flex-col gap-1">
-                          <label className="filter-label">Username</label>
-                          <input value={filterUsername} onChange={(e) => setFilterUsername(e.target.value)} placeholder="Optional username…" className={inputCls} />
-                        </div>
-                        <div className="flex flex-col gap-1">
-                          <label className="filter-label">From</label>
-                          <input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} className={inputCls} />
-                        </div>
-                        <div className="flex flex-col gap-1">
-                          <label className="filter-label">To</label>
-                          <input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} className={inputCls} />
-                        </div>
-                        <div className="flex flex-col gap-1">
-                          <label className="filter-label">Suno Team</label>
-                          <select value={sunoTeam} onChange={(e) => setSunoTeam(e.target.value)} className={inputCls}>
-                            <option value="all">All</option>
-                            <option value="only">Only Suno Team</option>
-                            <option value="exclude">Exclude Suno Team</option>
-                          </select>
-                        </div>
-                        <div className="flex flex-col gap-1">
-                          <label className="filter-label">Limit</label>
-                          <input type="text" inputMode="numeric" value={String(maxResults)} onChange={(e) => { const d = e.target.value.replace(/\D/g, ''); setMaxResults(d ? parseInt(d) : 1000000) }} className={inputCls} />
-                        </div>
-                        <div className="flex flex-col gap-1">
-                          <label className="filter-label">Min Words</label>
-                          <input type="text" inputMode="numeric" value={String(minWords)} onChange={(e) => { const d = e.target.value.replace(/\D/g, ''); setMinWords(d ? parseInt(d) : 0) }} className={inputCls} />
-                        </div>
-                        <div className="flex flex-col gap-1">
-                          <label className="filter-label">Sort By</label>
-                          <select value={sortBy} onChange={(e) => setSortBy(e.target.value)} className={inputCls}>
-                            <option value="similarity">Similarity ↓</option>
-                            <option value="date_asc">Date (oldest first)</option>
-                            <option value="date_desc">Date (newest first)</option>
-                          </select>
-                        </div>
-                      </div>
-                    )}
-                    <p className="text-xs text-gray-500 mt-3">Requires embedded data. Author &amp; date filter applied after retrieval.</p>
-                  </>
-                )}
-
-                {/* Username tab */}
-                {activeTab === 'username' && (
-                  <>
-                    <div className="flex gap-2 mb-4">
-                      <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Username or partial match…" className={`${inputCls} flex-1`} />
-                      <button onClick={doSearch} disabled={searching} className="search-btn">{searching ? 'Searching…' : 'Search'}</button>
-                    </div>
-                    <button onClick={() => setShowOptions((v) => !v)} className="flex items-center gap-1 text-xs text-gray-500 hover:text-indigo-600 mb-2 transition-colors">
-                      <svg className={`w-3 h-3 transition-transform duration-200${showOptions ? ' rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M19 9l-7 7-7-7"/>
-                      </svg>
-                      <span>Options</span>
-                    </button>
-                    {showOptions && (
-                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-4 gap-y-3">
-                        <div className="flex flex-col gap-1">
-                          <label className="filter-label">From</label>
-                          <input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} className={inputCls} />
-                        </div>
-                        <div className="flex flex-col gap-1">
-                          <label className="filter-label">To</label>
-                          <input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} className={inputCls} />
-                        </div>
-                        <div className="flex flex-col gap-1">
-                          <label className="filter-label">Suno Team</label>
-                          <select value={sunoTeam} onChange={(e) => setSunoTeam(e.target.value)} className={inputCls}>
-                            <option value="all">All</option>
-                            <option value="only">Only Suno Team</option>
-                            <option value="exclude">Exclude Suno Team</option>
-                          </select>
-                        </div>
-                        <div className="flex flex-col gap-1">
-                          <label className="filter-label">Limit</label>
-                          <input type="text" inputMode="numeric" value={String(maxResults)} onChange={(e) => { const d = e.target.value.replace(/\D/g, ''); setMaxResults(d ? parseInt(d) : 1000000) }} className={inputCls} />
-                        </div>
-                        <div className="flex flex-col gap-1">
-                          <label className="filter-label">Min Words</label>
-                          <input type="text" inputMode="numeric" value={String(minWords)} onChange={(e) => { const d = e.target.value.replace(/\D/g, ''); setMinWords(d ? parseInt(d) : 0) }} className={inputCls} />
-                        </div>
-                      </div>
-                    )}
-                    <p className="text-xs text-gray-500 mt-3">Partial match, case-insensitive.</p>
-                  </>
-                )}
-
-                {/* Phase shortcuts — shared by keyword / semantic / username tabs (all use dateFrom/dateTo) */}
-                {(activeTab === 'keyword' || activeTab === 'semantic' || activeTab === 'username') && showOptions && (() => {
-                  type PhaseKey = '1' | '2' | '3' | '3a' | '3b' | '3c' | '3d'
-                  const ap: PhaseKey | null =
-                    dateFrom === '2023-04-01' && dateTo === '2023-07-18' ? '1' :
-                    dateFrom === '2023-07-19' && dateTo === '2023-09-05' ? '2' :
-                    dateFrom === '2023-09-06' && dateTo === '' ? '3' :
-                    dateFrom === '2023-09-06' && dateTo === '2023-12-18' ? '3a' :
-                    dateFrom === '2023-12-18' && dateTo === '2024-03-17' ? '3b' :
-                    dateFrom === '2024-03-17' && dateTo === '2024-05-16' ? '3c' :
-                    dateFrom === '2024-05-17' && dateTo === '' ? '3d' : null
-                  const set = (p: PhaseKey) => {
-                    if (ap === p) { setDateFrom(''); setDateTo(''); return }
-                    if (p === '1')       { setDateFrom('2023-04-01'); setDateTo('2023-07-18') }
-                    else if (p === '2')  { setDateFrom('2023-07-19'); setDateTo('2023-09-05') }
-                    else if (p === '3')  { setDateFrom('2023-09-06'); setDateTo('') }
-                    else if (p === '3a') { setDateFrom('2023-09-06'); setDateTo('2023-12-18') }
-                    else if (p === '3b') { setDateFrom('2023-12-18'); setDateTo('2024-03-17') }
-                    else if (p === '3c') { setDateFrom('2024-03-17'); setDateTo('2024-05-16') }
-                    else if (p === '3d') { setDateFrom('2024-05-17'); setDateTo('') }
-                  }
-                  return (
-                    <div className="mt-2 mb-1 flex flex-wrap gap-1.5">
-                      <span className="filter-label self-center shrink-0">Phase</span>
-                      {([
-                        { key: '1',  label: 'Phase 1 — Capability Surfacing',     dates: 'Apr–18 Jul 2023',         cls: ['border-blue-400 bg-blue-100 text-blue-800',         'border-blue-300 text-blue-700 hover:bg-blue-50']         },
-                        { key: '2',  label: 'Phase 2 — Enclosure & Scrutiny',     dates: '19 Jul–5 Sep 2023',       cls: ['border-amber-400 bg-amber-100 text-amber-800',       'border-amber-300 text-amber-700 hover:bg-amber-50']       },
-                        { key: '3',  label: 'Phase 3 — Commercialization',        dates: 'Sep 2023 onward',         cls: ['border-emerald-400 bg-emerald-100 text-emerald-800', 'border-emerald-300 text-emerald-700 hover:bg-emerald-50'] },
-                        { key: '3a', label: 'Phase 3A — Early Commercialization', dates: '6 Sep–18 Dec 2023',       cls: ['border-violet-400 bg-violet-100 text-violet-800',    'border-violet-300 text-violet-700 hover:bg-violet-50']    },
-                        { key: '3b', label: 'Phase 3B — Early Wide Adoption',     dates: '18 Dec 2023–17 Mar 2024', cls: ['border-sky-400 bg-sky-100 text-sky-800',             'border-sky-300 text-sky-700 hover:bg-sky-50']             },
-                        { key: '3c', label: 'Phase 3C — Pre-Litigation',          dates: '17 Mar–16 May 2024',      cls: ['border-orange-400 bg-orange-100 text-orange-800',    'border-orange-300 text-orange-700 hover:bg-orange-50']    },
-                        { key: '3d', label: 'Phase 3D — Warning & Lawsuit',       dates: '17 May 2024 onward',      cls: ['border-rose-400 bg-rose-100 text-rose-800',          'border-rose-300 text-rose-700 hover:bg-rose-50']          },
-                      ] as { key: PhaseKey; label: string; dates: string; cls: [string, string] }[]).map(({ key, label, dates, cls }) => (
-                        <button
-                          key={key}
-                          onClick={() => set(key)}
-                          className={`text-xs px-2.5 py-1 rounded-full border transition-colors font-medium ${ap === key ? cls[0] + ' font-semibold' : cls[1]}`}
-                        >
-                          {label} <span className="opacity-60 ml-1">{dates}</span>
-                        </button>
-                      ))}
-                    </div>
-                  )
-                })()}
-
-                {/* Time Range tab */}
-                {activeTab === 'range' && (
-                  <>
-                    <div className="inline-flex mb-3">
-                      <button onClick={() => setRangeMode('exact')} className={`range-mode-btn${rangeMode === 'exact' ? ' range-mode-active' : ''}`}>Exact Date Range</button>
-                      <button onClick={() => setRangeMode('month')} className={`range-mode-btn${rangeMode === 'month' ? ' range-mode-active' : ''}`}>By Month &amp; Year</button>
-                    </div>
-
-                    {/* Phase template shortcuts */}
-                    {(() => {
-                      type PhaseKey = '1' | '2' | '3' | '3a' | '3b' | '3c' | '3d'
-                      const rangeActivePhase: PhaseKey | null =
-                        rangeDateFrom === '2023-04-01' && rangeDateTo === '2023-07-18' ? '1' :
-                        rangeDateFrom === '2023-07-19' && rangeDateTo === '2023-09-05' ? '2' :
-                        rangeDateFrom === '2023-09-06' && rangeDateTo === '' ? '3' :
-                        rangeDateFrom === '2023-09-06' && rangeDateTo === '2023-12-18' ? '3a' :
-                        rangeDateFrom === '2023-12-18' && rangeDateTo === '2024-03-17' ? '3b' :
-                        rangeDateFrom === '2024-03-17' && rangeDateTo === '2024-05-16' ? '3c' :
-                        rangeDateFrom === '2024-05-17' && rangeDateTo === '' ? '3d' : null
-
-                      const applyPhase = (p: PhaseKey) => {
-                        if (rangeActivePhase === p) {
-                          setRangeDateFrom(''); setRangeDateTo('')
-                        } else {
-                          setRangeMode('exact')
-                          if (p === '1')  { setRangeDateFrom('2023-04-01'); setRangeDateTo('2023-07-18') }
-                          else if (p === '2')  { setRangeDateFrom('2023-07-19'); setRangeDateTo('2023-09-05') }
-                          else if (p === '3')  { setRangeDateFrom('2023-09-06'); setRangeDateTo('') }
-                          else if (p === '3a') { setRangeDateFrom('2023-09-06'); setRangeDateTo('2023-12-18') }
-                          else if (p === '3b') { setRangeDateFrom('2023-12-18'); setRangeDateTo('2024-03-17') }
-                          else if (p === '3c') { setRangeDateFrom('2024-03-17'); setRangeDateTo('2024-05-16') }
-                          else if (p === '3d') { setRangeDateFrom('2024-05-17'); setRangeDateTo('') }
-                        }
-                      }
-
-                      return (
-                        <div className="flex flex-wrap gap-2 mb-3">
-                          <span className="filter-label self-center shrink-0">Phase</span>
-                          <button
-                            onClick={() => applyPhase('1')}
-                            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${rangeActivePhase === '1' ? 'border-blue-400 bg-blue-100 text-blue-800 font-semibold' : 'border-blue-300 text-blue-700 hover:bg-blue-50'}`}
-                          >
-                            Phase 1 — Capability Surfacing <span className="opacity-60 ml-1">Apr–18 Jul 2023</span>
-                          </button>
-                          <button
-                            onClick={() => applyPhase('2')}
-                            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${rangeActivePhase === '2' ? 'border-amber-400 bg-amber-100 text-amber-800 font-semibold' : 'border-amber-300 text-amber-700 hover:bg-amber-50'}`}
-                          >
-                            Phase 2 — Enclosure &amp; Scrutiny <span className="opacity-60 ml-1">19 Jul–5 Sep 2023</span>
-                          </button>
-                          <button
-                            onClick={() => applyPhase('3')}
-                            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${rangeActivePhase === '3' ? 'border-emerald-400 bg-emerald-100 text-emerald-800 font-semibold' : 'border-emerald-300 text-emerald-700 hover:bg-emerald-50'}`}
-                          >
-                            Phase 3 — Commercialization <span className="opacity-60 ml-1">Sep 2023 onward</span>
-                          </button>
-                          <button
-                            onClick={() => applyPhase('3a')}
-                            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${rangeActivePhase === '3a' ? 'border-violet-400 bg-violet-100 text-violet-800 font-semibold' : 'border-violet-300 text-violet-700 hover:bg-violet-50'}`}
-                          >
-                            Phase 3A — Early Commercialization <span className="opacity-60 ml-1">6 Sep–18 Dec 2023</span>
-                          </button>
-                          <button
-                            onClick={() => applyPhase('3b')}
-                            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${rangeActivePhase === '3b' ? 'border-sky-400 bg-sky-100 text-sky-800 font-semibold' : 'border-sky-300 text-sky-700 hover:bg-sky-50'}`}
-                          >
-                            Phase 3B — Early Wide Adoption <span className="opacity-60 ml-1">18 Dec 2023–17 Mar 2024</span>
-                          </button>
-                          <button
-                            onClick={() => applyPhase('3c')}
-                            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${rangeActivePhase === '3c' ? 'border-orange-400 bg-orange-100 text-orange-800 font-semibold' : 'border-orange-300 text-orange-700 hover:bg-orange-50'}`}
-                          >
-                            Phase 3C — Pre-Litigation <span className="opacity-60 ml-1">17 Mar–16 May 2024</span>
-                          </button>
-                          <button
-                            onClick={() => applyPhase('3d')}
-                            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${rangeActivePhase === '3d' ? 'border-rose-400 bg-rose-100 text-rose-800 font-semibold' : 'border-rose-300 text-rose-700 hover:bg-rose-50'}`}
-                          >
-                            Phase 3D — Warning &amp; Lawsuit <span className="opacity-60 ml-1">17 May 2024 onward</span>
-                          </button>
-                        </div>
-                      )
-                    })()}
-
-                    {rangeMode === 'exact' && (
-                      <div className="grid grid-cols-2 gap-x-4 gap-y-3 mb-3">
-                        <div className="flex flex-col gap-1">
-                          <label className="filter-label">From</label>
-                          <input type="date" value={rangeDateFrom} onChange={(e) => setRangeDateFrom(e.target.value)} className={inputCls} />
-                        </div>
-                        <div className="flex flex-col gap-1">
-                          <label className="filter-label">To</label>
-                          <input type="date" value={rangeDateTo} onChange={(e) => setRangeDateTo(e.target.value)} className={inputCls} />
-                        </div>
-                      </div>
-                    )}
-                    {rangeMode === 'month' && (
-                      <div className="grid grid-cols-2 gap-x-4 gap-y-3 mb-3">
-                        <div className="flex flex-col gap-1">
-                          <label className="filter-label">From Month</label>
-                          <input type="month" value={rangeDateFrom.slice(0, 7)} onChange={(e) => setRangeDateFrom(e.target.value + '-01')} className={inputCls} />
-                        </div>
-                        <div className="flex flex-col gap-1">
-                          <label className="filter-label">To Month</label>
-                          <input type="month" value={rangeDateTo.slice(0, 7)} onChange={(e) => setRangeDateTo(e.target.value + '-31')} className={inputCls} />
-                        </div>
-                      </div>
-                    )}
-                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-4 gap-y-3 mb-4">
-                      <div className="flex flex-col gap-1">
-                        <label className="filter-label">Suno Team</label>
-                        <select value={sunoTeam} onChange={(e) => setSunoTeam(e.target.value)} className={inputCls}>
-                          <option value="all">All</option>
-                          <option value="only">Only Suno Team</option>
-                          <option value="exclude">Exclude Suno Team</option>
-                        </select>
-                      </div>
-                      <div className="flex flex-col gap-1">
-                        <label className="filter-label">Min Words</label>
-                        <input type="text" inputMode="numeric" value={String(minWords)} onChange={(e) => { const d = e.target.value.replace(/\D/g, ''); setMinWords(d ? parseInt(d) : 0) }} className={inputCls} />
-                      </div>
-                      <div className="flex flex-col gap-1">
-                        <label className="filter-label">Limit</label>
-                        <input type="text" inputMode="numeric" value={String(maxResults)} onChange={(e) => { const d = e.target.value.replace(/\D/g, ''); setMaxResults(d ? parseInt(d) : 1000000) }} className={inputCls} />
-                      </div>
-                    </div>
-                    <button onClick={doSearch} disabled={searching} className="search-btn">{searching ? 'Searching…' : 'Search'}</button>
-                    <p className="text-xs text-gray-500 mt-3">Returns all messages in the selected range. At least one date is required.</p>
-                  </>
-                )}
-                {activeTab === 'browse' && (
-                  <p className="text-xs text-gray-500">
-                    Showing all messages oldest-first, 50 at a time. Scroll down to load more.
-                  </p>
-                )}
-              </>
-            )}
-
             {/* Users Stats Search */}
-            {searchCat === 'users' && usersDataTab === 'search' && (
+            {usersDataTab === 'search' && (
               <div className="space-y-3">
                 <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-4 gap-y-3 mb-3">
                   <div className="flex flex-col gap-1">
@@ -5656,7 +4680,7 @@ export default function SearchPage() {
             )}
 
             {/* User Summary Per Phases */}
-            {searchCat === 'users' && usersDataTab === 'phases' && (() => {
+            {usersDataTab === 'phases' && (() => {
               const pendingFetch = [...selectedPhases].filter((k) => !(k in phaseData))
 
               const phaseFilterEnd = (key: string) => {
@@ -5826,7 +4850,8 @@ export default function SearchPage() {
 
                         const flowRows: FlowRow[] = loadedKeys.map((key, i) => {
                           const def = PHASE_DEFS.find(p => p.key === key)!
-                          const periodDays = def.to ? daysBetween(def.from, def.to) : null
+                          const filterEnd = phaseFilterEnd(key)
+                          const periodDays = filterEnd ? daysBetween(def.from, filterEnd) : null
                           const statusMap = phaseStatusMaps[key]
                           const userSet = phaseUserSets[key]
                           const totalUsers = [...userSet].sort()
@@ -6206,7 +5231,7 @@ export default function SearchPage() {
                                         <tr
                                           key={name}
                                           className="border-b border-gray-50 hover:bg-gray-50 cursor-pointer"
-                                          onClick={() => navigate(`/discord/users/${encodeURIComponent(name)}`)}
+                                          onClick={() => navigate(`/discord/search/users/${encodeURIComponent(name)}`)}
                                         >
                                           <td className="px-3 py-1.5 font-medium text-indigo-700 max-w-[140px] truncate">{name}</td>
                                           {loadedKeys.map((k) => {
@@ -6334,7 +5359,7 @@ export default function SearchPage() {
                                           CSV
                                         </button>
                                         <button
-                                          onClick={() => navigate(`/discord/users/${encodeURIComponent(exactMatch)}`)}
+                                          onClick={() => navigate(`/discord/search/users/${encodeURIComponent(exactMatch)}`)}
                                           className="text-xs text-indigo-600 hover:text-indigo-800 hover:underline font-medium"
                                         >
                                           View Full Detail →
@@ -6360,7 +5385,7 @@ export default function SearchPage() {
                                               <tr
                                                 key={key}
                                                 className="border-b border-gray-50 hover:bg-gray-50 cursor-pointer"
-                                                onClick={() => navigate(`/discord/users/${encodeURIComponent(exactMatch)}`)}
+                                                onClick={() => navigate(`/discord/search/users/${encodeURIComponent(exactMatch)}`)}
                                               >
                                                 <td className="px-3 py-2">
                                                   <span className={`inline-block px-2 py-0.5 rounded-full text-[10px] font-semibold border ${def.chipCls}`}>{def.label}</span>
@@ -6433,6 +5458,768 @@ export default function SearchPage() {
                           </div>
                         )
                       })()}
+
+                      {/* Section C: Archetype Trend Across Phases */}
+                      {(() => {
+                        if (personaSummary.length === 0) return null
+
+                        const ALL_ARCHETYPES = [
+                          { name: 'Contributor', color: '#3b82f6' },
+                          { name: 'Explorer',    color: '#8b5cf6' },
+                          { name: 'Help-Seeker', color: '#f59e0b' },
+                          { name: 'Suno Team',   color: '#d946ef' },
+                          { name: 'Uncategorized', color: '#94a3b8' },
+                        ]
+
+                        // Build per-phase archetype count map from personaSummary (fetched
+                        // globally, independent of which phases' user lists are "Loaded" above).
+                        const archByPhase: Record<string, Record<string, number>> = {}
+                        for (const row of personaSummary) {
+                          if (!archByPhase[row.phase]) archByPhase[row.phase] = {}
+                          archByPhase[row.phase][row.persona] = (archByPhase[row.phase][row.persona] ?? 0) + row.count
+                        }
+
+                        // Show every phase that already has saved archetype data, not just the
+                        // ones currently "Loaded" in the phase selector above — this section
+                        // reflects prior computations, so a phase like 3D shouldn't appear
+                        // empty just because its user list hasn't been (re)fetched this session.
+                        const archetypePhaseDefs = PHASE_DEFS.filter(def => archByPhase[def.key])
+
+                        const archetypeChartData = archetypePhaseDefs.map(def => {
+                          const counts = archByPhase[def.key] ?? {}
+                          const total = Object.values(counts).reduce((s, c) => s + c, 0)
+                          const entry: Record<string, number | string> = { phase: def.label, total }
+                          for (const { name } of ALL_ARCHETYPES) entry[name] = counts[name] ?? 0
+                          return entry
+                        }).filter(d => (d.total as number) > 0)
+
+                        if (archetypeChartData.length === 0) return null
+
+                        const archetypePctData = archetypeChartData.map(d => {
+                          const total = d.total as number
+                          const entry: Record<string, number | string> = { phase: d.phase }
+                          for (const { name } of ALL_ARCHETYPES) {
+                            entry[name] = total > 0 ? Math.round(((d[name] as number) / total) * 100) : 0
+                          }
+                          return entry
+                        })
+
+                        const isExpanded = expandedPhaseSections.has('archetype-trend')
+                        const toggleSection = () => setExpandedPhaseSections(prev => {
+                          const next = new Set(prev)
+                          next.has('archetype-trend') ? next.delete('archetype-trend') : next.add('archetype-trend')
+                          return next
+                        })
+
+                        return (
+                          <div className="rounded-xl border border-gray-200 overflow-hidden">
+                            <button onClick={toggleSection} className="w-full flex items-center justify-between px-4 py-3 bg-gray-50 hover:bg-gray-100 transition-colors text-left">
+                              <div>
+                                <span className="text-xs font-semibold text-gray-700">Archetype Trend Across Phases</span>
+                                <span className="ml-2 text-[10px] text-gray-400">distribution of user archetypes per phase</span>
+                              </div>
+                              <svg className={`w-3.5 h-3.5 text-gray-400 transition-transform duration-150 ${isExpanded ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M19 9l-7 7-7-7" />
+                              </svg>
+                            </button>
+
+                            {isExpanded && (
+                              <div className="px-4 py-4 space-y-6 bg-white">
+
+                                {/* Stacked bar — absolute counts */}
+                                <div>
+                                  <div className="flex items-center justify-between mb-2">
+                                    <h4 className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide">Archetype Counts per Phase</h4>
+                                    <button onClick={() => downloadChartAsPNG(chartArchetypeRef.current, 'archetype-counts-per-phase.png')} className="flex items-center gap-1.5 text-[10px] text-gray-500 hover:text-gray-700 px-2 py-1 rounded border border-gray-200 hover:border-gray-300 hover:bg-gray-50 transition-colors" title="PNG">
+                                      <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                                      PNG
+                                    </button>
+                                  </div>
+                                  <div ref={chartArchetypeRef}>
+                                    <ResponsiveContainer width="100%" height={220}>
+                                      <BarChart data={archetypeChartData} barCategoryGap="25%">
+                                        <XAxis dataKey="phase" tick={{ fontSize: 10 }} />
+                                        <YAxis tick={{ fontSize: 10 }} />
+                                        <Tooltip contentStyle={{ fontSize: 11 }} />
+                                        {ALL_ARCHETYPES.map(({ name, color }) => (
+                                          <Bar key={name} dataKey={name} stackId="a" fill={color} />
+                                        ))}
+                                      </BarChart>
+                                    </ResponsiveContainer>
+                                    <div className="flex flex-wrap gap-x-4 gap-y-1 justify-center mt-2">
+                                      {ALL_ARCHETYPES.map(({ name, color }) => (
+                                        <span key={name} className="flex items-center gap-1 text-[10px] text-gray-500">
+                                          <span className="inline-block w-2.5 h-2.5 rounded-sm flex-shrink-0" style={{ backgroundColor: color }} />
+                                          {name}
+                                        </span>
+                                      ))}
+                                    </div>
+                                  </div>
+                                </div>
+
+                                {/* % composition line chart */}
+                                {archetypeChartData.length > 1 && (
+                                  <div>
+                                    <h4 className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-2">Archetype Share (%) — Trend</h4>
+                                    <ResponsiveContainer width="100%" height={200}>
+                                      <AreaChart data={archetypePctData}>
+                                        <XAxis dataKey="phase" tick={{ fontSize: 10 }} />
+                                        <YAxis tick={{ fontSize: 10 }} unit="%" domain={[0, 100]} />
+                                        <Tooltip contentStyle={{ fontSize: 11 }} formatter={(v: number) => `${v}%`} />
+                                        {ALL_ARCHETYPES.map(({ name, color }) => (
+                                          <Area key={name} type="monotone" dataKey={name} stackId="b" stroke={color} fill={color + '55'} strokeWidth={1.5} />
+                                        ))}
+                                      </AreaChart>
+                                    </ResponsiveContainer>
+                                  </div>
+                                )}
+
+                                {/* Dominant archetype + diversity table */}
+                                <div>
+                                  <div className="flex items-center justify-between mb-2">
+                                    <h4 className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide">Phase Summary</h4>
+                                    <button
+                                      onClick={() => {
+                                        const csvHeaders = ['Phase', 'Total Computed', 'Dominant Archetype', 'Dominant %', ...ALL_ARCHETYPES.map(a => a.name)]
+                                        const csvRows = archetypeChartData.map(d => {
+                                          const total = d.total as number
+                                          const dominant = ALL_ARCHETYPES.reduce((best, { name }) =>
+                                            (d[name] as number) > (d[best] as number) ? name : best, ALL_ARCHETYPES[0].name)
+                                          const domPct = total > 0 ? Math.round(((d[dominant] as number) / total) * 100) : 0
+                                          return [d.phase, total, dominant, `${domPct}%`, ...ALL_ARCHETYPES.map(({ name }) => d[name])]
+                                        })
+                                        downloadTableAsCSV(csvHeaders, csvRows, 'archetype-phase-summary.csv')
+                                      }}
+                                      className="flex items-center gap-1.5 text-[10px] text-gray-500 hover:text-gray-700 px-2 py-1 rounded border border-gray-200 hover:border-gray-300 hover:bg-gray-50 transition-colors"
+                                    >
+                                      <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                                      CSV
+                                    </button>
+                                  </div>
+                                  <div className="overflow-x-auto rounded-lg border border-gray-100">
+                                    <table className="w-full text-xs border-collapse">
+                                      <thead className="bg-gray-50 border-b border-gray-200">
+                                        <tr>
+                                          <th className="text-left px-3 py-2 font-semibold text-gray-500">Phase</th>
+                                          <th className="text-right px-3 py-2 font-semibold text-gray-500">Total</th>
+                                          <th className="text-center px-3 py-2 font-semibold text-gray-500">Dominant</th>
+                                          {ALL_ARCHETYPES.map(({ name, color }) => (
+                                            <th key={name} className="text-right px-2 py-2 font-semibold text-[10px] whitespace-nowrap" style={{ color }}>{name.split(' ')[0]}</th>
+                                          ))}
+                                          <th className="text-center px-2 py-2 font-semibold text-gray-400 text-[10px]"></th>
+                                        </tr>
+                                      </thead>
+                                      <tbody>
+                                        {archetypeChartData.map(d => {
+                                          const total = d.total as number
+                                          const dominant = ALL_ARCHETYPES.reduce((best, { name }) =>
+                                            (d[name] as number) > (d[best.name] as number) ? { name, color: best.color } : best,
+                                            ALL_ARCHETYPES[0])
+                                          const domPct = total > 0 ? Math.round(((d[dominant.name] as number) / total) * 100) : 0
+                                          const def = archetypePhaseDefs.find(p => p.label === d.phase)
+                                          const isReanalyzing = def ? reanalyzingPhases.has(def.key) : false
+                                          return (
+                                            <tr key={d.phase as string} className="border-b border-gray-50 hover:bg-gray-50">
+                                              <td className="px-3 py-2 font-medium text-gray-700">{d.phase}</td>
+                                              <td className="text-right px-3 py-2 font-bold text-gray-800">{total}</td>
+                                              <td className="text-center px-3 py-2">
+                                                <span className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full" style={{ backgroundColor: dominant.color + '22', color: dominant.color }}>
+                                                  {dominant.name} · {domPct}%
+                                                </span>
+                                              </td>
+                                              {ALL_ARCHETYPES.map(({ name }) => {
+                                                const cnt = d[name] as number
+                                                const pct = total > 0 ? Math.round((cnt / total) * 100) : 0
+                                                return (
+                                                  <td key={name} className="text-right px-2 py-2 text-gray-600">
+                                                    {cnt > 0 ? <><span className="font-semibold">{cnt}</span><span className="text-gray-400 ml-0.5 text-[10px]"> {pct}%</span></> : <span className="text-gray-200">—</span>}
+                                                  </td>
+                                                )
+                                              })}
+                                              <td className="text-center px-2 py-2">
+                                                {def && (
+                                                  <button
+                                                    onClick={() => reanalyzePhaseFull(def.key, def.label, def.from, def.to ?? '')}
+                                                    disabled={isReanalyzing || batchPersonaClassifying}
+                                                    title={`Reanalyze all ${phaseData[def.key]?.length ?? 0} users in ${def.label}`}
+                                                    className="flex items-center gap-1 text-[10px] px-2 py-0.5 rounded border transition-colors disabled:opacity-40 disabled:cursor-not-allowed border-indigo-200 text-indigo-600 hover:bg-indigo-50 hover:border-indigo-300"
+                                                  >
+                                                    {isReanalyzing
+                                                      ? <><svg className="w-2.5 h-2.5 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/></svg>…</>
+                                                      : <><svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>Reanalyze</>
+                                                    }
+                                                  </button>
+                                                )}
+                                              </td>
+                                            </tr>
+                                          )
+                                        })}
+                                      </tbody>
+                                    </table>
+                                  </div>
+                                </div>
+
+                                {/* Secondary archetype (Evangelist / Scrutinizer) distribution */}
+                                {(() => {
+                                  const readySecKeys = archetypePhaseDefs.filter(def => phaseSecondaryPersonas[def.key])
+                                  if (readySecKeys.length === 0) return null
+                                  const secByPhase: Record<string, Record<string, number>> = {}
+                                  for (const def of readySecKeys) {
+                                    const secMap = phaseSecondaryPersonas[def.key] ?? {}
+                                    const counts: Record<string, number> = { Evangelist: 0, Scrutinizer: 0, None: 0 }
+                                    const total = (archByPhase[def.key] ? Object.values(archByPhase[def.key]).reduce((s, c) => s + c, 0) : 0)
+                                    for (const [, sec] of Object.entries(secMap)) {
+                                      if (sec === 'Evangelist') counts.Evangelist++
+                                      else if (sec === 'Scrutinizer') counts.Scrutinizer++
+                                    }
+                                    counts.None = Math.max(0, total - counts.Evangelist - counts.Scrutinizer)
+                                    secByPhase[def.key] = counts
+                                  }
+                                  const ALL_SEC_WITH_NONE = [
+                                    { name: 'Evangelist',  color: '#10b981' },
+                                    { name: 'Scrutinizer', color: '#f43f5e' },
+                                    { name: 'None',        color: '#d1d5db' },
+                                  ]
+                                  const secChartData = readySecKeys.map(def => {
+                                    const counts = secByPhase[def.key] ?? { Evangelist: 0, Scrutinizer: 0, None: 0 }
+                                    const total = counts.Evangelist + counts.Scrutinizer + counts.None
+                                    return { phase: def.label, ...counts, total }
+                                  }).filter(d => d.total > 0)
+                                  if (secChartData.length === 0) return null
+                                  return (
+                                    <div>
+                                      <h4 className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-2">Secondary Archetype — Stance per Phase</h4>
+                                      <ResponsiveContainer width="100%" height={180}>
+                                        <BarChart data={secChartData} barCategoryGap="25%">
+                                          <XAxis dataKey="phase" tick={{ fontSize: 10 }} />
+                                          <YAxis tick={{ fontSize: 10 }} />
+                                          <Tooltip contentStyle={{ fontSize: 11 }} />
+                                          {ALL_SEC_WITH_NONE.map(({ name, color }) => (
+                                            <Bar key={name} dataKey={name} stackId="s" fill={color} />
+                                          ))}
+                                        </BarChart>
+                                      </ResponsiveContainer>
+                                      <div className="flex flex-wrap gap-x-4 gap-y-1 justify-center mt-2">
+                                        {ALL_SEC_WITH_NONE.map(({ name, color }) => (
+                                          <span key={name} className="flex items-center gap-1 text-[10px] text-gray-500">
+                                            <span className="inline-block w-2.5 h-2.5 rounded-sm flex-shrink-0" style={{ backgroundColor: color }} />
+                                            {name}
+                                          </span>
+                                        ))}
+                                      </div>
+                                      <div className="overflow-x-auto rounded-lg border border-gray-100 mt-3">
+                                        <table className="w-full text-xs border-collapse">
+                                          <thead className="bg-gray-50 border-b border-gray-200">
+                                            <tr>
+                                              <th className="text-left px-3 py-2 font-semibold text-gray-500">Phase</th>
+                                              <th className="text-right px-2 py-2 font-semibold text-[10px]" style={{ color: '#10b981' }}>Evangelist</th>
+                                              <th className="text-right px-2 py-2 font-semibold text-[10px]" style={{ color: '#f43f5e' }}>Scrutinizer</th>
+                                              <th className="text-right px-2 py-2 font-semibold text-gray-400 text-[10px]">None</th>
+                                              <th className="text-right px-3 py-2 font-semibold text-gray-400 text-[10px]">Total</th>
+                                            </tr>
+                                          </thead>
+                                          <tbody>
+                                            {secChartData.map(d => (
+                                              <tr key={d.phase} className="border-b border-gray-50 hover:bg-gray-50">
+                                                <td className="px-3 py-2 font-medium text-gray-700">{d.phase}</td>
+                                                {(['Evangelist', 'Scrutinizer', 'None'] as const).map(k => {
+                                                  const cnt = (d as unknown as Record<string, number>)[k] ?? 0
+                                                  const pct = d.total > 0 ? Math.round((cnt / d.total) * 100) : 0
+                                                  return (
+                                                    <td key={k} className="text-right px-2 py-2">
+                                                      {cnt > 0
+                                                        ? <><span className="font-semibold text-gray-800">{cnt}</span><span className="text-[9px] text-gray-400 ml-0.5">{pct}%</span></>
+                                                        : <span className="text-gray-200">—</span>}
+                                                    </td>
+                                                  )
+                                                })}
+                                                <td className="text-right px-3 py-2 font-bold text-gray-700">{d.total}</td>
+                                              </tr>
+                                            ))}
+                                          </tbody>
+                                        </table>
+                                      </div>
+                                    </div>
+                                  )
+                                })()}
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })()}
+
+                      {/* Section D: Community Sentiment Trend */}
+                      {(() => {
+                        const sentRows = phaseSentiment.filter(r =>
+                          loadedSorted.includes(r.phase) && r.total > 0
+                        ).sort((a, b) => loadedSorted.indexOf(a.phase) - loadedSorted.indexOf(b.phase))
+                        if (sentRows.length === 0) return null
+
+                        const sentChartData = sentRows.map(r => {
+                          const def = PHASE_DEFS.find(p => p.key === r.phase)
+                          const label = def?.label ?? r.phase
+                          return {
+                            phase: label,
+                            Positive: r.total > 0 ? Math.round((r.positive / r.total) * 100) : 0,
+                            Negative: r.total > 0 ? Math.round((r.negative / r.total) * 100) : 0,
+                            Neutral:  r.total > 0 ? Math.round((r.neutral  / r.total) * 100) : 0,
+                            posCount: r.positive, negCount: r.negative, neuCount: r.neutral,
+                            total: r.total,
+                          }
+                        })
+
+                        const isExpanded = expandedPhaseSections.has('sentiment-trend')
+                        const toggleSection = () => setExpandedPhaseSections(prev => {
+                          const next = new Set(prev)
+                          next.has('sentiment-trend') ? next.delete('sentiment-trend') : next.add('sentiment-trend')
+                          return next
+                        })
+
+                        return (
+                          <div className="rounded-xl border border-gray-200 overflow-hidden">
+                            <button onClick={toggleSection} className="w-full flex items-center justify-between px-4 py-3 bg-gray-50 hover:bg-gray-100 transition-colors text-left">
+                              <div>
+                                <span className="text-xs font-semibold text-gray-700">Community Sentiment Trend</span>
+                                <span className="ml-2 text-[10px] text-gray-400">positive / negative / neutral messages per phase</span>
+                              </div>
+                              <svg className={`w-3.5 h-3.5 text-gray-400 transition-transform duration-150 ${isExpanded ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M19 9l-7 7-7-7" />
+                              </svg>
+                            </button>
+
+                            {isExpanded && (
+                              <div className="px-4 py-4 space-y-6 bg-white">
+
+                                {/* Sentiment line trend */}
+                                <div>
+                                  <div className="flex items-center justify-between mb-2">
+                                    <h4 className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide">Sentiment Share (%) — Trend</h4>
+                                    <button onClick={() => downloadChartAsPNG(chartSentimentRef.current, 'community-sentiment-trend.png')} className="flex items-center gap-1.5 text-[10px] text-gray-500 hover:text-gray-700 px-2 py-1 rounded border border-gray-200 hover:border-gray-300 hover:bg-gray-50 transition-colors" title="PNG">
+                                      <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                                      PNG
+                                    </button>
+                                  </div>
+                                  <div ref={chartSentimentRef}>
+                                    <ResponsiveContainer width="100%" height={200}>
+                                      <AreaChart data={sentChartData}>
+                                        <XAxis dataKey="phase" tick={{ fontSize: 10 }} />
+                                        <YAxis tick={{ fontSize: 10 }} unit="%" domain={[0, 100]} />
+                                        <Tooltip contentStyle={{ fontSize: 11 }} formatter={(v: number) => `${v}%`} />
+                                        <Area type="monotone" dataKey="Positive" stroke="#10b981" fill="none" strokeWidth={2} dot={{ r: 4, fill: '#10b981' }} />
+                                        <Area type="monotone" dataKey="Negative" stroke="#f43f5e" fill="none" strokeWidth={2} dot={{ r: 4, fill: '#f43f5e' }} />
+                                        <Area type="monotone" dataKey="Neutral"  stroke="#9ca3af" fill="none" strokeWidth={2} dot={{ r: 4, fill: '#9ca3af' }} />
+                                      </AreaChart>
+                                    </ResponsiveContainer>
+                                    <div className="flex gap-4 justify-center mt-1">
+                                      {([['#10b981','Positive'],['#f43f5e','Negative'],['#9ca3af','Neutral']] as [string,string][]).map(([color, label]) => (
+                                        <span key={label} className="flex items-center gap-1 text-[10px] text-gray-500">
+                                          <span className="inline-block w-4 h-0.5 rounded" style={{ backgroundColor: color }} />
+                                          {label}
+                                        </span>
+                                      ))}
+                                    </div>
+                                  </div>
+                                </div>
+
+                                {/* Stacked 100% bar */}
+                                {sentChartData.length > 1 && (
+                                  <div>
+                                    <h4 className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-2">Sentiment Composition — Stacked</h4>
+                                    <ResponsiveContainer width="100%" height={160}>
+                                      <BarChart data={sentChartData} barCategoryGap="30%">
+                                        <XAxis dataKey="phase" tick={{ fontSize: 10 }} />
+                                        <YAxis tick={{ fontSize: 10 }} unit="%" domain={[0, 100]} />
+                                        <Tooltip contentStyle={{ fontSize: 11 }} formatter={(v: number) => `${v}%`} />
+                                        <Bar dataKey="Positive" stackId="s" fill="#10b981" />
+                                        <Bar dataKey="Neutral"  stackId="s" fill="#9ca3af" />
+                                        <Bar dataKey="Negative" stackId="s" fill="#f43f5e" radius={[3, 3, 0, 0]} />
+                                      </BarChart>
+                                    </ResponsiveContainer>
+                                  </div>
+                                )}
+
+                                {/* Summary table */}
+                                <div>
+                                  <div className="flex items-center justify-between mb-2">
+                                    <h4 className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide">Per-Phase Breakdown</h4>
+                                    <button
+                                      onClick={() => {
+                                        const csvHeaders = ['Phase', 'Total Analyzed', 'Positive', 'Pos %', 'Negative', 'Neg %', 'Neutral', 'Neu %', 'Net Sentiment']
+                                        const csvRows = sentChartData.map(d => [
+                                          d.phase, d.total,
+                                          d.posCount, `${d.Positive}%`,
+                                          d.negCount, `${d.Negative}%`,
+                                          d.neuCount, `${d.Neutral}%`,
+                                          `${d.Positive - d.Negative > 0 ? '+' : ''}${d.Positive - d.Negative}%`,
+                                        ])
+                                        downloadTableAsCSV(csvHeaders, csvRows, 'community-sentiment-phases.csv')
+                                      }}
+                                      className="flex items-center gap-1.5 text-[10px] text-gray-500 hover:text-gray-700 px-2 py-1 rounded border border-gray-200 hover:border-gray-300 hover:bg-gray-50 transition-colors"
+                                    >
+                                      <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                                      CSV
+                                    </button>
+                                  </div>
+                                  <div className="overflow-x-auto rounded-lg border border-gray-100">
+                                    <table className="w-full text-xs border-collapse">
+                                      <thead className="bg-gray-50 border-b border-gray-200">
+                                        <tr>
+                                          <th className="text-left px-3 py-2 font-semibold text-gray-500">Phase</th>
+                                          <th className="text-right px-3 py-2 font-semibold text-gray-500">Analyzed</th>
+                                          <th className="text-right px-3 py-2 font-semibold text-emerald-600">Positive</th>
+                                          <th className="text-right px-3 py-2 font-semibold text-rose-500">Negative</th>
+                                          <th className="text-right px-3 py-2 font-semibold text-gray-400">Neutral</th>
+                                          <th className="text-right px-3 py-2 font-semibold text-gray-500">Net</th>
+                                        </tr>
+                                      </thead>
+                                      <tbody>
+                                        {sentChartData.map(d => {
+                                          const net = d.Positive - d.Negative
+                                          return (
+                                            <tr key={d.phase as string} className="border-b border-gray-50 hover:bg-gray-50">
+                                              <td className="px-3 py-2 font-medium text-gray-700">{d.phase}</td>
+                                              <td className="text-right px-3 py-2 text-gray-600">{(d.total as number).toLocaleString()}</td>
+                                              <td className="text-right px-3 py-2">
+                                                <span className="font-semibold text-emerald-700">{d.posCount.toLocaleString()}</span>
+                                                <span className="text-[10px] text-emerald-400 ml-1">{d.Positive}%</span>
+                                              </td>
+                                              <td className="text-right px-3 py-2">
+                                                <span className="font-semibold text-rose-600">{d.negCount.toLocaleString()}</span>
+                                                <span className="text-[10px] text-rose-400 ml-1">{d.Negative}%</span>
+                                              </td>
+                                              <td className="text-right px-3 py-2">
+                                                <span className="text-gray-500">{d.neuCount.toLocaleString()}</span>
+                                                <span className="text-[10px] text-gray-300 ml-1">{d.Neutral}%</span>
+                                              </td>
+                                              <td className="text-right px-3 py-2">
+                                                <span className={`font-semibold text-sm ${net > 0 ? 'text-emerald-600' : net < 0 ? 'text-rose-600' : 'text-gray-400'}`}>
+                                                  {net > 0 ? '+' : ''}{net}%
+                                                </span>
+                                              </td>
+                                            </tr>
+                                          )
+                                        })}
+                                      </tbody>
+                                    </table>
+                                  </div>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })()}
+
+                      {/* Section E: Archetype × Engagement Cross-Tab */}
+                      {(() => {
+                        // Need at least one phase with both phaseData and phasePersonas loaded
+                        const readyKeys = loadedSorted.filter(k => phasePersonas[k] && phaseData[k])
+                        if (readyKeys.length === 0) return null
+
+                        const ALL_ARCHETYPES = ['Contributor','Explorer','Help-Seeker','Suno Team']
+                        const ENG_LEVELS = ['high','medium','low'] as const
+                        const ENG_LABELS: Record<string, string> = { high: 'High Eng.', medium: 'Med Eng.', low: 'Low Eng.' }
+                        const ENG_COLORS: Record<string, string> = { high: '#10b981', medium: '#0ea5e9', low: '#f59e0b' }
+                        const ARCH_COLORS: Record<string, string> = {
+                          'Contributor': '#3b82f6',
+                          'Explorer':    '#8b5cf6',
+                          'Help-Seeker': '#f59e0b',
+                          'Suno Team':   '#d946ef',
+                        }
+
+                        // Build the cross-tab data — one record per (phase, username)
+                        type CrossRow = { archetype: string; engagement: string; phase: string }
+                        const rows: CrossRow[] = []
+                        for (const key of readyKeys) {
+                          const def = PHASE_DEFS.find(p => p.key === key)!
+                          const filterEnd = phaseFilterEnd(key)
+                          const personaMap = phasePersonas[key]
+                          for (const u of phaseData[key]) {
+                            const archetype = personaMap[u.username]
+                            if (!archetype) continue
+                            const eng = classifyEngagement(u, def.from, filterEnd).level
+                            rows.push({ archetype, engagement: eng, phase: def.label })
+                          }
+                        }
+
+                        if (rows.length === 0) return null
+
+                        // Aggregate: archetype × engagement count matrix
+                        type Matrix = Record<string, Record<string, number>>
+                        const buildMatrix = (subset: CrossRow[]): Matrix => {
+                          const m: Matrix = {}
+                          for (const a of ALL_ARCHETYPES) {
+                            m[a] = { high: 0, medium: 0, low: 0 }
+                          }
+                          for (const r of subset) {
+                            if (!m[r.archetype]) m[r.archetype] = { high: 0, medium: 0, low: 0 }
+                            m[r.archetype][r.engagement] = (m[r.archetype][r.engagement] ?? 0) + 1
+                          }
+                          return m
+                        }
+                        const aggMatrix = buildMatrix(rows)
+                        const archTotals = (m: Matrix) =>
+                          Object.fromEntries(ALL_ARCHETYPES.map(a => [a, Object.values(m[a] ?? {}).reduce((s, c) => s + c, 0)]))
+                        const aggTotals = archTotals(aggMatrix)
+                        const engTotals = Object.fromEntries(ENG_LEVELS.map(e => [e, rows.filter(r => r.engagement === e).length]))
+                        const grandTotal = rows.length
+
+                        // Per-phase matrices
+                        const phaseMatrices = readyKeys.map(key => {
+                          const def = PHASE_DEFS.find(p => p.key === key)!
+                          const subset = rows.filter(r => r.phase === def.label)
+                          return { key, def, matrix: buildMatrix(subset), total: subset.length, totals: archTotals(buildMatrix(subset)) }
+                        })
+
+                        // Stacked bar data: per-archetype, split by engagement (for bar chart)
+                        const stackedBarData = ALL_ARCHETYPES
+                          .filter(a => aggTotals[a] > 0)
+                          .map(a => ({
+                            archetype: a.replace(' ', '\n'),
+                            High:   aggMatrix[a]?.high   ?? 0,
+                            Medium: aggMatrix[a]?.medium ?? 0,
+                            Low:    aggMatrix[a]?.low    ?? 0,
+                          }))
+
+                        // Reverse bar: per-engagement, split by archetype
+                        const engBarData = ENG_LEVELS.map(e => {
+                          const entry: Record<string, number | string> = { eng: ENG_LABELS[e] }
+                          for (const a of ALL_ARCHETYPES) entry[a] = aggMatrix[a]?.[e] ?? 0
+                          return entry
+                        })
+
+                        const isExpanded = expandedPhaseSections.has('archetype-engagement')
+                        const toggleSection = () => setExpandedPhaseSections(prev => {
+                          const next = new Set(prev)
+                          next.has('archetype-engagement') ? next.delete('archetype-engagement') : next.add('archetype-engagement')
+                          return next
+                        })
+
+                        const maxCell = Math.max(...ALL_ARCHETYPES.flatMap(a => ENG_LEVELS.map(e => aggMatrix[a]?.[e] ?? 0)))
+                        const cellBg = (count: number) => {
+                          if (count === 0 || maxCell === 0) return 'transparent'
+                          const alpha = 0.08 + (count / maxCell) * 0.55
+                          return `rgba(99,102,241,${alpha.toFixed(2)})`
+                        }
+
+                        return (
+                          <div className="rounded-xl border border-gray-200 overflow-hidden">
+                            <button onClick={toggleSection} className="w-full flex items-center justify-between px-4 py-3 bg-gray-50 hover:bg-gray-100 transition-colors text-left">
+                              <div>
+                                <span className="text-xs font-semibold text-gray-700">Archetype × Engagement Cross-Tab</span>
+                                <span className="ml-2 text-[10px] text-gray-400">how engagement levels distribute across archetypes</span>
+                              </div>
+                              <svg className={`w-3.5 h-3.5 text-gray-400 transition-transform duration-150 ${isExpanded ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M19 9l-7 7-7-7" />
+                              </svg>
+                            </button>
+
+                            {isExpanded && (
+                              <div className="px-4 py-4 space-y-6 bg-white">
+
+                                {/* Aggregate heatmap table */}
+                                <div>
+                                  <div className="flex items-center justify-between mb-2">
+                                    <h4 className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide">
+                                      Heatmap — Aggregated Across {readyKeys.length} Phase{readyKeys.length > 1 ? 's' : ''}
+                                    </h4>
+                                    <button
+                                      onClick={() => {
+                                        const csvHeaders = ['Archetype', 'High Eng.', 'High %', 'Med Eng.', 'Med %', 'Low Eng.', 'Low %', 'Total']
+                                        const csvRows = ALL_ARCHETYPES.filter(a => aggTotals[a] > 0).map(a => {
+                                          const t = aggTotals[a]
+                                          return [a,
+                                            aggMatrix[a].high,   t > 0 ? `${Math.round(aggMatrix[a].high / t * 100)}%` : '0%',
+                                            aggMatrix[a].medium, t > 0 ? `${Math.round(aggMatrix[a].medium / t * 100)}%` : '0%',
+                                            aggMatrix[a].low,    t > 0 ? `${Math.round(aggMatrix[a].low / t * 100)}%` : '0%',
+                                            t,
+                                          ]
+                                        })
+                                        downloadTableAsCSV(csvHeaders, csvRows, 'archetype-engagement-crosstab.csv')
+                                      }}
+                                      className="flex items-center gap-1.5 text-[10px] text-gray-500 hover:text-gray-700 px-2 py-1 rounded border border-gray-200 hover:border-gray-300 hover:bg-gray-50 transition-colors"
+                                    >
+                                      <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                                      CSV
+                                    </button>
+                                  </div>
+                                  <div className="overflow-x-auto rounded-lg border border-gray-100">
+                                    <table className="w-full text-xs border-collapse">
+                                      <thead className="bg-gray-50 border-b border-gray-200">
+                                        <tr>
+                                          <th className="text-left px-3 py-2 font-semibold text-gray-600">Archetype</th>
+                                          {ENG_LEVELS.map(e => (
+                                            <th key={e} className="text-center px-3 py-2 font-semibold text-[11px]" style={{ color: ENG_COLORS[e] }}>{ENG_LABELS[e]}</th>
+                                          ))}
+                                          <th className="text-right px-3 py-2 font-semibold text-gray-400 text-[10px]">Total</th>
+                                          <th className="text-left px-3 py-2 font-semibold text-gray-400 text-[10px]">Engagement Mix</th>
+                                        </tr>
+                                      </thead>
+                                      <tbody>
+                                        {ALL_ARCHETYPES.filter(a => aggTotals[a] > 0).map(a => {
+                                          const t = aggTotals[a]
+                                          const dominantEng = ENG_LEVELS.reduce((best, e) =>
+                                            (aggMatrix[a][e] ?? 0) > (aggMatrix[a][best] ?? 0) ? e : best, ENG_LEVELS[0])
+                                          return (
+                                            <tr key={a} className="border-b border-gray-50 hover:bg-gray-50">
+                                              <td className="px-3 py-2">
+                                                <span className="inline-flex items-center gap-1.5 font-semibold" style={{ color: ARCH_COLORS[a] }}>
+                                                  <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ backgroundColor: ARCH_COLORS[a] }} />
+                                                  {a}
+                                                </span>
+                                              </td>
+                                              {ENG_LEVELS.map(e => {
+                                                const count = aggMatrix[a]?.[e] ?? 0
+                                                const pct = t > 0 ? Math.round((count / t) * 100) : 0
+                                                return (
+                                                  <td key={e} className="text-center px-3 py-2" style={{ backgroundColor: cellBg(count) }}>
+                                                    {count > 0 ? (
+                                                      <div className="flex flex-col items-center gap-0.5">
+                                                        <span className="font-bold text-gray-800">{count}</span>
+                                                        <span className="text-[9px] text-gray-500">{pct}%</span>
+                                                      </div>
+                                                    ) : <span className="text-gray-200 text-[10px]">—</span>}
+                                                  </td>
+                                                )
+                                              })}
+                                              <td className="text-right px-3 py-2 font-bold text-gray-700">{t}</td>
+                                              <td className="px-3 py-2">
+                                                <div className="flex gap-0.5 items-center w-32">
+                                                  {ENG_LEVELS.map(e => {
+                                                    const pct = t > 0 ? (aggMatrix[a]?.[e] ?? 0) / t * 100 : 0
+                                                    return pct > 0 ? (
+                                                      <div key={e} title={`${ENG_LABELS[e]}: ${Math.round(pct)}%`}
+                                                        className="h-4 rounded-sm transition-all"
+                                                        style={{ width: `${pct}%`, backgroundColor: ENG_COLORS[e] }}
+                                                      />
+                                                    ) : null
+                                                  })}
+                                                </div>
+                                                <span className="text-[9px] text-gray-400 mt-0.5 block">{ENG_LABELS[dominantEng]} dominant</span>
+                                              </td>
+                                            </tr>
+                                          )
+                                        })}
+                                        {/* Column totals */}
+                                        <tr className="border-t-2 border-gray-200 bg-gray-50">
+                                          <td className="px-3 py-2 font-semibold text-gray-500 text-[10px] uppercase">Total</td>
+                                          {ENG_LEVELS.map(e => (
+                                            <td key={e} className="text-center px-3 py-2">
+                                              <div className="flex flex-col items-center gap-0.5">
+                                                <span className="font-bold text-gray-700">{engTotals[e]}</span>
+                                                <span className="text-[9px] text-gray-400">{grandTotal > 0 ? Math.round(engTotals[e] / grandTotal * 100) : 0}%</span>
+                                              </div>
+                                            </td>
+                                          ))}
+                                          <td className="text-right px-3 py-2 font-bold text-gray-800">{grandTotal}</td>
+                                          <td />
+                                        </tr>
+                                      </tbody>
+                                    </table>
+                                  </div>
+                                </div>
+
+                                {/* Stacked bar: per-archetype, engagement composition */}
+                                <div>
+                                  <h4 className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-2">Engagement Composition per Archetype</h4>
+                                  <ResponsiveContainer width="100%" height={200}>
+                                    <BarChart data={stackedBarData} barCategoryGap="30%">
+                                      <XAxis dataKey="archetype" tick={{ fontSize: 9 }} />
+                                      <YAxis tick={{ fontSize: 10 }} />
+                                      <Tooltip contentStyle={{ fontSize: 11 }} />
+                                      <Bar dataKey="High"   stackId="e" fill={ENG_COLORS.high}   name="High Eng." />
+                                      <Bar dataKey="Medium" stackId="e" fill={ENG_COLORS.medium} name="Med Eng." />
+                                      <Bar dataKey="Low"    stackId="e" fill={ENG_COLORS.low}    name="Low Eng." radius={[3,3,0,0]} />
+                                    </BarChart>
+                                  </ResponsiveContainer>
+                                  <div className="flex gap-4 justify-center mt-1">
+                                    {ENG_LEVELS.map(e => (
+                                      <span key={e} className="flex items-center gap-1 text-[10px] text-gray-500">
+                                        <span className="inline-block w-2.5 h-2.5 rounded-sm" style={{ backgroundColor: ENG_COLORS[e] }} />
+                                        {ENG_LABELS[e]}
+                                      </span>
+                                    ))}
+                                  </div>
+                                </div>
+
+                                {/* Stacked bar: per-engagement, archetype composition */}
+                                <div>
+                                  <h4 className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-2">Archetype Composition per Engagement Level</h4>
+                                  <ResponsiveContainer width="100%" height={160}>
+                                    <BarChart data={engBarData} barCategoryGap="40%">
+                                      <XAxis dataKey="eng" tick={{ fontSize: 10 }} />
+                                      <YAxis tick={{ fontSize: 10 }} />
+                                      <Tooltip contentStyle={{ fontSize: 11 }} />
+                                      {ALL_ARCHETYPES.filter(a => aggTotals[a] > 0).map(a => (
+                                        <Bar key={a} dataKey={a} stackId="a" fill={ARCH_COLORS[a]} name={a} />
+                                      ))}
+                                    </BarChart>
+                                  </ResponsiveContainer>
+                                  <div className="flex flex-wrap gap-x-4 gap-y-1 justify-center mt-2">
+                                    {ALL_ARCHETYPES.filter(a => aggTotals[a] > 0).map(a => (
+                                      <span key={a} className="flex items-center gap-1 text-[10px] text-gray-500">
+                                        <span className="inline-block w-2.5 h-2.5 rounded-sm" style={{ backgroundColor: ARCH_COLORS[a] }} />
+                                        {a}
+                                      </span>
+                                    ))}
+                                  </div>
+                                </div>
+
+                                {/* Per-phase breakdown tables */}
+                                {phaseMatrices.length > 1 && (
+                                  <div>
+                                    <h4 className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-3">Per-Phase Breakdown</h4>
+                                    <div className="space-y-4">
+                                      {phaseMatrices.map(({ def, matrix, total, totals }) => {
+                                        if (total === 0) return null
+                                        return (
+                                          <div key={def.key}>
+                                            <div className="flex items-center gap-2 mb-1.5">
+                                              <span className={`inline-block px-2 py-0.5 rounded-full text-[10px] font-bold border ${def.chipCls}`}>{def.label}</span>
+                                              <span className="text-[10px] text-gray-400">{def.sub} · {total} users with archetypes</span>
+                                            </div>
+                                            <div className="overflow-x-auto rounded-lg border border-gray-100">
+                                              <table className="w-full text-xs border-collapse">
+                                                <thead className="bg-gray-50 border-b border-gray-100">
+                                                  <tr>
+                                                    <th className="text-left px-3 py-1.5 font-semibold text-gray-500 text-[10px]">Archetype</th>
+                                                    {ENG_LEVELS.map(e => (
+                                                      <th key={e} className="text-center px-2 py-1.5 font-semibold text-[10px]" style={{ color: ENG_COLORS[e] }}>{ENG_LABELS[e]}</th>
+                                                    ))}
+                                                    <th className="text-right px-3 py-1.5 font-semibold text-gray-400 text-[10px]">Total</th>
+                                                  </tr>
+                                                </thead>
+                                                <tbody>
+                                                  {ALL_ARCHETYPES.filter(a => totals[a] > 0).map(a => (
+                                                    <tr key={a} className="border-b border-gray-50 hover:bg-gray-50">
+                                                      <td className="px-3 py-1.5 font-medium text-[11px]" style={{ color: ARCH_COLORS[a] }}>{a}</td>
+                                                      {ENG_LEVELS.map(e => {
+                                                        const cnt = matrix[a]?.[e] ?? 0
+                                                        const pct = totals[a] > 0 ? Math.round((cnt / totals[a]) * 100) : 0
+                                                        return (
+                                                          <td key={e} className="text-center px-2 py-1.5">
+                                                            {cnt > 0
+                                                              ? <><span className="font-semibold text-gray-700">{cnt}</span><span className="text-[9px] text-gray-400 ml-0.5">{pct}%</span></>
+                                                              : <span className="text-gray-200 text-[10px]">—</span>}
+                                                          </td>
+                                                        )
+                                                      })}
+                                                      <td className="text-right px-3 py-1.5 font-bold text-gray-600">{totals[a]}</td>
+                                                    </tr>
+                                                  ))}
+                                                </tbody>
+                                              </table>
+                                            </div>
+                                          </div>
+                                        )
+                                      })}
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })()}
                     </div>
                   )}
 
@@ -6445,55 +6232,12 @@ export default function SearchPage() {
                 </div>
               )
             })()}
-
-            {/* Context window */}
-            {activeTab !== 'browse' && searchCat === 'chat' && (
-              <div className="mt-4 pt-4 border-t border-gray-100 flex flex-wrap items-end gap-3">
-                <div className="flex flex-col gap-1">
-                  <label className="filter-label">Context Before</label>
-                  <div className="flex items-center gap-1">
-                    <input type="text" inputMode="numeric" value={String(ctxBefore)} onChange={(e) => { const d = e.target.value.replace(/\D/g, ''); setCtxBefore(d ? parseInt(d) : 0) }} className="search-input text-xs py-1 w-16 text-center" />
-                    <span className="text-xs text-gray-400">msgs</span>
-                  </div>
-                </div>
-                <div className="flex flex-col gap-1">
-                  <label className="filter-label">Context After</label>
-                  <div className="flex items-center gap-1">
-                    <input type="text" inputMode="numeric" value={String(ctxAfter)} onChange={(e) => { const d = e.target.value.replace(/\D/g, ''); setCtxAfter(d ? parseInt(d) : 0) }} className="search-input text-xs py-1 w-16 text-center" />
-                    <span className="text-xs text-gray-400">msgs</span>
-                  </div>
-                </div>
-                <span className="self-end pb-1 text-xs text-gray-400">(same CSV, original order)</span>
-              </div>
-            )}
           </>
         )}
       </section>
 
-      {/* Scroll anchor + loading animation */}
-      <div ref={resultsAnchorRef} className="-mt-2" />
-      {searching && <SearchingAnimation />}
-
-      {/* Error */}
-      {error && (
-        <div className="bg-red-50 border border-red-200 rounded-2xl px-4 py-3 text-sm text-red-700">
-          {error}
-        </div>
-      )}
-
-      {/* No results feedback */}
-      {!searching && !error && didSearch && searchCat === 'chat' && results.length === 0 && (
-        <div className="bg-gray-50 border border-gray-200 rounded-2xl px-4 py-3 text-sm text-gray-500 text-center">
-          {activeTab === 'range'
-            ? 'No results found for the selected date range. The dataset may not have data for that period.'
-            : lastKeyword
-              ? <>No results for <span className="font-semibold text-gray-700">"{lastKeyword}"</span>. Try a different query, match type, or date range.</>
-              : 'No results found. Try adjusting the username or date filter.'}
-        </div>
-      )}
-
       {/* Users results table */}
-      {searchCat === 'users' && userStats.length > 0 && (
+      {userStats.length > 0 && (
         <section className="bg-white rounded-2xl shadow p-5 flex flex-col" style={{ height: 'calc(100vh - 80px)', minHeight: '900px' }}>
           {/* Dropout summary bar */}
           {dropoutMap.size > 0 && (() => {
@@ -6540,37 +6284,76 @@ export default function SearchPage() {
             )
           })()}
 
-          {/* Dropout users — active in prev loaded phase but absent in current window */}
-          {dropoutUsersFromPrev.length > 0 && (() => {
-            const cidx = PHASE_DEFS.findIndex((d) => d.key === currentBatchPhaseKey)
-            const pd = cidx > 0 ? (phaseData[PHASE_DEFS[cidx - 1].key] ?? []) : []
+          {/* Archetype filter chips — visible whenever archetypes have been computed */}
+          {Object.keys(tablePersonas).length > 0 && (() => {
+            const ALL_PERSONA_CHIPS = [
+              { name: 'Contributor', cls: 'bg-blue-100 text-blue-800 border-blue-300' },
+              { name: 'Explorer',    cls: 'bg-violet-100 text-violet-800 border-violet-300' },
+              { name: 'Help-Seeker', cls: 'bg-amber-100 text-amber-800 border-amber-300' },
+              { name: 'Evangelist',  cls: 'bg-emerald-100 text-emerald-800 border-emerald-300' },
+              { name: 'Scrutinizer', cls: 'bg-rose-100 text-rose-800 border-rose-300' },
+              { name: 'Suno Team',   cls: 'bg-fuchsia-100 text-fuchsia-800 border-fuchsia-300' },
+            ]
+            const ALL_SECONDARY_CHIPS = [
+              { name: 'Evangelist',  cls: 'bg-emerald-100 text-emerald-800 border-emerald-300' },
+              { name: 'Scrutinizer', cls: 'bg-rose-100 text-rose-800 border-rose-300' },
+              { name: 'None',        cls: 'bg-gray-100 text-gray-600 border-gray-300' },
+            ]
+            const archetypeCounts: Record<string, number> = {}
+            const secondaryCounts: Record<string, number> = {}
+            for (const [username, p] of Object.entries(tablePersonas)) {
+              if (userStats.some(u => u.username === username)) {
+                archetypeCounts[p.persona] = (archetypeCounts[p.persona] ?? 0) + 1
+                const sec = p.secondary_persona ?? 'None'
+                secondaryCounts[sec] = (secondaryCounts[sec] ?? 0) + 1
+              }
+            }
+            const computedTotal = Object.values(archetypeCounts).reduce((s, c) => s + c, 0)
+            const hasSecondary = ALL_SECONDARY_CHIPS.some(({ name }) => (secondaryCounts[name] ?? 0) > 0)
             return (
-              <div className="shrink-0 mb-3 bg-rose-50 border border-rose-200 rounded-xl px-4 py-2.5">
-                <div className="flex items-center gap-2 mb-1.5">
-                  <span className="text-[10px] font-semibold text-rose-600 uppercase tracking-wide">
-                    ↓ Dropout from prev phase ({dropoutUsersFromPrev.length})
-                  </span>
-                  <span className="text-[10px] text-rose-400">— were active in previous phase, no messages in current window</span>
+              <div className="shrink-0 mb-3 space-y-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-[10px] font-medium text-gray-400 uppercase tracking-wide shrink-0 w-20">Primary:</span>
+                  <button
+                    onClick={() => setArchetypeFilter('all')}
+                    className={`text-xs px-3 py-1 rounded-full border font-semibold transition-colors bg-gray-100 text-gray-700 border-gray-300 ${archetypeFilter === 'all' ? 'ring-2 ring-offset-1 ring-gray-400' : 'opacity-70 hover:opacity-100'}`}
+                  >
+                    All · {computedTotal}
+                  </button>
+                  {ALL_PERSONA_CHIPS.filter(({ name }) => (archetypeCounts[name] ?? 0) > 0).map(({ name, cls }) => (
+                    <button
+                      key={name}
+                      onClick={() => setArchetypeFilter(archetypeFilter === name ? 'all' : name)}
+                      className={`text-xs px-3 py-1 rounded-full border font-semibold transition-colors ${cls} ${archetypeFilter === name ? 'ring-2 ring-offset-1 ring-gray-400' : 'opacity-70 hover:opacity-100'}`}
+                    >
+                      {name} · {archetypeCounts[name]}
+                    </button>
+                  ))}
                 </div>
-                <div className="flex flex-wrap gap-1.5">
-                  {dropoutUsersFromPrev.map(username => {
-                    const u = pd.find(x => x.username === username)
-                    return (
+                {hasSecondary && (
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-[10px] font-medium text-gray-400 uppercase tracking-wide shrink-0 w-20">Secondary:</span>
+                    <button
+                      onClick={() => setSecondaryArchetypeFilter('all')}
+                      className={`text-xs px-3 py-1 rounded-full border font-semibold transition-colors bg-gray-100 text-gray-700 border-gray-300 ${secondaryArchetypeFilter === 'all' ? 'ring-2 ring-offset-1 ring-gray-400' : 'opacity-70 hover:opacity-100'}`}
+                    >
+                      All
+                    </button>
+                    {ALL_SECONDARY_CHIPS.filter(({ name }) => (secondaryCounts[name] ?? 0) > 0).map(({ name, cls }) => (
                       <button
-                        key={username}
-                        onClick={() => { if (u) openUserDetail(u) }}
-                        className="text-[10px] font-semibold px-2 py-0.5 rounded-full border bg-rose-100 text-rose-700 border-rose-300 hover:bg-rose-200 transition-colors"
-                        style={getUserStyle(username)}
-                        title={`${username} — was active in prev phase, absent in current window`}
+                        key={name}
+                        onClick={() => setSecondaryArchetypeFilter(secondaryArchetypeFilter === name ? 'all' : name)}
+                        className={`text-xs px-3 py-1 rounded-full border font-semibold transition-colors ${cls} ${secondaryArchetypeFilter === name ? 'ring-2 ring-offset-1 ring-gray-400' : 'opacity-70 hover:opacity-100'}`}
                       >
-                        {username}
+                        {name} · {secondaryCounts[name]}
                       </button>
-                    )
-                  })}
-                </div>
+                    ))}
+                  </div>
+                )}
               </div>
             )
           })()}
+
 
           {/* REFINE bar — always visible, never scrolls */}
           <div className="shrink-0 mb-3 bg-gray-50 rounded-xl border border-gray-200 px-4 py-3">
@@ -6626,7 +6409,7 @@ export default function SearchPage() {
           {filteredUsers.length > 0 && (
             <div className="px-3 py-2 border-b border-gray-100 bg-gray-50 flex items-center justify-between gap-3 flex-wrap">
               <div className="flex items-center gap-1.5">
-                <span className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide">Persona</span>
+                <span className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide">Archetype</span>
                 <span className="text-[10px] text-gray-400">
                   {(() => {
                     const matched = PHASE_DEFS.find(def =>
@@ -6690,6 +6473,23 @@ export default function SearchPage() {
                     )}
                   </div>
                 )}
+                {relabelAllProgress && (
+                  <div className="flex items-center gap-1.5">
+                    <div className="animate-spin w-3 h-3 border-2 border-amber-300 border-t-transparent rounded-full" />
+                    <span className="text-[10px] text-gray-500">
+                      🤖 {relabelAllProgress.done}/{relabelAllProgress.total} users relabeled
+                      {relabelAllProgress.errors > 0 && <span className="text-rose-500 ml-1">{relabelAllProgress.errors} errors</span>}
+                    </span>
+                    {relabelAllProgress.total > 1 && (
+                      <div className="w-24 h-1.5 bg-gray-200 rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-amber-300 rounded-full transition-all"
+                          style={{ width: `${(relabelAllProgress.done / relabelAllProgress.total) * 100}%` }}
+                        />
+                      </div>
+                    )}
+                  </div>
+                )}
                 <div className="flex items-center gap-0.5">
                   <button
                     disabled={batchSentimentRunning || batchPersonaClassifying}
@@ -6710,15 +6510,11 @@ export default function SearchPage() {
                 </div>
                 <button
                   disabled={batchPersonaClassifying || batchSentimentRunning}
-                  onClick={() => {
-                    if (window.confirm(`Run persona analysis for ${filteredUsers.length} users?\nThis will make ${filteredUsers.length} OpenAI API calls and may take a while.`)) {
-                      batchClassifyPersonas('llm')
-                    }
-                  }}
-                  className="text-[10px] font-semibold px-2.5 py-1 rounded-lg bg-violet-100 text-violet-700 hover:bg-violet-200 disabled:opacity-50 transition-colors border border-violet-200"
-                  title={`Persona analysis for all ${filteredUsers.length} filtered users (requires OpenAI key)`}
+                  onClick={() => computeBatchArchetypes(filteredUsers)}
+                  className="text-[10px] font-semibold px-2.5 py-1 rounded-lg bg-indigo-100 text-indigo-700 hover:bg-indigo-200 disabled:opacity-50 transition-colors border border-indigo-200"
+                  title={`Compute archetype (primary + secondary) for all ${filteredUsers.length} filtered users from stored signals — no LLM calls`}
                 >
-                  Persona Analysis ({filteredUsers.length})
+                  {batchPersonaClassifying ? '⏳ ' : ''}Archetypes ({filteredUsers.length})
                 </button>
                 <div className="flex items-center gap-0.5">
                   <button
@@ -6738,6 +6534,62 @@ export default function SearchPage() {
                     Topic (New Only)
                   </button>
                 </div>
+                {(() => {
+                  const usersWithTopics = filteredUsers.filter(u =>
+                    (tableTopics[u.username]?.topics ?? []).some(tp => tp.id !== -1)
+                  )
+                  if (usersWithTopics.length === 0) return null
+                  const isRunning = !!relabelAllProgress
+                  return (
+                    <button
+                      disabled={isRunning || batchTopicRunning}
+                      onClick={() => runRelabelAllUsers(
+                        usersWithTopics.map(u => ({
+                          username: u.username,
+                          topicIds: (tableTopics[u.username]?.topics ?? []).filter(tp => tp.id !== -1).map(tp => tp.id),
+                        })).filter(u => u.topicIds.length > 0)
+                      )}
+                      className="text-[10px] font-semibold px-2.5 py-1 rounded-lg border border-amber-200 bg-amber-50 text-amber-600 hover:bg-amber-100 disabled:opacity-50 transition-colors"
+                      title={`Relabel all topics for all ${usersWithTopics.length} users with AI`}
+                    >
+                      {isRunning ? '⏳' : '🤖'} Relabel All ({usersWithTopics.length})
+                    </button>
+                  )
+                })()}
+                {(() => {
+                  const failedUsers = filteredUsers.filter(u => {
+                    const t = tableTopics[u.username]
+                    return t?.warning && (t.topics?.length ?? 0) > 0
+                  })
+                  if (failedUsers.length === 0) return null
+                  return (
+                    <button
+                      onClick={() => setShowOnlyFailedTopics(v => !v)}
+                      className={`text-[10px] font-semibold px-2.5 py-1 rounded-lg border transition-colors ${showOnlyFailedTopics ? 'bg-amber-500 text-white border-amber-500' : 'bg-amber-50 text-amber-600 border-amber-200 hover:bg-amber-100'}`}
+                      title="Show only users where BERTopic clustering failed (keyword-fallback used)"
+                    >
+                      ⚠ Failed ({failedUsers.length})
+                    </button>
+                  )
+                })()}
+                {(() => {
+                  const anomalyUsers = filteredUsers.filter(u => {
+                    const topics = (tableTopics[u.username]?.topics ?? []).filter(tp => tp.id !== -1)
+                    const topicCount = topics.length
+                    const msgCount = u.total_messages ?? 0
+                    return topicCount > 0 && msgCount > 0 && topicCount > msgCount
+                  })
+                  if (anomalyUsers.length === 0) return null
+                  return (
+                    <button
+                      onClick={() => setShowOnlyAnomalyTopics(v => !v)}
+                      className={`text-[10px] font-semibold px-2.5 py-1 rounded-lg border transition-colors ${showOnlyAnomalyTopics ? 'bg-orange-500 text-white border-orange-500' : 'bg-orange-50 text-orange-600 border-orange-200 hover:bg-orange-100'}`}
+                      title="Show only users where topic count is suspiciously high relative to their message count"
+                    >
+                      ⚡ Anomaly ({anomalyUsers.length})
+                    </button>
+                  )
+                })()}
               </div>
             </div>
           )}
@@ -6790,7 +6642,7 @@ export default function SearchPage() {
                       </span>
                     )}
                   </th>
-                  <th className="px-3 py-2 border-b border-gray-200 bg-gray-50 text-center text-violet-600">Persona</th>
+                  <th className="px-3 py-2 border-b border-gray-200 bg-gray-50 text-center text-indigo-600">Archetype</th>
                 </tr>
               </thead>
               <tbody>
@@ -6904,11 +6756,15 @@ export default function SearchPage() {
                     })()}
                     {(() => {
                       const t = tableTopics[u.username]
+                      const isAnalyzing = batchTopicCurrentUser === u.username
+                      if (isAnalyzing) return (
+                        <td className="px-2 py-2 text-center">
+                          <span className="inline-block w-3 h-3 border-2 border-amber-400 border-t-transparent rounded-full animate-spin" />
+                        </td>
+                      )
                       if (!t) return (
                         <td className="px-2 py-2 text-center">
-                          {batchTopicRunning
-                            ? <span className="inline-block w-3 h-3 border-2 border-amber-300 border-t-transparent rounded-full animate-spin" />
-                            : <span className="text-gray-300 text-[10px]">—</span>}
+                          <span className="text-gray-300 text-[10px]">—</span>
                         </td>
                       )
                       const nonOutlier = t.topics.filter(tp => tp.id !== -1)
@@ -6933,16 +6789,34 @@ export default function SearchPage() {
                       )
                     })()}
                     {(() => {
-                      const l = tablePersonas[u.username]?.llm
+                      const a = tablePersonas[u.username]
+                      const PERSONA_BG: Record<string, string> = {
+                        'Suno Team':         'bg-fuchsia-100 text-fuchsia-700',
+                        'Power Contributor': 'bg-blue-100 text-blue-700',
+                        'Help-Seeker':       'bg-amber-100 text-amber-700',
+                        'Evangelist':        'bg-emerald-100 text-emerald-700',
+                        'Scrutinizer':       'bg-rose-100 text-rose-700',
+                        'Casual Explorer':   'bg-violet-100 text-violet-700',
+                      }
                       return (
                         <td className="px-2 py-2 text-center">
-                          {l ? (
-                            <span
-                              className="inline-block text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-violet-100 text-violet-700 cursor-help whitespace-nowrap leading-tight"
-                              title={`${(l.confidence * 100).toFixed(0)}% confidence\n${l.reasoning}`}
-                            >
-                              {l.persona}
-                            </span>
+                          {a ? (
+                            <div className="flex flex-col items-center gap-0.5">
+                              <span
+                                className={`inline-block text-[10px] font-semibold px-1.5 py-0.5 rounded-full cursor-help whitespace-nowrap leading-tight ${PERSONA_BG[a.persona] ?? 'bg-gray-100 text-gray-600'}`}
+                                title={`${Math.round(a.confidence * 100)}% confidence\n${a.reasoning}`}
+                              >
+                                {a.persona}
+                              </span>
+                              {a.secondary_persona && (
+                                <span
+                                  className={`inline-block text-[9px] font-medium px-1.5 py-0 rounded-full opacity-70 ${PERSONA_BG[a.secondary_persona] ?? 'bg-gray-100 text-gray-600'}`}
+                                  title={`Secondary: ${Math.round((a.secondary_confidence ?? 0) * 100)}%`}
+                                >
+                                  +{a.secondary_persona}
+                                </span>
+                              )}
+                            </div>
                           ) : (
                             <span className="text-gray-300 text-[10px]">—</span>
                           )}
@@ -6996,6 +6870,8 @@ export default function SearchPage() {
                   {topicDetailUser === u.username && tableTopics[u.username] && (() => {
                     const t = tableTopics[u.username]
                     const visibleTopics = t.topics.filter(tp => tp.id !== -1)
+                    const relabelingSet = relabelingInTable[u.username] ?? new Set<number>()
+                    const anyRelabeling = relabelingSet.size > 0
                     return (
                       <tr className="bg-amber-50/30 border-b border-amber-100">
                         <td colSpan={20} className="px-4 py-3">
@@ -7004,23 +6880,55 @@ export default function SearchPage() {
                               {visibleTopics.length} topic{visibleTopics.length !== 1 ? 's' : ''} · {t.filtered_docs} / {t.total_docs} messages assigned
                             </span>
                             {t.warning && (
-                              <span className="text-[10px] text-amber-500 italic">{t.warning}</span>
+                              <span className="text-[10px] text-amber-500 italic">⚠ {t.warning}</span>
+                            )}
+                            {visibleTopics.length > 0 && (
+                              <button
+                                disabled={anyRelabeling}
+                                onClick={() => relabelAllTopicsInTable(u.username, visibleTopics.map(tp => tp.id))}
+                                className="ml-auto text-[10px] font-semibold px-2 py-0.5 rounded bg-amber-100 text-amber-700 hover:bg-amber-200 disabled:opacity-50 transition-colors border border-amber-200 shrink-0"
+                                title="Relabel all topics for this user with AI (diverse sample per cluster)"
+                              >
+                                {anyRelabeling ? '⏳ Relabeling…' : '🤖 Relabel All'}
+                              </button>
                             )}
                           </div>
-                          <div className="grid grid-cols-2 gap-2 max-h-64 overflow-y-auto pr-1">
-                            {visibleTopics.map(tp => (
-                              <div key={tp.id} className="bg-white rounded-lg p-2 border border-amber-100 flex flex-col gap-1">
-                                <div className="flex items-center justify-between">
-                                  <span className="text-[11px] font-semibold text-amber-800 truncate">{tp.label}</span>
-                                  <span className="text-[10px] text-gray-400 ml-2 shrink-0">{tp.message_count} msgs</span>
+                          <div className="grid grid-cols-2 gap-2 max-h-72 overflow-y-auto pr-1">
+                            {visibleTopics.map(tp => {
+                              const isRelabeling = relabelingSet.has(tp.id)
+                              return (
+                                <div key={tp.id} className="bg-white rounded-lg p-2 border border-amber-100 flex flex-col gap-1">
+                                  <div className="flex items-start justify-between gap-1">
+                                    <span className="text-[11px] font-semibold text-amber-800 leading-snug">{tp.label}</span>
+                                    <div className="flex items-center gap-1 shrink-0">
+                                      <span className="text-[10px] text-gray-400">{tp.message_count}m</span>
+                                      <button
+                                        disabled={isRelabeling}
+                                        onClick={() => relabelTopicInTable(u.username, tp.id)}
+                                        className="text-[10px] px-1 py-0.5 rounded bg-amber-50 text-amber-600 hover:bg-amber-100 disabled:opacity-40 transition-colors border border-amber-200"
+                                        title={`Relabel "${tp.label}" with AI (${tp.message_count} msgs in cluster)`}
+                                      >
+                                        {isRelabeling ? '⏳' : '🤖'}
+                                      </button>
+                                    </div>
+                                  </div>
+                                  <div className="flex flex-wrap gap-1">
+                                    {tp.keywords.slice(0, 8).map(kw => (
+                                      <span key={kw} className="text-[9px] px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700">{kw}</span>
+                                    ))}
+                                  </div>
+                                  <button
+                                    onClick={() => openStatsTopicModal(u.username, tp.id, tp.label, tp.keywords, tp.message_count, filterStartDate, filterEndDate, scopeParam)}
+                                    className="mt-1 flex items-center gap-1 text-[10px] text-violet-600 hover:text-violet-800 font-medium transition-colors"
+                                  >
+                                    <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 10h16M4 14h16M4 18h16" />
+                                    </svg>
+                                    View all {tp.message_count} messages
+                                  </button>
                                 </div>
-                                <div className="flex flex-wrap gap-1">
-                                  {tp.keywords.slice(0, 8).map(kw => (
-                                    <span key={kw} className="text-[9px] px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700">{kw}</span>
-                                  ))}
-                                </div>
-                              </div>
-                            ))}
+                              )
+                            })}
                           </div>
                           <div className="mt-1.5 text-[9px] text-gray-400">click topic count to collapse</div>
                         </td>
@@ -7046,538 +6954,6 @@ export default function SearchPage() {
               : 'Click a username to open their message detail view.'}
           </p>
         </section>
-      )}
-
-      {/* Chat results */}
-      {searchCat === 'chat' && results.length > 0 && (
-        <>
-          {/* Analysis tab bar */}
-          <div className="flex flex-wrap items-center gap-2">
-            <button
-              onClick={() => toggleAnalysisTab('summarize')}
-              className={`inline-flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold border-2 transition-colors ${analysisTab === 'summarize' ? 'border-indigo-500 bg-indigo-50 text-indigo-800' : 'border-gray-200 bg-white text-gray-600 hover:border-indigo-300'}`}
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-              </svg>
-              Summarize &amp; Analyse
-            </button>
-            <button
-              onClick={() => toggleAnalysisTab('viz')}
-              className={`inline-flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold border-2 transition-colors ${analysisTab === 'viz' ? 'border-purple-500 bg-purple-50 text-purple-800' : 'border-gray-200 bg-white text-gray-600 hover:border-purple-300'}`}
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
-              </svg>
-              Visualization
-            </button>
-            <button onClick={exportCSV} className="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold border-2 border-gray-200 bg-white text-gray-600 hover:border-green-300 hover:text-green-700 transition-colors">
-              <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-              </svg>
-              Export CSV
-            </button>
-            <span className="ml-auto text-xs text-gray-400">
-              {`${Math.min(visibleCount, displayedResults.length).toLocaleString()} of ${results.length.toLocaleString()} results`}
-            </span>
-          </div>
-
-          {/* Summarize & Analyse panel */}
-          {analysisTab === 'summarize' && (
-            <section className="bg-white rounded-2xl shadow p-5">
-              <div className="flex items-center justify-between mb-4">
-                <h3 className="font-semibold text-gray-800">Summarize &amp; Analyse Results</h3>
-                <span className="text-xs text-gray-500">{results.length.toLocaleString()} current results available for analysis.</span>
-              </div>
-
-              {/* Controls */}
-              <div className="space-y-3 mb-4">
-                <div className="flex flex-col gap-1">
-                  <label className="filter-label">Custom instructions (optional)</label>
-                  <textarea
-                    value={summarizeQuery}
-                    onChange={(e) => setSummarizeQuery(e.target.value)}
-                    placeholder="Optional focus or instructions for the analysis…"
-                    className={`${inputCls} min-h-[60px] resize-y`}
-                    rows={2}
-                  />
-                </div>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-3">
-                  <div className="flex flex-col gap-1">
-                    <label className="filter-label">Retrieval mode</label>
-                    <select value={srRetrievalMode} onChange={(e) => setSrRetrievalMode(e.target.value as 'cluster' | 'all')} className={inputCls}>
-                      <option value="cluster">Cluster &amp; Sample (recommended)</option>
-                      <option value="all">All messages (no clustering)</option>
-                    </select>
-                    <p className="text-xs text-gray-400 mt-0.5">{retrievalHint[srRetrievalMode]}</p>
-                  </div>
-                  <div className="flex flex-col gap-1">
-                    <label className="filter-label">Model</label>
-                    <select value={srModel} onChange={(e) => setSrModel(e.target.value)} className={inputCls}>
-                      <optgroup label="GPT-5.4">
-                        <option value="gpt-5.4">GPT-5.4 (default)</option>
-                        <option value="gpt-5.4-pro">gpt-5.4-pro</option>
-                        <option value="gpt-5.4-mini">gpt-5.4-mini</option>
-                        <option value="gpt-5.4-nano">gpt-5.4-nano</option>
-                      </optgroup>
-                      <optgroup label="GPT-4.1">
-                        <option value="gpt-4.1">GPT-4.1</option>
-                      </optgroup>
-                      <optgroup label="GPT-4o">
-                        <option value="gpt-4o">GPT-4o</option>
-                      </optgroup>
-                      <optgroup label="o-series">
-                        <option value="o4-mini">o4-mini</option>
-                        <option value="o3">o3</option>
-                        <option value="o3-mini">o3-mini</option>
-                      </optgroup>
-                    </select>
-                  </div>
-                </div>
-              </div>
-
-              <button
-                onClick={handleSummarize}
-                disabled={summarizeLoading}
-                className="search-btn mb-4"
-              >
-                {summarizeLoading ? 'Generating…' : 'Summarize Results'}
-              </button>
-
-              {/* Pipeline log */}
-              {(srLog.length > 0 || summarizeLoading) && (
-                <div className="mb-4">
-                  <button
-                    onClick={() => setSrLogVisible((v) => !v)}
-                    className="flex items-center gap-1 text-xs text-gray-500 hover:text-gray-700 mb-1"
-                  >
-                    <svg className={`w-3 h-3 transition-transform${srLogVisible ? ' rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M19 9l-7 7-7-7"/>
-                    </svg>
-                    Pipeline log ({srLog.length} steps)
-                  </button>
-                  {srLogVisible && (
-                    <div className="bg-gray-50 rounded-xl p-3 space-y-1 text-xs font-mono max-h-48 overflow-y-auto">
-                      {srLog.map((entry, i) => (
-                        <div key={i} className="log-entry flex gap-2 items-start">
-                          <span className="log-icon shrink-0">{LOG_ICONS[entry.step] ?? '•'}</span>
-                          <span className="log-label font-semibold text-gray-600 shrink-0 w-20">{entry.label}</span>
-                          <span className="log-msg text-gray-500 flex-1">{entry.msg}</span>
-                        </div>
-                      ))}
-                      {summarizeLoading && (
-                        <div className="flex gap-2 items-center text-gray-400 animate-pulse">
-                          <span>✨</span>
-                          <span>Processing…</span>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* Result area */}
-              {showSrResultsPanel && (
-                <div>
-                  {summarizeResult && (
-                    <div className="bg-gray-50 rounded-xl p-4 markdown-body mb-4" aria-live="polite">
-                      <ReactMarkdown>{summarizeResult + (summarizeLoading ? ' ▋' : '')}</ReactMarkdown>
-                    </div>
-                  )}
-                  {!summarizeLoading && summarizeResult && (
-                    <button
-                      onClick={handleExportPDF}
-                      className="action-btn-primary mb-4"
-                    >
-                      Export PDF
-                    </button>
-                  )}
-
-                  {/* Follow-up Q&A */}
-                  {summarizeResult && !summarizeLoading && (
-                    <div>
-                      <div className="flex items-center justify-between mb-2">
-                        <h4 className="text-xs font-semibold text-gray-600 uppercase tracking-wide">Follow-up Q&amp;A</h4>
-                        {summarizeFollowUp.length > 0 && (
-                          <button
-                            onClick={() => setSummarizeFollowUp([])}
-                            className="text-xs text-gray-400 hover:text-red-500"
-                          >
-                            Clear Q&amp;A
-                          </button>
-                        )}
-                      </div>
-                      <div className="space-y-2 mb-2 max-h-60 overflow-y-auto">
-                        {summarizeFollowUp.map((h, i) => (
-                          <div key={i} className={h.role === 'user' ? 'flex justify-end' : ''}>
-                            <div className={`rounded-xl px-3 py-2 text-sm ${h.role === 'user' ? 'bg-indigo-700 text-white max-w-xl' : 'bg-gray-50 border border-gray-200 text-gray-900 markdown-body'}`}>
-                              {h.role === 'assistant' ? <ReactMarkdown>{h.content}</ReactMarkdown> : h.content}
-                            </div>
-                          </div>
-                        ))}
-                        {summarizeFollowUpLoading && <div className="text-xs text-gray-400 animate-pulse">Generating…</div>}
-                      </div>
-                      <div className="flex gap-2">
-                        <input
-                          value={summarizeFollowUpInput}
-                          onChange={(e) => setSummarizeFollowUpInput(e.target.value)}
-                          onKeyDown={(e) => {
-                            if ((e.key === 'Enter' && e.ctrlKey) || (e.key === 'Enter' && !e.shiftKey)) {
-                              e.preventDefault()
-                              handleSumFollowUp()
-                            }
-                          }}
-                          placeholder="Ask a follow-up question… (Ctrl+Enter to submit)"
-                          className={`${inputCls} flex-1`}
-                        />
-                        <button onClick={handleSumFollowUp} disabled={summarizeFollowUpLoading || !summarizeFollowUpInput.trim()} className="search-btn">Ask</button>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )}
-            </section>
-          )}
-
-          {/* Visualization panel */}
-          {analysisTab === 'viz' && (
-            <section className="bg-white rounded-2xl shadow p-5">
-              <div className="flex items-center justify-between mb-4">
-                <h3 className="font-semibold text-sm text-gray-700 uppercase tracking-wide">Message Volume Over Time</h3>
-                <div className="flex items-center gap-2">
-                  <div className="flex gap-0.5 bg-gray-100 rounded-lg p-0.5">
-                    {(['month', 'week', 'day'] as TrendBucket[]).map((b) => (
-                      <button
-                        key={b}
-                        onClick={() => { setTrendBucket(b); buildTrend(results, b) }}
-                        className={`trend-bucket-btn${trendBucket === b ? ' trend-bucket-active' : ''}`}
-                      >
-                        {b.charAt(0).toUpperCase() + b.slice(1)}
-                      </button>
-                    ))}
-                  </div>
-                  <button
-                    onClick={() => alert('Chart export requires Chart.js. PNG export not available with Recharts.')}
-                    className="action-btn-primary text-xs"
-                    title="Export chart as PNG"
-                  >
-                    PNG
-                  </button>
-                </div>
-              </div>
-
-              {/* Chart range banner */}
-              {chartRange && (
-                <div className="flex items-center gap-2 mb-3 bg-indigo-50 border border-indigo-200 rounded-xl px-3 py-2 text-sm text-indigo-800">
-                  <span>
-                    Showing {displayedResults.length} of {results.length} — {chartRange.label} ({chartRange.from} → {chartRange.to})
-                  </span>
-                  <button
-                    onClick={() => {
-                      setChartRange(null)
-                      const tokens = computeFilterTokens(filterMode, filterText)
-                      applyFilters(results, filterMode, filterText, null, tokens)
-                    }}
-                    className="ml-auto text-indigo-500 hover:text-indigo-800 font-bold"
-                  >
-                    ✕ Clear
-                  </button>
-                </div>
-              )}
-
-              {trendData.length > 0 ? (
-                <ResponsiveContainer width="100%" height={180}>
-                  <BarChart
-                    data={trendData}
-                    onClick={(data) => {
-                      if (data?.activePayload?.[0]) {
-                        const pt = data.activePayload[0].payload as TrendPoint
-                        handleChartBarClick(pt)
-                      }
-                    }}
-                    style={{ cursor: 'pointer' }}
-                  >
-                    <XAxis dataKey="period" tick={{ fontSize: 11 }} tickFormatter={formatTrendPeriod} />
-                    <YAxis tick={{ fontSize: 11 }} />
-                    <Tooltip />
-                    <Bar dataKey="count" radius={[2, 2, 0, 0]}>
-                      {trendData.map((entry, i) => (
-                        <Cell
-                          key={i}
-                          fill={chartRange?.from === entry.from ? '#4f46e5' : 'rgba(99,102,241,0.7)'}
-                        />
-                      ))}
-                    </Bar>
-                  </BarChart>
-                </ResponsiveContainer>
-              ) : (
-                <p className="text-sm text-gray-400 text-center py-8">No trend data available.</p>
-              )}
-            </section>
-          )}
-
-          {/* Results filter bar — sticky so it stays visible while scrolling through cards */}
-          <div className="bg-white rounded-2xl shadow px-4 py-3 sticky top-0 z-20">
-            <div className="flex flex-wrap items-center gap-2">
-              {/* Mode buttons */}
-              <div className="inline-flex rounded-lg overflow-hidden border border-gray-200 shrink-0">
-                <button
-                  onClick={() => setFilterMode('any')}
-                  className={`px-3 py-1.5 text-xs font-semibold transition-colors ${filterMode === 'any' ? 'bg-emerald-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'}`}
-                >
-                  Any Word
-                </button>
-                <button
-                  onClick={() => setFilterMode('exact')}
-                  className={`px-3 py-1.5 text-xs font-semibold border-l border-gray-200 transition-colors ${filterMode === 'exact' ? 'bg-blue-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'}`}
-                >
-                  Exact
-                </button>
-                <button
-                  onClick={() => setFilterMode('fuzzy')}
-                  className={`px-3 py-1.5 text-xs font-semibold border-l border-gray-200 transition-colors ${filterMode === 'fuzzy' ? 'bg-amber-500 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'}`}
-                >
-                  Fuzzy
-                </button>
-                <button
-                  onClick={() => setFilterMode('semantic')}
-                  className={`px-3 py-1.5 text-xs font-semibold border-l border-gray-200 transition-colors ${filterMode === 'semantic' ? 'bg-indigo-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'}`}
-                >
-                  Semantic
-                </button>
-              </div>
-
-              {/* Filter input */}
-              <div className="flex items-center gap-1.5 flex-1 min-w-0">
-                <svg className="w-3.5 h-3.5 text-gray-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2a1 1 0 01-.293.707L13 13.414V19a1 1 0 01-.553.894l-4 2A1 1 0 017 21v-7.586L3.293 6.707A1 1 0 013 6V4z" />
-                </svg>
-                <input
-                  value={filterText}
-                  onChange={(e) => setFilterText(e.target.value)}
-                  placeholder={filterPlaceholder[filterMode]}
-                  className="search-input flex-1 min-w-0 text-xs py-1.5"
-                />
-                {filterLoading && (
-                  <svg className="w-3.5 h-3.5 text-indigo-500 animate-spin shrink-0" fill="none" viewBox="0 0 24 24">
-                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                  </svg>
-                )}
-                {filterText && (
-                  <button
-                    onClick={() => {
-                      setFilterText('')
-                      setDisplayedResults(results)
-                      setFilterCount(null)
-                      setFilterTokens([])
-                    }}
-                    className="text-gray-400 hover:text-gray-700 shrink-0 font-bold text-sm"
-                    title="Clear filter"
-                  >
-                    ✕
-                  </button>
-                )}
-              </div>
-
-              {/* Count label */}
-              {filterCount && (
-                <span className="text-xs text-gray-500 shrink-0 tabular-nums">
-                  {filterCount.shown} of {filterCount.total}
-                </span>
-              )}
-            </div>
-          </div>
-
-          {/* Bookmark error toast */}
-          {bookmarkError && (
-            <div className="bg-red-50 border border-red-200 rounded-2xl px-4 py-3 text-sm text-red-700 flex items-center justify-between">
-              <span>Bookmark failed: {bookmarkError}</span>
-              <button onClick={() => setBookmarkError(null)} className="text-red-400 hover:text-red-700 font-bold ml-3">✕</button>
-            </div>
-          )}
-
-          {/* Message cards */}
-          <div className="bg-white rounded-2xl shadow px-4 py-3" id="results-container">
-            {displayedResults.slice(0, visibleCount).map((msg, idx) => {
-              const sliced = displayedResults.slice(0, visibleCount)
-              const prev = sliced[idx - 1]
-              const isGrouped = idx > 0 && prev?.username === msg.username
-              const prevDay = prev?.date?.slice(0, 10)
-              const thisDay = msg.date?.slice(0, 10)
-              const showDateSep = idx === 0 || thisDay !== prevDay
-              return (
-                <div key={msg.id}>
-                  {showDateSep && (
-                    <div className="flex items-center gap-3 my-3">
-                      <div className="flex-1 border-t border-gray-100" />
-                      <span className="text-xs text-gray-400 font-medium shrink-0">{thisDay}</span>
-                      <div className="flex-1 border-t border-gray-100" />
-                    </div>
-                  )}
-                  <MessageCard
-                    msg={msg}
-                    keyword={activeKeyword}
-                    tokens={activeTokens}
-                    isBookmarked={bookmarkedIds.has(msg.id)}
-                    isSelected={selectedIds.has(msg.id)}
-                    onBookmarkToggle={handleBookmarkToggle}
-                    onSelectToggle={toggleSelected}
-                    ctxBefore={ctxBefore}
-                    ctxAfter={ctxAfter}
-                    isGrouped={isGrouped && !showDateSep}
-                    emotion={msg.msg_uuid ? msgEmotions[msg.msg_uuid] : undefined}
-                  />
-                </div>
-              )
-            })}
-            {displayedResults.length === 0 && filterText.trim() && (
-              <div className="text-center py-8 text-gray-400 text-sm">No results match the current filter.</div>
-            )}
-            {/* Sentinel — IntersectionObserver target for infinite scroll */}
-            <div ref={sentinelRef} />
-            {visibleCount < displayedResults.length ? (
-              <div className="py-4 text-center text-sm text-gray-400 animate-pulse">
-                Loading more… ({Math.min(visibleCount, displayedResults.length).toLocaleString()} of {displayedResults.length.toLocaleString()})
-              </div>
-            ) : displayedResults.length > 50 && (
-              <div className="py-3 text-center text-xs text-gray-400">
-                All {displayedResults.length.toLocaleString()} results shown
-              </div>
-            )}
-          </div>
-        </>
-      )}
-
-      {/* Browse All results */}
-      {activeTab === 'browse' && searchCat === 'chat' && (
-        <div className="bg-white rounded-2xl shadow" id="browse-container">
-          {/* Sticky filter bar */}
-          <div className="sticky top-0 z-20 bg-white border-b border-gray-100 px-4 py-3 shadow-sm rounded-t-2xl">
-            <div className="flex flex-wrap gap-3 items-end">
-              <div className="flex flex-col gap-1">
-                <label className="filter-label">Username</label>
-                <input
-                  value={browseUsernameFilter}
-                  onChange={(e) => setBrowseUsernameFilter(e.target.value)}
-                  placeholder="filter…"
-                  className="search-input text-xs py-1 w-44"
-                />
-              </div>
-              <div className="flex flex-col gap-1">
-                <label className="filter-label">Keyword</label>
-                <input
-                  value={browseKeywordFilter}
-                  onChange={(e) => setBrowseKeywordFilter(e.target.value)}
-                  placeholder="filter…"
-                  className="search-input text-xs py-1 w-56"
-                />
-              </div>
-              <div className="flex flex-col gap-1">
-                <label className="filter-label">From</label>
-                <input
-                  type="date"
-                  value={browseDateFrom}
-                  onChange={(e) => setBrowseDateFrom(e.target.value)}
-                  className="search-input text-xs py-1"
-                />
-              </div>
-              <div className="flex flex-col gap-1">
-                <label className="filter-label">To</label>
-                <input
-                  type="date"
-                  value={browseDateTo}
-                  onChange={(e) => setBrowseDateTo(e.target.value)}
-                  className="search-input text-xs py-1"
-                />
-              </div>
-              {(browseUsernameFilter || browseKeywordFilter || browseDateFrom || browseDateTo) && (
-                <button
-                  onClick={() => { setBrowseUsernameFilter(''); setBrowseKeywordFilter(''); setBrowseDateFrom(''); setBrowseDateTo('') }}
-                  className="self-end pb-1 text-xs text-gray-400 hover:text-red-500 transition-colors flex items-center gap-1"
-                >
-                  <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
-                  Clear
-                </button>
-              )}
-              <div className="self-end pb-1 ml-auto flex items-center gap-3">
-                <button
-                  onClick={handleBrowseDownloadCsv}
-                  disabled={browseExporting}
-                  className="flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-lg border border-indigo-200 text-indigo-600 hover:bg-indigo-50 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
-                  title="Download all messages as CSV (ignores pagination)"
-                >
-                  {browseExporting ? (
-                    <svg className="w-3.5 h-3.5 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                    </svg>
-                  ) : (
-                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                    </svg>
-                  )}
-                  {browseExporting ? 'Exporting…' : 'Download CSV'}
-                </button>
-                <span className="text-xs text-gray-400">
-                  {filteredBrowseMessages.length !== browseMessages.length
-                    ? `${filteredBrowseMessages.length.toLocaleString()} / ${browseMessages.length.toLocaleString()} loaded`
-                    : `${browseMessages.length.toLocaleString()} loaded`}
-                </span>
-              </div>
-            </div>
-          </div>
-
-          {/* Messages */}
-          <div className="px-4 py-3">
-            {filteredBrowseMessages.map((msg, idx) => {
-              const prev = filteredBrowseMessages[idx - 1]
-              const isGrouped = idx > 0 && prev.username === msg.username
-              const prevDay = prev?.date?.slice(0, 10)
-              const thisDay = msg.date?.slice(0, 10)
-              const showDateSep = idx === 0 || thisDay !== prevDay
-              return (
-                <div key={msg.id}>
-                  {showDateSep && (
-                    <div className="flex items-center gap-3 my-3">
-                      <div className="flex-1 border-t border-gray-100" />
-                      <span className="text-xs text-gray-400 font-medium shrink-0">{thisDay}</span>
-                      <div className="flex-1 border-t border-gray-100" />
-                    </div>
-                  )}
-                  <BrowseChatRow
-                    msg={msg}
-                    isGrouped={isGrouped && !showDateSep}
-                    isBookmarked={bookmarkedIds.has(msg.id)}
-                    onBookmarkToggle={handleBookmarkToggle}
-                    tokens={browseTokens}
-                  />
-                </div>
-              )
-            })}
-            <div ref={browseSentinelRef} />
-            {browseFetching && (
-              <div className="flex items-center justify-center gap-2 py-6 text-sm text-indigo-500">
-                <svg className="w-4 h-4 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                </svg>
-                Loading more messages…
-              </div>
-            )}
-            {!browseHasMore && browseMessages.length > 0 && (
-              <div className="py-3 text-center text-xs text-gray-400">
-                All {browseMessages.length.toLocaleString()} messages loaded
-              </div>
-            )}
-            {browseMessages.length === 0 && !browseFetching && (
-              <div className="text-center py-8 text-gray-400 text-sm">No messages found.</div>
-            )}
-            {filteredBrowseMessages.length === 0 && browseMessages.length > 0 && (
-              <div className="text-center py-8 text-gray-400 text-sm">No messages match the current filters.</div>
-            )}
-          </div>
-        </div>
       )}
 
       {/* Flow Analysis user detail modal */}
@@ -7682,6 +7058,80 @@ export default function SearchPage() {
                     </table>
                   )
                 }
+              </div>
+            </div>
+          </div>
+        )
+      })()}
+
+      {/* Stats-table topic messages modal (rendered here so it works without a selected user) */}
+      {statsTopicModal !== null && (() => {
+        const colors = [
+          'bg-violet-600','bg-indigo-600','bg-blue-600','bg-cyan-600',
+          'bg-teal-600','bg-emerald-600','bg-amber-600','bg-orange-600',
+          'bg-rose-600','bg-gray-600',
+        ]
+        const accentColor = colors[Math.abs(statsTopicModal.topicId) % colors.length]
+        return (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center p-4"
+            onClick={() => setStatsTopicModal(null)}
+          >
+            <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+            <div
+              className="relative bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[85vh] flex flex-col overflow-hidden"
+              onClick={e => e.stopPropagation()}
+            >
+              <div className={`${accentColor} px-5 py-4 flex items-start justify-between gap-3`}>
+                <div>
+                  <p className="text-white/70 text-[11px] font-medium uppercase tracking-wide mb-0.5">
+                    {statsTopicModal.username} · Topic #{statsTopicModal.topicId}
+                  </p>
+                  <h3 className="text-white font-semibold text-base leading-snug">
+                    {statsTopicModal.label}
+                  </h3>
+                  {statsTopicModal.keywords.length > 0 && (
+                    <div className="flex flex-wrap gap-1 mt-2">
+                      {statsTopicModal.keywords.slice(0, 6).map(kw => (
+                        <span key={kw} className="text-[10px] px-1.5 py-0.5 rounded-full bg-white/20 text-white font-medium">{kw}</span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <button
+                  onClick={() => setStatsTopicModal(null)}
+                  className="text-white/80 hover:text-white transition-colors shrink-0 mt-0.5"
+                >
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+              <div className="px-5 py-2 border-b border-gray-100 bg-gray-50">
+                <span className="text-xs text-gray-500">
+                  {statsTopicLoading
+                    ? 'Loading messages…'
+                    : `${statsTopicMessages.length.toLocaleString()} message${statsTopicMessages.length !== 1 ? 's' : ''}`
+                  }
+                </span>
+              </div>
+              <div className="overflow-y-auto flex-1 divide-y divide-gray-100">
+                {statsTopicLoading ? (
+                  <p className="text-sm text-gray-400 text-center py-10">Loading…</p>
+                ) : statsTopicMessages.length === 0 ? (
+                  <p className="text-sm text-gray-400 text-center py-10">No messages found.</p>
+                ) : (
+                  statsTopicMessages.map((msg, i) => (
+                    <TopicMsgRow
+                      key={msg.id ?? i}
+                      msg={msg}
+                      isBookmarked={bookmarkedIds.has(msg.id)}
+                      onBookmarkToggle={handleBookmarkToggle}
+                      ctxBefore={userDetailCtxBefore}
+                      ctxAfter={userDetailCtxAfter}
+                    />
+                  ))
+                )}
               </div>
             </div>
           </div>

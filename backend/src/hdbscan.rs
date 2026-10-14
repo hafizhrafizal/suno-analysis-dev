@@ -1,3 +1,5 @@
+use rayon::prelude::*;
+
 /// HDBSCAN clustering with cosine distance.
 /// Returns cluster labels (0-based integers) or -1 for noise.
 ///
@@ -8,6 +10,12 @@
 ///   4. Single-linkage dendrogram from MST
 ///   5. Condensed tree (collapse tiny components → noise)
 ///   6. Excess-of-mass cluster extraction
+///
+/// Steps 1 and 2 are the O(n²) bottleneck (each of the n(n-1)/2 pairs does a
+/// 1536-dim dot product) — they're embarrassingly parallel across rows/points,
+/// so they run on rayon's thread pool. This changes wall-clock time only; the
+/// result is bit-identical to the serial version, so clustering stays exact
+/// (no sampling/capping of the input).
 
 pub fn cosine_dist(a: &[f32], b: &[f32]) -> f32 {
     let mut dot = 0.0f32;
@@ -60,10 +68,15 @@ pub fn hdbscan(data: &[Vec<f32>], min_cluster_size: usize) -> Vec<i32> {
     let k = min_cluster_size.min(n - 1).max(1);
 
     // ── 1. Pairwise cosine distance matrix ────────────────────────────────────
+    // Each row i only computes j > i (upper triangle), same total work as the
+    // serial version — just spread across threads. Mirrored into `dm` after.
     let mut dm = vec![0.0f32; n * n];
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let d = cosine_dist(&data[i], &data[j]);
+    let rows: Vec<Vec<(usize, f32)>> = (0..n)
+        .into_par_iter()
+        .map(|i| ((i + 1)..n).map(|j| (j, cosine_dist(&data[i], &data[j]))).collect())
+        .collect();
+    for (i, row) in rows.into_iter().enumerate() {
+        for (j, d) in row {
             dm[i * n + j] = d;
             dm[j * n + i] = d;
         }
@@ -71,6 +84,7 @@ pub fn hdbscan(data: &[Vec<f32>], min_cluster_size: usize) -> Vec<i32> {
 
     // ── 2. Core distances (k-th nearest neighbour) ────────────────────────────
     let core: Vec<f32> = (0..n)
+        .into_par_iter()
         .map(|i| {
             let mut row: Vec<f32> = (0..n)
                 .filter(|&j| j != i)

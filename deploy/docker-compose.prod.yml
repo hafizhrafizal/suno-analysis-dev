@@ -1,0 +1,81 @@
+# Production stack for the VPS. CI copies this file to ~/suno-analysis/docker-compose.yml.
+# Host nginx (not a container) terminates TLS, serves frontend/dist and proxies /api to the backend,
+# so nothing here is exposed beyond 127.0.0.1.
+#
+# Secrets/settings come from ~/suno-analysis/.env on the VPS (see deploy/.env.example).
+# IMAGE_TAG is set by CI to the commit SHA; defaults to latest for manual `docker compose up`.
+
+name: suno-analysis
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: retrieval
+      POSTGRES_USER: retrieval
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      # postgres 18 images keep data under /var/lib/postgresql/<major>/docker
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U retrieval -d retrieval"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  qdrant:
+    # Pinned: snapshots must be restored into a compatible Qdrant version
+    image: qdrant/qdrant:v1.18.1
+    restart: unless-stopped
+    environment:
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY}
+    ports:
+      - "127.0.0.1:6333:6333"   # localhost only — for snapshots/maintenance over SSH
+    volumes:
+      - qdrant_data:/qdrant/storage
+      - qdrant_snapshots:/qdrant/snapshots
+
+  ai_service:
+    image: ${AI_IMAGE:-ghcr.io/hafizhrafizal/suno-discord-analysis-ai}:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      HF_ENDPOINT_URL: ${HF_ENDPOINT_URL:-}
+    volumes:
+      - ai_model_cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 300s   # first start downloads models into ai_model_cache
+
+  backend:
+    image: ${BACKEND_IMAGE:-ghcr.io/hafizhrafizal/suno-discord-analysis-backend}:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      ai_service:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgres://retrieval:${POSTGRES_PASSWORD}@postgres:5432/retrieval
+      VECTOR_DB: qdrant
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-discord_openai}
+      QDRANT_API_KEY: ${QDRANT_API_KEY}
+      APP_MODE: ${APP_MODE:-multi}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      AI_SERVICE_URL: http://ai_service:8001
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "127.0.0.1:8000:8000"   # host nginx proxies /api here
+
+volumes:
+  postgres_data:
+  qdrant_data:
+  qdrant_snapshots:
+  ai_model_cache:

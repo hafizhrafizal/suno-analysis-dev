@@ -1,9 +1,9 @@
-import { useState, useEffect, useRef, useMemo } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '../api/client'
 import ColorPicker from '../components/ui/ColorPicker'
-import type { Code, CodeCategory, Bookmark, BookmarkCode, ContextMessage, InterviewBookmark } from '../types'
+import type { Code, CodeCategory, Bookmark, BookmarkCode, ContextMessage } from '../types'
 
 type PageTab = 'manager' | 'table'
 type AuthorFilter = 'all' | 'only' | 'exclude'
@@ -53,8 +53,6 @@ interface CodeCardProps {
   excerpts: BookmarkCode[] | undefined
   filteredBmIds: Set<number>
   bookmarks: Bookmark[]
-  interviewBmIds: Set<number>
-  newsBmIds: Set<number>
   mergeMode: boolean
   mergeSelected: boolean
   onMergeToggle: (id: number) => void
@@ -64,9 +62,10 @@ interface CodeCardProps {
   onOpenExcerpt: (bc: BookmarkCode, bm: Bookmark, mode?: 'add' | 'change') => void
   onDeleteExcerptCode: (bc: BookmarkCode, bookmarkId: number) => void
   activeExcerptKey: string | null
+  userArchetypes: Record<string, string>
 }
 
-function CodeCard({ code, depth, expanded, excerpts, filteredBmIds, bookmarks, interviewBmIds, newsBmIds, mergeMode, mergeSelected, onMergeToggle, isActive, onToggle, dnd, onOpenExcerpt, onDeleteExcerptCode, activeExcerptKey }: CodeCardProps) {
+function CodeCard({ code, depth, expanded, excerpts, filteredBmIds, bookmarks, mergeMode, mergeSelected, onMergeToggle, isActive, onToggle, dnd, onOpenExcerpt, onDeleteExcerptCode, activeExcerptKey, userArchetypes }: CodeCardProps) {
   const navigate = useNavigate()
   const tc = labelTextColor(code.color)
   const quoteCount = (excerpts || []).length
@@ -166,11 +165,11 @@ function CodeCard({ code, depth, expanded, excerpts, filteredBmIds, bookmarks, i
                             &ldquo;{(bm?.content || '').substring(0, 180)}{(bm?.content || '').length > 180 ? '…' : ''}&rdquo;
                           </p>
                         )}
-                        <div className="flex items-center gap-2 mt-0.5">
+                        <div className="flex items-center gap-2 mt-0.5 flex-wrap">
                           <p className="text-[10px] text-gray-400">
-                            {bm?.username && !interviewBmIds.has(bc.bookmark_id) && !newsBmIds.has(bc.bookmark_id) ? (
+                            {bm?.username ? (
                               <button
-                                onClick={e => { e.stopPropagation(); sessionStorage.setItem('codingPage.scrollY', String(window.scrollY)); navigate(`/discord/users/${encodeURIComponent(bm.username!)}`) }}
+                                onClick={e => { e.stopPropagation(); sessionStorage.setItem('codingPage.scrollY', String(window.scrollY)); navigate(`/discord/search/users/${encodeURIComponent(bm.username!)}`) }}
                                 className="text-indigo-600 hover:underline font-medium"
                               >
                                 {bm.username}
@@ -178,6 +177,15 @@ function CodeCard({ code, depth, expanded, excerpts, filteredBmIds, bookmarks, i
                             ) : (bm?.username || '')}
                             {bm?.date ? ' · ' + bm.date.substring(0, 10) : ''}
                           </p>
+                          {bm?.username && userArchetypes[bm.username] && (() => {
+                            const a = userArchetypes[bm.username!]
+                            const cls = a === 'Contributor' ? 'bg-blue-100 text-blue-700'
+                              : a === 'Explorer' ? 'bg-violet-100 text-violet-700'
+                              : a === 'Help-Seeker' ? 'bg-amber-100 text-amber-700'
+                              : a === 'Uncategorized' ? 'bg-slate-100 text-slate-500'
+                              : 'bg-gray-100 text-gray-600'
+                            return <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded-full ${cls}`}>{a}</span>
+                          })()}
                         </div>
                       </div>
                     </div>
@@ -229,8 +237,6 @@ interface CatNodeProps {
   onToggleCode: (code: CodeExt) => void
   filteredBmIds: Set<number>
   bookmarks: Bookmark[]
-  interviewBmIds: Set<number>
-  newsBmIds: Set<number>
   bookmarkCodes: BookmarkCode[]
   mergeMode: boolean
   mergeSelected: Set<number>
@@ -243,12 +249,14 @@ interface CatNodeProps {
   onOpenExcerpt: (bc: BookmarkCode, bm: Bookmark, mode?: 'add' | 'change') => void
   onDeleteExcerptCode: (bc: BookmarkCode, bookmarkId: number) => void
   activeExcerptKey: string | null
+  userArchetypes: Record<string, string>
 }
 
 function CatNode({
   node, depth, collapsedCats, onToggleCollapse, expandedCodes, onToggleCode,
-  filteredBmIds, bookmarks, interviewBmIds, newsBmIds, bookmarkCodes, mergeMode, mergeSelected, onMergeToggle,
+  filteredBmIds, bookmarks, bookmarkCodes, mergeMode, mergeSelected, onMergeToggle,
   activeCodeId, activeCatId, onOpenCat, dnd, filterActive, onOpenExcerpt, onDeleteExcerptCode, activeExcerptKey,
+  userArchetypes,
 }: CatNodeProps) {
   const codeHasFilteredExcerpts = (code: CodeExt) =>
     bookmarkCodes.some(bc => bc.code_id === code.id && filteredBmIds.has(bc.bookmark_id))
@@ -314,8 +322,6 @@ function CatNode({
               onToggleCode={onToggleCode}
               filteredBmIds={filteredBmIds}
               bookmarks={bookmarks}
-              interviewBmIds={interviewBmIds}
-              newsBmIds={newsBmIds}
               bookmarkCodes={bookmarkCodes}
               mergeMode={mergeMode}
               mergeSelected={mergeSelected}
@@ -328,6 +334,7 @@ function CatNode({
               onOpenExcerpt={onOpenExcerpt}
               onDeleteExcerptCode={onDeleteExcerptCode}
               activeExcerptKey={activeExcerptKey}
+              userArchetypes={userArchetypes}
             />
           ))}
           <div className="space-y-1">
@@ -342,8 +349,6 @@ function CatNode({
                   excerpts={codeExcerpts}
                   filteredBmIds={filteredBmIds}
                   bookmarks={bookmarks}
-                  interviewBmIds={interviewBmIds}
-                  newsBmIds={newsBmIds}
                   mergeMode={mergeMode}
                   mergeSelected={mergeSelected.has(code.id)}
                   onMergeToggle={onMergeToggle}
@@ -353,6 +358,7 @@ function CatNode({
                   onOpenExcerpt={onOpenExcerpt}
                   onDeleteExcerptCode={onDeleteExcerptCode}
                   activeExcerptKey={activeExcerptKey}
+                  userArchetypes={userArchetypes}
                 />
               )
             })}
@@ -362,47 +368,6 @@ function CatNode({
     </div>
   )
 }
-
-function normalizeInterviewBookmark(bm: InterviewBookmark): Bookmark {
-  return {
-    id: bm.id,
-    msg_id: bm.id,
-    content: bm.excerpt,
-    username: bm.interviewees || bm.interview_id,
-    date: bm.source_date || bm.created_at,
-    codes: bm.codes,
-    is_suno_team: false,
-    note: bm.note,
-    created_at: bm.created_at,
-  }
-}
-
-interface NewsBookmark {
-  id: number
-  article_id: string
-  excerpt: string
-  note: string
-  char_start?: number
-  char_end?: number
-  created_at: string
-  codes: Code[]
-}
-
-function normalizeNewsBookmark(bm: NewsBookmark): Bookmark {
-  return {
-    id: bm.id,
-    msg_id: bm.id,
-    content: bm.excerpt,
-    username: bm.article_id,
-    date: bm.created_at,
-    codes: bm.codes,
-    is_suno_team: false,
-    note: bm.note,
-    created_at: bm.created_at,
-  }
-}
-
-type CodingSource = 'all' | 'discord' | 'interview' | 'news'
 
 export default function CodingPage() {
   const { pathname } = useLocation()
@@ -415,88 +380,26 @@ export default function CodingPage() {
     navigate(`../${tab}${qs ? `?${qs}` : ''}`, { relative: 'path' })
   }
 
-  const module = pathname.split('/')[1] // 'discord', 'coding', 'interview', 'news'
-  const sourceParam = searchParams.get('source') as CodingSource | null
-  const defaultSrc: CodingSource =
-    sourceParam === 'interview' || sourceParam === 'news' ? sourceParam :
-    module === 'interview' ? 'interview' :
-    module === 'news' ? 'news' : 'discord'
-  const [sourceFilter, setSourceFilter] = useState<CodingSource>(defaultSrc)
-  const isAllSrc = sourceFilter === 'all'
-  const isDiscordSrc = sourceFilter === 'discord' || isAllSrc
-  const isInterviewSrc = sourceFilter === 'interview' || isAllSrc
-  const isNewsSrc = sourceFilter === 'news' || isAllSrc
-
   const queryClient = useQueryClient()
   const { data: _codes } = useQuery<CodeExt[]>({ queryKey: ['codes'], queryFn: () => apiFetch('/codes') })
   const { data: _categories } = useQuery<CodeCategoryExt[]>({ queryKey: ['code-categories'], queryFn: () => apiFetch('/code-categories') })
-
-  // Always fetch all sources; merge based on filter
-  const { data: _discordBookmarks } = useQuery<Bookmark[]>({
+  const { data: _rawBookmarks } = useQuery<Bookmark[]>({
     queryKey: ['bookmarks'],
     queryFn: () => apiFetch('/bookmarks'),
   })
-  const { data: _discordBookmarkCodes } = useQuery<BookmarkCode[]>({
+  const { data: _bookmarkCodes } = useQuery<BookmarkCode[]>({
     queryKey: ['bookmark-codes'],
     queryFn: () => apiFetch('/bookmark-codes'),
   })
-  const { data: _interviewBookmarks } = useQuery<InterviewBookmark[]>({
-    queryKey: ['interview-bookmarks'],
-    queryFn: () => apiFetch('/interview-bookmarks'),
-  })
-  const { data: _interviewBookmarkCodes } = useQuery<BookmarkCode[]>({
-    queryKey: ['interview-bookmark-codes'],
-    queryFn: () => apiFetch('/interview-bookmark-codes'),
-  })
-  const { data: _newsBookmarks } = useQuery<NewsBookmark[]>({
-    queryKey: ['news-bookmarks'],
-    queryFn: () => apiFetch('/news-bookmarks'),
-    retry: false,
-  })
-  const { data: _newsBookmarkCodes } = useQuery<BookmarkCode[]>({
-    queryKey: ['news-bookmark-codes'],
-    queryFn: () => apiFetch('/news-bookmark-codes'),
-    retry: false,
-  })
 
-  // Merge bookmarks and codes based on source filter
-  const _rawBookmarks = useMemo(() => {
-    const result: (Bookmark | InterviewBookmark | NewsBookmark)[] = []
-    if (isDiscordSrc) result.push(...(_discordBookmarks ?? []))
-    if (isInterviewSrc) result.push(...(_interviewBookmarks ?? []))
-    if (isNewsSrc) result.push(...(_newsBookmarks ?? []))
-    return result
-  }, [isDiscordSrc, isInterviewSrc, isNewsSrc, _discordBookmarks, _interviewBookmarks, _newsBookmarks])
-
-  const _bookmarkCodes = useMemo(() => {
-    const result: BookmarkCode[] = []
-    if (isDiscordSrc) result.push(...(_discordBookmarkCodes ?? []))
-    if (isInterviewSrc) result.push(...(_interviewBookmarkCodes ?? []))
-    if (isNewsSrc) result.push(...(_newsBookmarkCodes ?? []))
-    return result
-  }, [isDiscordSrc, isInterviewSrc, isNewsSrc, _discordBookmarkCodes, _interviewBookmarkCodes, _newsBookmarkCodes])
-
-  // Source-aware endpoints (used for mutations - determine source from bookmark context)
-  const bmCodesEndpoint = '/bookmark-codes' // default for discord; overridden per-mutation
-  const rmBmCodeEndpoint = (bmId: number, codeId: number, source?: string) =>
-    source === 'interview' ? `/interview-bookmark-codes/${bmId}/${codeId}` :
-    source === 'news' ? `/news-bookmark-codes/${bmId}/${codeId}` :
-    `/bookmark-codes/${bmId}/${codeId}`
+  const bmCodesEndpoint = '/bookmark-codes'
+  const rmBmCodeEndpoint = (bmId: number, codeId: number) => `/bookmark-codes/${bmId}/${codeId}`
 
   // Initialize from cache so navigating back shows data instantly (no empty flash)
   const [codes, setCodes] = useState<CodeExt[]>(() => queryClient.getQueryData<CodeExt[]>(['codes']) ?? [])
   const [categories, setCategories] = useState<CodeCategoryExt[]>(() => queryClient.getQueryData<CodeCategoryExt[]>(['code-categories']) ?? [])
-  const [bookmarks, setBookmarks] = useState<Bookmark[]>(() => {
-    const d = queryClient.getQueryData<Bookmark[]>(['bookmarks']) ?? []
-    const i = (queryClient.getQueryData<InterviewBookmark[]>(['interview-bookmarks']) ?? []).map(normalizeInterviewBookmark)
-    const n = (queryClient.getQueryData<NewsBookmark[]>(['news-bookmarks']) ?? []).map(normalizeNewsBookmark)
-    return [...d, ...i, ...n]
-  })
-  const [bookmarkCodes, setBookmarkCodes] = useState<BookmarkCode[]>(() =>
-    (queryClient.getQueryData<BookmarkCode[]>(['bookmark-codes']) ?? [])
-      .concat(queryClient.getQueryData<BookmarkCode[]>(['interview-bookmark-codes']) ?? [])
-      .concat(queryClient.getQueryData<BookmarkCode[]>(['news-bookmark-codes']) ?? [])
-  )
+  const [bookmarks, setBookmarks] = useState<Bookmark[]>(() => queryClient.getQueryData<Bookmark[]>(['bookmarks']) ?? [])
+  const [bookmarkCodes, setBookmarkCodes] = useState<BookmarkCode[]>(() => queryClient.getQueryData<BookmarkCode[]>(['bookmark-codes']) ?? [])
 
   useEffect(() => { if (_codes) setCodes(_codes) }, [_codes])
   useEffect(() => { if (_categories) setCategories(_categories) }, [_categories])
@@ -507,16 +410,8 @@ export default function CodingPage() {
       requestAnimationFrame(() => window.scrollTo({ top: parseInt(saved, 10), behavior: 'instant' }))
     }
   }, [])
-  useEffect(() => {
-    const normalized = (_rawBookmarks as any[]).map((bm: any) => {
-      if (bm.interview_id !== undefined) return normalizeInterviewBookmark(bm as InterviewBookmark)
-      if (bm.article_id !== undefined) return normalizeNewsBookmark(bm as NewsBookmark)
-      return bm as Bookmark
-    })
-    setBookmarks(normalized)
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [_rawBookmarks])
-  useEffect(() => { setBookmarkCodes(_bookmarkCodes ?? []) }, [_bookmarkCodes])
+  useEffect(() => { if (_rawBookmarks) setBookmarks(_rawBookmarks) }, [_rawBookmarks])
+  useEffect(() => { if (_bookmarkCodes) setBookmarkCodes(_bookmarkCodes) }, [_bookmarkCodes])
 
   const [dateFrom, setDateFrom] = useState<string>(() => searchParams.get('from') ?? '')
   const [dateTo, setDateTo] = useState<string>(() => searchParams.get('to') ?? '')
@@ -532,6 +427,29 @@ export default function CodingPage() {
       return next
     }, { replace: true })
   }, [dateFrom, dateTo, authorFilter]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Archetype labels keyed by discord username
+  const [userArchetypes, setUserArchetypes] = useState<Record<string, string>>({})
+  const fetchedArchetypeUsers = useRef<Set<string>>(new Set())
+
+  useEffect(() => {
+    const newUsers = [...new Set(
+      bookmarks
+        .filter(bm => bm.username)
+        .map(bm => bm.username!)
+    )].filter(u => !fetchedArchetypeUsers.current.has(u))
+    if (newUsers.length === 0) return
+    newUsers.forEach(u => fetchedArchetypeUsers.current.add(u))
+    newUsers.forEach(async u => {
+      try {
+        const data = await apiFetch<Array<{ persona: string; created_at: string }>>(`/persona/user/${encodeURIComponent(u)}?method=archetype`)
+        if (data.length > 0) {
+          const latest = [...data].sort((a, b) => b.created_at.localeCompare(a.created_at))[0]
+          setUserArchetypes(prev => ({ ...prev, [u]: latest.persona }))
+        }
+      } catch { }
+    })
+  }, [bookmarks])
 
   const [collapsedCats, setCollapsedCats] = useState<Set<number>>(new Set())
   const [expandedCodes, setExpandedCodes] = useState<Set<number>>(new Set())
@@ -586,10 +504,6 @@ export default function CodingPage() {
     queryClient.invalidateQueries({ queryKey: ['code-categories'] })
     queryClient.invalidateQueries({ queryKey: ['bookmarks'] })
     queryClient.invalidateQueries({ queryKey: ['bookmark-codes'] })
-    queryClient.invalidateQueries({ queryKey: ['interview-bookmarks'] })
-    queryClient.invalidateQueries({ queryKey: ['interview-bookmark-codes'] })
-    queryClient.invalidateQueries({ queryKey: ['news-bookmarks'] })
-    queryClient.invalidateQueries({ queryKey: ['news-bookmark-codes'] })
   }
 
   const filterActive = !!(dateFrom || dateTo || authorFilter !== 'all')
@@ -843,12 +757,12 @@ export default function CodingPage() {
 
   const exportCSV = () => {
     const q = (s: string) => `"${s.replace(/"/g, '""')}"`
-    const rows = [['2nd-order Coding', 'Open Coding', 'Quote / Excerpt', 'Source Username', 'Source Date', 'Source', 'Note'].join(',')]
+    const rows = [['2nd-order Coding', 'Open Coding', 'Quote / Excerpt', 'Source Username', 'Source Date', 'Note'].join(',')]
 
     const emitCode = (catName: string, code: CodeExt) => {
       const excerpts = filteredCodes.filter(bc => bc.code_id === code.id)
       if (excerpts.length === 0) {
-        rows.push([q(catName), q(code.name), '', '', '', '', ''].join(','))
+        rows.push([q(catName), q(code.name), '', '', '', ''].join(','))
       } else {
         for (const bc of excerpts) {
           const bm = bookmarks.find(b => b.id === bc.bookmark_id)
@@ -859,7 +773,6 @@ export default function CodingPage() {
             q(quote),
             q(bm?.username || ''),
             bm?.date?.slice(0, 19).replace('T', ' ') || '',
-            interviewBmIds.has(bc.bookmark_id) ? 'Interview' : newsBmIds.has(bc.bookmark_id) ? 'News' : 'Discord',
             q(bm?.note || ''),
           ].join(','))
         }
@@ -867,7 +780,7 @@ export default function CodingPage() {
     }
 
     sortedCats.forEach(cat => {
-      const catCodes = codeSourceFiltered.filter(c => c.category_id === cat.id).sort((a, b) => a.name.localeCompare(b.name))
+      const catCodes = codes.filter(c => c.category_id === cat.id).sort((a, b) => a.name.localeCompare(b.name))
       const visibleCatCodes = catCodes.filter(code => filteredCodes.some(bc => bc.code_id === code.id))
       visibleCatCodes.forEach(code => emitCode(cat.name, code))
     })
@@ -937,26 +850,11 @@ export default function CodingPage() {
     return pool.filter(c => c.name.toLowerCase().includes(term)).slice(0, 8)
   })()
 
-  // Build sets of bookmark IDs per source for source-aware code filtering
-  const discordBmIds = useMemo(() => new Set((_discordBookmarks ?? []).map(b => b.id)), [_discordBookmarks])
-  const interviewBmIds = useMemo(() => new Set((_interviewBookmarks ?? []).map(b => b.id)), [_interviewBookmarks])
-  const newsBmIds = useMemo(() => new Set((_newsBookmarks ?? []).map(b => b.id)), [_newsBookmarks])
-
-  // Source-aware code filter: only show codes that have quotes from the selected source
-  const codeSourceFiltered = useMemo(() => {
-    if (sourceFilter === 'all') return codes
-    const sourceBmIds = sourceFilter === 'discord' ? discordBmIds :
-      sourceFilter === 'interview' ? interviewBmIds : newsBmIds
-    return codes.filter(code =>
-      bookmarkCodes.some(bc => bc.code_id === code.id && sourceBmIds.has(bc.bookmark_id))
-    )
-  }, [sourceFilter, codes, bookmarkCodes, discordBmIds, interviewBmIds, newsBmIds])
-
   // Build tree
   const buildTree = (): TreeNode[] => {
     const catMap = new Map<number, TreeNode>()
     categories.forEach(c => catMap.set(c.id, { ...c, children: [], codes: [] }))
-    codeSourceFiltered.forEach(code => {
+    codes.forEach(code => {
       if (code.category_id != null) {
         const node = catMap.get(code.category_id as number)
         if (node) node.codes.push(code)
@@ -980,20 +878,19 @@ export default function CodingPage() {
   }
 
   const treeRoots = buildTree()
-  const uncategorized = codeSourceFiltered.filter(c => c.category_id == null).sort((a, b) => a.name.localeCompare(b.name))
+  const uncategorized = codes.filter(c => c.category_id == null).sort((a, b) => a.name.localeCompare(b.name))
   const sortedCats = [...categories].sort((a, b) => a.name.localeCompare(b.name))
 
   const codeHasFilteredExcerpts = (code: CodeExt) =>
-    bookmarkCodes.some(bc => bc.code_id === code.id && filteredBmIds.has(bc.bookmark_id)) &&
-    codeSourceFiltered.some(c => c.id === code.id)
+    bookmarkCodes.some(bc => bc.code_id === code.id && filteredBmIds.has(bc.bookmark_id))
 
   const treeNodeHasVisible = (node: TreeNode): boolean => {
-    if (!filterActive && sourceFilter === 'all') return true
+    if (!filterActive) return true
     return node.codes.some(codeHasFilteredExcerpts) || node.children.some(treeNodeHasVisible)
   }
 
-  const visibleTreeRoots = (filterActive || sourceFilter !== 'all') ? treeRoots.filter(treeNodeHasVisible) : treeRoots
-  const visibleUncategorized = (filterActive || sourceFilter !== 'all') ? uncategorized.filter(codeHasFilteredExcerpts) : uncategorized
+  const visibleTreeRoots = filterActive ? treeRoots.filter(treeNodeHasVisible) : treeRoots
+  const visibleUncategorized = filterActive ? uncategorized.filter(codeHasFilteredExcerpts) : uncategorized
 
   const codeFilterLower = codeSearchFilter.trim().toLowerCase()
   const flatSearchResults = codeFilterLower
@@ -1017,25 +914,6 @@ export default function CodingPage() {
             }`}
           >
             {tab === 'manager' ? 'Coding Manager' : 'Coding Table'}
-          </button>
-        ))}
-      </div>
-
-      {/* Source filter chips */}
-      <div className="flex items-center gap-2 px-1 flex-wrap">
-        <span className="text-xs font-semibold text-gray-400 uppercase tracking-wide shrink-0">Source</span>
-        {([
-          { value: 'all' as const, label: 'All', active: 'bg-gray-700 text-white', inactive: 'bg-gray-100 text-gray-600 hover:bg-gray-200' },
-          { value: 'discord' as const, label: 'Discord', active: 'bg-indigo-600 text-white', inactive: 'bg-indigo-50 text-indigo-700 hover:bg-indigo-100' },
-          { value: 'interview' as const, label: 'Interview', active: 'bg-teal-600 text-white', inactive: 'bg-teal-50 text-teal-700 hover:bg-teal-100' },
-          { value: 'news' as const, label: 'News', active: 'bg-amber-600 text-white', inactive: 'bg-amber-50 text-amber-700 hover:bg-amber-100' },
-        ]).map(({ value, label, active, inactive }) => (
-          <button
-            key={value}
-            onClick={() => setSourceFilter(value as CodingSource)}
-            className={`text-xs px-3 py-1 rounded-full font-semibold transition-colors ${sourceFilter === value ? active : inactive}`}
-          >
-            {label}
           </button>
         ))}
       </div>
@@ -1251,7 +1129,7 @@ export default function CodingPage() {
               <div className="flex items-center gap-3 mb-3 pb-3 border-b border-gray-100">
                 <div>
                   <span className="text-sm font-semibold text-gray-700">{codeFilterLower ? 'Search Results' : 'Code Tree'}</span>
-                  <span className="ml-2 text-xs text-gray-400">{visibleTreeRoots.length} categories · {codeSourceFiltered.length} codes · {bookmarkCodes.length} quotes</span>
+                  <span className="ml-2 text-xs text-gray-400">{visibleTreeRoots.length} categories · {codes.length} codes · {bookmarkCodes.length} quotes</span>
                 </div>
                 <div className="relative ml-auto w-52">
                   <input
@@ -1271,7 +1149,7 @@ export default function CodingPage() {
                 )}
               </div>
 
-              {codeSourceFiltered.length === 0 && categories.length === 0 ? (
+              {codes.length === 0 && categories.length === 0 ? (
                 <p className="text-sm text-gray-400 text-center py-8">No codes yet. Click &ldquo;+ Open Coding&rdquo; to get started.</p>
               ) : codeFilterLower && flatSearchResults.length === 0 ? (
                 <p className="text-sm text-gray-400 text-center py-6">No codes match &ldquo;{codeSearchFilter}&rdquo;</p>
@@ -1307,8 +1185,6 @@ export default function CodingPage() {
                     onToggleCode={openCodeDetail}
                     filteredBmIds={filteredBmIds}
                     bookmarks={bookmarks}
-                    interviewBmIds={interviewBmIds}
-                    newsBmIds={newsBmIds}
                     bookmarkCodes={bookmarkCodes}
                     mergeMode={mergeMode}
                     mergeSelected={mergeSelected}
@@ -1321,6 +1197,7 @@ export default function CodingPage() {
                     onOpenExcerpt={openExcerptDetail}
                     onDeleteExcerptCode={deleteExcerptCode}
                     activeExcerptKey={activeExcerptKey}
+                    userArchetypes={userArchetypes}
                   />
                 ))}
                 {(!filterActive || visibleUncategorized.length > 0 || dragOverCatId === 0) && (
@@ -1347,8 +1224,6 @@ export default function CodingPage() {
                               excerpts={codeExcerpts}
                               filteredBmIds={filteredBmIds}
                               bookmarks={bookmarks}
-                              interviewBmIds={interviewBmIds}
-                              newsBmIds={newsBmIds}
                               mergeMode={mergeMode}
                               mergeSelected={mergeSelected.has(code.id)}
                               onMergeToggle={toggleMergeSelect}
@@ -1358,6 +1233,7 @@ export default function CodingPage() {
                               onOpenExcerpt={openExcerptDetail}
                               onDeleteExcerptCode={deleteExcerptCode}
                               activeExcerptKey={activeExcerptKey}
+                              userArchetypes={userArchetypes}
                             />
                           )
                         })}
@@ -1473,9 +1349,9 @@ export default function CodingPage() {
                       </div>
                       {/* Source */}
                       <div className="flex items-center gap-1.5 text-xs text-gray-500 flex-wrap">
-                        {detailExcerptBm.username && !interviewBmIds.has(detailExcerptBm.id) && !newsBmIds.has(detailExcerptBm.id) ? (
+                        {detailExcerptBm.username ? (
                           <button
-                            onClick={() => { sessionStorage.setItem('codingPage.scrollY', String(window.scrollY)); navigate(`/discord/users/${encodeURIComponent(detailExcerptBm.username!)}`) }}
+                            onClick={() => { sessionStorage.setItem('codingPage.scrollY', String(window.scrollY)); navigate(`/discord/search/users/${encodeURIComponent(detailExcerptBm.username!)}`) }}
                             className="text-[11px] px-2 py-0.5 rounded-full font-semibold bg-indigo-100 text-indigo-700 hover:bg-indigo-200 transition-colors"
                           >
                             {detailExcerptBm.username}
@@ -1632,7 +1508,7 @@ export default function CodingPage() {
                                 <div className="flex items-center gap-1.5 mb-0.5">
                                   {cm.username ? (
                                     <button
-                                      onClick={() => { sessionStorage.setItem('codingPage.scrollY', String(window.scrollY)); navigate(`/discord/users/${encodeURIComponent(cm.username)}`) }}
+                                      onClick={() => { sessionStorage.setItem('codingPage.scrollY', String(window.scrollY)); navigate(`/discord/search/users/${encodeURIComponent(cm.username)}`) }}
                                       className="font-semibold text-indigo-700 hover:underline"
                                     >
                                       {cm.username}
@@ -1689,20 +1565,8 @@ export default function CodingPage() {
                   {(() => {
                     const rows: React.ReactElement[] = []
 
-                    // Helper to resolve bookmark source label
-                    const getBmSource = (bmId: number): string => {
-                      if (interviewBmIds.has(bmId)) return 'Interview'
-                      if (newsBmIds.has(bmId)) return 'News'
-                      return 'Discord'
-                    }
-                    const sourceStyle = (src: string) => {
-                      if (src === 'Interview') return 'bg-teal-100 text-teal-700'
-                      if (src === 'News') return 'bg-amber-100 text-amber-700'
-                      return 'bg-indigo-100 text-indigo-700'
-                    }
-
                     sortedCats.forEach(cat => {
-                      const allCatCodes = codeSourceFiltered.filter(c => c.category_id === cat.id).sort((a, b) => a.name.localeCompare(b.name))
+                      const allCatCodes = codes.filter(c => c.category_id === cat.id).sort((a, b) => a.name.localeCompare(b.name))
                       const catCodes = allCatCodes.filter(code => filteredCodes.some(bc => bc.code_id === code.id))
                       if (catCodes.length === 0) return
                       const catTotalRows = catCodes.reduce((sum, code) => {
@@ -1773,9 +1637,9 @@ export default function CodingPage() {
                                   <p className="italic leading-relaxed">&ldquo;{text}{truncated ? '…' : ''}&rdquo;</p>
                                 </td>
                                 <td className="px-3 py-2 text-xs text-gray-500 border-b border-gray-100 whitespace-nowrap">
-                                  {bm?.username && getBmSource(bc.bookmark_id) === 'Discord' ? (
+                                  {bm?.username ? (
                                     <button
-                                      onClick={() => { sessionStorage.setItem('codingPage.scrollY', String(window.scrollY)); navigate(`/discord/users/${encodeURIComponent(bm.username!)}`) }}
+                                      onClick={() => { sessionStorage.setItem('codingPage.scrollY', String(window.scrollY)); navigate(`/discord/search/users/${encodeURIComponent(bm.username!)}`) }}
                                       className="font-medium text-indigo-700 hover:underline block"
                                     >
                                       {bm.username}
@@ -1784,7 +1648,16 @@ export default function CodingPage() {
                                     <div className="font-medium">{bm?.username || '—'}</div>
                                   )}
                                   <div className="text-gray-400">{bm?.date?.slice(0, 19).replace('T', ' ') || ''}</div>
-                                  <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded-full mt-1 inline-block ${sourceStyle(getBmSource(bc.bookmark_id))}`}>{getBmSource(bc.bookmark_id)}</span>
+                                  <div className="flex items-center gap-1 mt-0.5 flex-wrap">
+                                    {bm?.username && userArchetypes[bm.username] && (() => {
+                                      const a = userArchetypes[bm.username!]
+                                      const cls = a === 'Contributor' ? 'bg-blue-100 text-blue-700'
+                                        : a === 'Explorer' ? 'bg-violet-100 text-violet-700'
+                                        : a === 'Help-Seeker' ? 'bg-amber-100 text-amber-700'
+                                        : 'bg-gray-100 text-gray-600'
+                                      return <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded-full inline-block ${cls}`}>{a}</span>
+                                    })()}
+                                  </div>
                                 </td>
                                 <td className="px-3 py-2 text-xs text-gray-400 border-b border-gray-100"></td>
                               </tr>
@@ -1858,9 +1731,9 @@ export default function CodingPage() {
                                   <p className="italic leading-relaxed">&ldquo;{text}{truncated ? '…' : ''}&rdquo;</p>
                                 </td>
                                 <td className="px-3 py-2 text-xs text-gray-500 border-b border-gray-100 whitespace-nowrap">
-                                  {bm?.username && getBmSource(bc.bookmark_id) === 'Discord' ? (
+                                  {bm?.username ? (
                                     <button
-                                      onClick={() => { sessionStorage.setItem('codingPage.scrollY', String(window.scrollY)); navigate(`/discord/users/${encodeURIComponent(bm.username!)}`) }}
+                                      onClick={() => { sessionStorage.setItem('codingPage.scrollY', String(window.scrollY)); navigate(`/discord/search/users/${encodeURIComponent(bm.username!)}`) }}
                                       className="font-medium text-indigo-700 hover:underline block"
                                     >
                                       {bm.username}
@@ -1869,7 +1742,16 @@ export default function CodingPage() {
                                     <div className="font-medium">{bm?.username || '—'}</div>
                                   )}
                                   <div className="text-gray-400">{bm?.date?.slice(0, 19).replace('T', ' ') || ''}</div>
-                                  <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded-full mt-1 inline-block ${sourceStyle(getBmSource(bc.bookmark_id))}`}>{getBmSource(bc.bookmark_id)}</span>
+                                  <div className="flex items-center gap-1 mt-0.5 flex-wrap">
+                                    {bm?.username && userArchetypes[bm.username] && (() => {
+                                      const a = userArchetypes[bm.username!]
+                                      const cls = a === 'Contributor' ? 'bg-blue-100 text-blue-700'
+                                        : a === 'Explorer' ? 'bg-violet-100 text-violet-700'
+                                        : a === 'Help-Seeker' ? 'bg-amber-100 text-amber-700'
+                                        : 'bg-gray-100 text-gray-600'
+                                      return <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded-full inline-block ${cls}`}>{a}</span>
+                                    })()}
+                                  </div>
                                 </td>
                                 <td className="px-3 py-2 text-xs text-gray-400 border-b border-gray-100"></td>
                               </tr>
@@ -1879,7 +1761,7 @@ export default function CodingPage() {
                       })
                     }
 
-                    if (codeSourceFiltered.length === 0) {
+                    if (codes.length === 0) {
                       rows.push(
                         <tr key="empty">
                           <td colSpan={5} className="px-3 py-8 text-center text-sm text-gray-400">

@@ -26,11 +26,30 @@ _SEED = 42
 random.seed(_SEED)
 np.random.seed(_SEED)
 
+# Topic analysis libraries — imported once at startup to avoid per-request overhead
+# and to allow numba JIT warmup during lifespan startup.
+try:
+    from bertopic import BERTopic
+    from hdbscan import HDBSCAN
+    from umap import UMAP
+    from sklearn.feature_extraction.text import CountVectorizer, ENGLISH_STOP_WORDS
+    _TOPIC_LIBS_AVAILABLE = True
+except ImportError:
+    _TOPIC_LIBS_AVAILABLE = False
+    BERTopic = HDBSCAN = UMAP = CountVectorizer = ENGLISH_STOP_WORDS = None  # type: ignore
+
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Silence BERTopic's "Using a custom list of topic assignments…" warning fired by
+# update_topics() inside _reduce_outliers.  We deliberately call update_topics()
+# as the final pipeline step (no further reductions follow), so the warning is
+# informational noise.
+if _TOPIC_LIBS_AVAILABLE:
+    logging.getLogger("bertopic").setLevel(logging.ERROR)
 
 embedding_model = None
 emotion_classifier = None
@@ -46,6 +65,12 @@ _AI_INFERENCE_CONCURRENCY = max(
 )
 # Created in lifespan so it binds to the FastAPI event loop, not module import time.
 _inference_sem: "Optional[asyncio.Semaphore]" = None
+
+# Topic analysis is CPU-heavy (UMAP + HDBSCAN need all cores).  Serialise to 1
+# concurrent run by default so each analysis gets the full CPU.  Raise via
+# TOPIC_CONCURRENCY env var only if the machine has many NUMA nodes.
+_TOPIC_CONCURRENCY = max(1, int(os.environ.get("TOPIC_CONCURRENCY", "1")))
+_topic_sem: "Optional[asyncio.Semaphore]" = None
 
 # When set, /analyze_emotion forwards inference to this HF Dedicated Endpoint
 # (using the per-request X-HF-Token as the Bearer auth) instead of the local
@@ -321,9 +346,11 @@ async def _prewarm_hf_endpoint():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global embedding_model, emotion_classifier, _inference_sem
+    global embedding_model, emotion_classifier, _inference_sem, _topic_sem
     _inference_sem = asyncio.Semaphore(_AI_INFERENCE_CONCURRENCY)
     logger.info("Inference semaphore initialised with %d slot(s).", _AI_INFERENCE_CONCURRENCY)
+    _topic_sem = asyncio.Semaphore(_TOPIC_CONCURRENCY)
+    logger.info("Topic semaphore initialised with %d slot(s).", _TOPIC_CONCURRENCY)
     logger.info("Loading sentence-transformer model (all-MiniLM-L6-v2) as fallback…")
     from sentence_transformers import SentenceTransformer
     embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
@@ -364,6 +391,22 @@ async def lifespan(app: FastAPI):
     # immediately; warmup completes in parallel.
     if _HF_ENDPOINT_URL:
         asyncio.create_task(_prewarm_hf_endpoint())
+    # Warm up UMAP's numba JIT so the first real topic analysis doesn't pay the
+    # ~10-30s numba compilation cost.  A 30-point dummy fit is enough to trigger
+    # all relevant JIT paths (nearest-neighbour graph + layout).
+    if _TOPIC_LIBS_AVAILABLE:
+        try:
+            logger.info("Warming up UMAP numba JIT (one-time compilation)…")
+            _n_warmup = max(1, (os.cpu_count() or 1))
+            _dummy_umap = UMAP(
+                n_neighbors=5, n_components=2, n_epochs=5,
+                random_state=_SEED, n_jobs=_n_warmup,
+            )
+            _dummy_data = np.random.default_rng(_SEED).random((40, 16)).astype(np.float32)
+            await asyncio.to_thread(_dummy_umap.fit_transform, _dummy_data)
+            logger.info("UMAP numba JIT ready.")
+        except Exception as _exc:
+            logger.warning("UMAP warmup failed (non-fatal): %s", _exc)
     yield
 
 
@@ -392,26 +435,57 @@ def health():
 
 
 async def gpt_label(keywords: List[str], rep_docs: List[str]) -> Optional[str]:
-    """Call GPT-4o-mini to generate a meaningful topic name."""
+    """Call GPT-4o-mini to generate a meaningful topic name.
+
+    `rep_docs` should be a diverse sample (e.g. from diverse_sample_for_labeling)
+    of up to ~10 messages spanning the cluster's similarity spectrum, so the
+    model sees both the core and the edges when judging the dominant role.
+    """
     if not OPENAI_API_KEY:
         return None
     try:
         from openai import AsyncOpenAI
         client = AsyncOpenAI(api_key=OPENAI_API_KEY)
         kw_str = ", ".join(keywords[:8])
-        docs_str = "\n".join(f"- {d[:200]}" for d in rep_docs[:3])
+        docs_str = "\n".join(f"- {d[:200]}" for d in rep_docs)
         prompt = (
             "You are labelling discussion topics from a Suno AI music generation Discord community.\n\n"
             f"Top keywords: {kw_str}\n\n"
-            f"Sample messages:\n{docs_str}\n\n"
-            "Give a concise, descriptive topic label (3–6 words). "
-            "Return ONLY the label, no punctuation, no explanation."
+            f"Sample messages (mix of core and edge examples from the cluster):\n{docs_str}\n\n"
+            "Write a concise topic label (4–8 words) that captures the DIRECTION of help, the action verb, and the subject.\n\n"
+            "STEP 1 — Determine the DIRECTION OF HELP by reading the messages carefully:\n\n"
+            "SHARING HELP (contributor) — the author is helping OTHERS:\n"
+            "  Signals: imperative instructions ('try this', 'go to Settings', 'make sure you'), "
+            "step-by-step directions, offering fixes or solutions, explaining how something works, "
+            "pointing others to resources, caring/supportive tone ('hope that helps', 'let me know if'), "
+            "troubleshooting guidance aimed at another person's problem.\n"
+            "  Verbs to use: Sharing / Explaining / Guiding / Recommending / Demonstrating / "
+            "Teaching / Providing / Offering / Helping troubleshoot / Walking through\n\n"
+            "SEEKING HELP (help-seeker) — the author needs help THEMSELVES:\n"
+            "  Signals: first-person confusion or struggle ('I can't', 'why doesn't this work', "
+            "'not working for me', 'I don't understand'), direct questions about their own problem, "
+            "reporting their own error or failure, requesting others to fix or explain something for them.\n"
+            "  Verbs to use: Asking about / Requesting / Seeking help with / Wondering about / "
+            "Struggling with / Reporting issues with\n\n"
+            "KEY RULE: A message about troubleshooting, fixing, or solving a problem "
+            "is SHARING HELP if the author is guiding or advising others. "
+            "It is SEEKING HELP only if the author is describing their OWN unresolved problem.\n\n"
+            "STEP 2 — Pick the specific subject (tool name, feature, workflow).\n\n"
+            "Format: <Verb> <specific subject>\n"
+            "Good examples:\n"
+            "  'Guiding troubleshooting audio export issues' (contributor giving directions)\n"
+            "  'Sharing prompt techniques for style control' (contributor teaching)\n"
+            "  'Asking about voice cloning with Bark' (seeker with their own problem)\n"
+            "  'Struggling with song length generation limits' (seeker reporting own issue)\n"
+            "  'Walking through Suno API setup steps' (contributor providing instructions)\n"
+            "  'Seeking help with account billing errors' (seeker needing assistance)\n\n"
+            "Return ONLY the label, no punctuation at the end, no explanation."
         )
         resp = await client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=20,
-            temperature=0,
+            max_tokens=45,
+            temperature=0.2,
         )
         label = resp.choices[0].message.content.strip().strip('"').strip("'")
         return label or None
@@ -422,10 +496,8 @@ async def gpt_label(keywords: List[str], rep_docs: List[str]) -> Optional[str]:
 
 @app.post("/topics")
 async def run_bertopic(req: TopicsRequest):
-    from bertopic import BERTopic
-    from hdbscan import HDBSCAN
-    from umap import UMAP
-    from sklearn.feature_extraction.text import CountVectorizer, ENGLISH_STOP_WORDS
+    if not _TOPIC_LIBS_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Topic analysis libraries not installed")
 
     total_input = len(req.docs)
     using_precomputed = req.embeddings is not None and len(req.embeddings) == total_input
@@ -506,228 +578,329 @@ async def run_bertopic(req: TopicsRequest):
             "used_openai_labels": bool(OPENAI_API_KEY and keywords),
         }
 
+    # --- Acquire topic semaphore — only 1 analysis runs at a time so each
+    # gets the full CPU budget instead of competing for cores.
+    async with _topic_sem:
+        return await _run_bertopic_locked(
+            docs, precomputed, filtered_uuids, total_input,
+        )
+
+
+async def _run_bertopic_locked(
+    docs: list,
+    precomputed,
+    filtered_uuids: list,
+    total_input: int,
+):
+    """Inner BERTopic pipeline — called only while _topic_sem is held."""
+    from sklearn.metrics.pairwise import cosine_similarity as cos_sim
+
     # --- Adaptive parameters ---
     n = len(docs)
 
-    # min_topic_size: keep close to the original heuristic so HDBSCAN can form
-    # fine-grained topics.  Only push higher for very large corpora where
-    # micro-clusters become noise rather than signal.
     if n >= 2000:
-        min_size = max(15, min(30, n // 100))  # ~1% per topic, cap 30
+        min_size = max(15, min(30, n // 100))
     else:
-        min_size = max(2, min(15, n // 8))     # original formula
+        min_size = max(2, min(15, n // 8))
 
-    # Sanitize precomputed embeddings — NaN/inf cause HDBSCAN to crash silently
     if precomputed is not None:
         precomputed = np.nan_to_num(precomputed, nan=0.0, posinf=0.0, neginf=0.0)
 
     n_jobs = max(1, (os.cpu_count() or 1))
 
-    # UMAP: cosine metric matches sentence-transformer training objective;
-    # n_components=5 gives better cluster separation than 2D projection.
-    # n_epochs=200 (vs default 500) cuts UMAP time ~60% with negligible quality loss.
-    # n_jobs parallelises the nearest-neighbour graph construction.
-    umap_model = UMAP(
-        n_neighbors=min(15, n - 1),
-        n_components=min(5, n - 2),
-        n_epochs=25 if n > 5000 else (50 if n > 2000 else 100),
-        min_dist=0.0,
-        metric='cosine',
-        random_state=_SEED,
-        low_memory=n > 5000,
-        n_jobs=n_jobs,
-    )
-
-    # HDBSCAN: min_samples=1 makes it far less conservative about outlier
-    # assignment — any point can be a core point — while min_cluster_size
-    # still enforces meaningful topic size.
-    # core_dist_n_jobs parallelises the core-distance computation.
-    hdbscan_model = HDBSCAN(
-        min_cluster_size=min_size,
-        min_samples=1,
-        metric='euclidean',
-        cluster_selection_method='eom',
-        prediction_data=True,   # required for reduce_outliers
-        core_dist_n_jobs=n_jobs,
-    )
-
-    stop_words = list(set(ENGLISH_STOP_WORDS) | set(DOMAIN_STOPWORDS))
-    vectorizer = CountVectorizer(
-        stop_words=stop_words,
-        ngram_range=(1, 2),
-        min_df=2,
-        max_features=5000,   # cap vocabulary for faster TF-IDF
-    )
-
+    # Override the global OMP_NUM_THREADS=1 (set for the emotion model) so that
+    # UMAP and HDBSCAN can use all available CPU threads.  Restored in finally
+    # regardless of success or failure so emotion inference is unaffected.
+    _prev_omp = os.environ.get("OMP_NUM_THREADS")
+    _prev_mkl = os.environ.get("MKL_NUM_THREADS")
     try:
-        topic_model = BERTopic(
-            embedding_model=None if precomputed is not None else embedding_model,
-            umap_model=umap_model,
-            hdbscan_model=hdbscan_model,
-            vectorizer_model=vectorizer,
-            min_topic_size=min_size,
-            nr_topics="auto",
-            verbose=False,
-            calculate_probabilities=False,
+        os.environ["OMP_NUM_THREADS"] = str(n_jobs)
+        os.environ["MKL_NUM_THREADS"] = str(n_jobs)
+        try:
+            import numba
+            numba.set_num_threads(n_jobs)
+        except Exception:
+            pass
+
+        umap_model = UMAP(
+            n_neighbors=min(15, n - 1),
+            n_components=min(5, n - 2),
+            n_epochs=25 if n > 5000 else (50 if n > 2000 else 100),
+            min_dist=0.0,
+            metric='cosine',
+            random_state=_SEED,
+            low_memory=n > 5000,
+            n_jobs=n_jobs,
         )
 
-        # Run CPU-bound fit_transform in a thread so the event loop stays responsive
-        if precomputed is not None:
-            topic_assignments, _ = await asyncio.to_thread(
-                topic_model.fit_transform, docs, embeddings=precomputed
-            )
-        else:
-            topic_assignments, _ = await asyncio.to_thread(
-                topic_model.fit_transform, docs
-            )
-
-        # Build embedding matrix for representative doc ranking and outlier reduction.
-        if precomputed is not None:
-            all_embs = precomputed
-        else:
-            all_embs = np.array(
-                embedding_model.encode(docs, show_progress_bar=False), dtype=np.float32
-            )
-
-        # Outlier reduction: reassign topic -1 docs to their nearest topic
-        # by cosine similarity to topic centroids.  Applied whenever >10% of
-        # docs are outliers and at least one real topic exists.
-        outlier_count = sum(1 for t in topic_assignments if t == -1)
-        outlier_pct = outlier_count / len(topic_assignments)
-        real_topics = set(topic_assignments) - {-1}
-        logger.info(
-            "Initial clustering: %d topics, %d outliers (%.1f%%)",
-            len(real_topics), outlier_count, outlier_pct * 100,
+        hdbscan_model = HDBSCAN(
+            min_cluster_size=min_size,
+            min_samples=1,
+            metric='euclidean',
+            cluster_selection_method='eom',
+            prediction_data=True,
+            core_dist_n_jobs=n_jobs,
         )
 
-        if outlier_pct > 0.10 and real_topics:
-            try:
-                def _reduce_outliers(_ta=topic_assignments):
-                    reduced = topic_model.reduce_outliers(
-                        docs,
-                        _ta,
-                        strategy="embeddings",
-                        embeddings=all_embs,
-                        threshold=0.25,
+        stop_words = list(set(ENGLISH_STOP_WORDS) | set(DOMAIN_STOPWORDS))
+        # min_df=2 prunes vocabulary aggressively for sparse small corpora —
+        # combined with the heavy stopword list this often leaves zero terms
+        # and raises "After pruning, no terms remain" from sklearn, or an
+        # empty-diagonal ValueError in BERTopic's c-TF-IDF.  Use min_df=1
+        # for corpora under 50 docs; the reactive fallback in _fit handles
+        # edge cases at larger n.
+        adaptive_min_df = 1 if n < 50 else 2
+        vectorizer = CountVectorizer(
+            stop_words=stop_words,
+            ngram_range=(1, 2),
+            min_df=adaptive_min_df,
+            max_features=5000,
+        )
+
+        try:
+            # nr_topics="auto" triggers a second HDBSCAN pass (_auto_reduce_topics)
+            # that fails with "Found array with 0 sample(s)" when all documents are
+            # initially assigned to the outlier class (-1).  This reliably happens
+            # on tiny corpora (n < 20) where HDBSCAN has nowhere to cluster.
+            nr_topics = None if n < 20 else "auto"
+
+            topic_model = BERTopic(
+                embedding_model=None if precomputed is not None else embedding_model,
+                umap_model=umap_model,
+                hdbscan_model=hdbscan_model,
+                vectorizer_model=vectorizer,
+                min_topic_size=min_size,
+                nr_topics=nr_topics,
+                verbose=False,
+                calculate_probabilities=False,
+            )
+
+            async def _fit(embs=None):
+                try:
+                    return await asyncio.to_thread(
+                        topic_model.fit_transform, docs,
+                        **({'embeddings': embs} if embs is not None else {}),
                     )
-                    topic_model.update_topics(docs, topics=reduced, vectorizer_model=vectorizer)
-                    return reduced
+                except ValueError as exc:
+                    exc_str = str(exc)
+                    if "0 sample" in exc_str and topic_model.nr_topics is not None:
+                        # All docs became outliers; retry without auto-reduction.
+                        logger.warning("Auto-reduce got 0 samples, retrying with nr_topics=None: %s", exc)
+                        topic_model.nr_topics = None
+                        return await asyncio.to_thread(
+                            topic_model.fit_transform, docs,
+                            **({'embeddings': embs} if embs is not None else {}),
+                        )
+                    if getattr(topic_model.vectorizer_model, 'min_df', 1) != 1:
+                        # Vectorizer pruned all terms ("no terms remain") or the
+                        # resulting c-TF-IDF matrix was empty (empty diagonal in
+                        # scipy.diags).  Rebuild with min_df=1 and retry once.
+                        logger.warning(
+                            "Vectorizer/c-TF-IDF empty-vocabulary failure, retrying with min_df=1: %s", exc
+                        )
+                        topic_model.vectorizer_model = CountVectorizer(
+                            stop_words=stop_words,
+                            ngram_range=(1, 2),
+                            min_df=1,
+                            max_features=5000,
+                        )
+                        return await asyncio.to_thread(
+                            topic_model.fit_transform, docs,
+                            **({'embeddings': embs} if embs is not None else {}),
+                        )
+                    raise
 
-                topic_assignments = await asyncio.to_thread(_reduce_outliers)
-                new_outliers = sum(1 for t in topic_assignments if t == -1)
-                logger.info(
-                    "After outlier reduction: %d outliers remain (%.1f%%)",
-                    new_outliers, new_outliers / len(topic_assignments) * 100,
+            if precomputed is not None:
+                topic_assignments, _ = await _fit(precomputed)
+            else:
+                topic_assignments, _ = await _fit()
+
+            if precomputed is not None:
+                all_embs = precomputed
+            else:
+                all_embs = np.array(
+                    embedding_model.encode(docs, show_progress_bar=False), dtype=np.float32
                 )
-            except Exception as exc:
-                logger.warning("Outlier reduction failed, keeping original: %s", exc)
 
-        topic_info = topic_model.get_topic_info()
-        topic_assignments_arr = np.array(topic_assignments)
-
-        # Build uuid → topic_id map so the frontend can group full message objects
-        doc_assignments: dict = {}
-        for uuid, tid in zip(filtered_uuids, topic_assignments):
-            if uuid:
-                doc_assignments[uuid] = int(tid)
-
-        def top_docs_by_similarity(topic_id: int, n: int = 10) -> List[str]:
-            """Return up to n docs for a topic, sorted by cosine sim to centroid."""
-            from sklearn.metrics.pairwise import cosine_similarity as cos_sim
-            idx = np.where(topic_assignments_arr == topic_id)[0]
-            if len(idx) == 0:
-                return []
-            embs = all_embs[idx]
-            centroid = embs.mean(axis=0, keepdims=True)
-            sims = cos_sim(centroid, embs)[0]
-            top_idx = np.argsort(sims)[::-1][:n]
-            return [docs[idx[i]] for i in top_idx]
-
-        # Build base topic objects
-        raw_topics = []
-        for _, row in topic_info.iterrows():
-            topic_id = int(row["Topic"])
-            kw_pairs = topic_model.get_topic(topic_id) or []
-            keywords = [kw for kw, _ in kw_pairs[:8]]
-            rep_docs_list = top_docs_by_similarity(topic_id, n=10)
-
-            fallback_label = (
-                "Outliers / Miscellaneous"
-                if topic_id == -1
-                else (" · ".join(kw for kw, _ in kw_pairs[:3]) if kw_pairs else f"Topic {topic_id}")
+            outlier_count = sum(1 for t in topic_assignments if t == -1)
+            outlier_pct = outlier_count / len(topic_assignments)
+            real_topics = set(topic_assignments) - {-1}
+            logger.info(
+                "Initial clustering: %d topics, %d outliers (%.1f%%)",
+                len(real_topics), outlier_count, outlier_pct * 100,
             )
 
-            raw_topics.append({
-                "id": topic_id,
+            if outlier_pct > 0.10 and real_topics:
+                try:
+                    def _reduce_outliers(_ta=topic_assignments):
+                        # c-tf-idf: uses TF-IDF doc representations, ~5-10x faster
+                        # than the dense "embeddings" strategy (avoids 384D cosine loop).
+                        reduced = topic_model.reduce_outliers(
+                            docs, _ta, strategy="c-tf-idf", threshold=0.1,
+                        )
+                        topic_model.update_topics(docs, topics=reduced, vectorizer_model=vectorizer)
+                        return reduced
+
+                    topic_assignments = await asyncio.to_thread(_reduce_outliers)
+                    new_outliers = sum(1 for t in topic_assignments if t == -1)
+                    logger.info(
+                        "After outlier reduction: %d outliers remain (%.1f%%)",
+                        new_outliers, new_outliers / len(topic_assignments) * 100,
+                    )
+                except Exception as exc:
+                    logger.warning("Outlier reduction failed, keeping original: %s", exc)
+
+            topic_info = topic_model.get_topic_info()
+            topic_assignments_arr = np.array(topic_assignments)
+
+            doc_assignments: dict = {}
+            for uuid, tid in zip(filtered_uuids, topic_assignments):
+                if uuid:
+                    doc_assignments[uuid] = int(tid)
+
+            def top_docs_by_similarity(topic_id: int, k: int = 10) -> List[str]:
+                """Top-k docs by cosine similarity to centroid — for display."""
+                idx = np.where(topic_assignments_arr == topic_id)[0]
+                if len(idx) == 0:
+                    return []
+                embs = all_embs[idx]
+                centroid = embs.mean(axis=0, keepdims=True)
+                sims = cos_sim(centroid, embs)[0]
+                top_idx = np.argsort(sims)[::-1][:k]
+                return [docs[idx[i]] for i in top_idx]
+
+            def diverse_sample_for_labeling(topic_id: int, k: int = 10) -> List[str]:
+                """Stratified sample across the cluster's similarity spectrum so GPT
+                sees both 'core' examples and edge cases.  Pure top-similarity would
+                miss the edges entirely, which are exactly what help disambiguate
+                mixed roles (e.g. help-seekers vs contributors in the same cluster).
+                Recipe: 3 core (top-sim) + 3 typical (middle) + 2 edges (bottom) + 2 random.
+                Falls back to all docs sorted by similarity if cluster has ≤k docs."""
+                idx = np.where(topic_assignments_arr == topic_id)[0]
+                n_docs = len(idx)
+                if n_docs == 0:
+                    return []
+                embs = all_embs[idx]
+                centroid = embs.mean(axis=0, keepdims=True)
+                sims = cos_sim(centroid, embs)[0]
+                sorted_idx = np.argsort(sims)[::-1]  # high → low similarity
+
+                if n_docs <= k:
+                    return [docs[idx[i]] for i in sorted_idx]
+
+                picks: List[int] = []
+                picks.extend(int(i) for i in sorted_idx[:3])              # core
+                mid_start = max(3, n_docs // 2 - 1)
+                picks.extend(int(i) for i in sorted_idx[mid_start : mid_start + 3])  # typical
+                picks.extend(int(i) for i in sorted_idx[-2:])             # edges
+
+                seen = set(picks)
+                rng = np.random.default_rng(_SEED + topic_id)
+                remaining = [int(i) for i in sorted_idx if int(i) not in seen]
+                if remaining and len(picks) < k:
+                    n_rand = min(k - len(picks), len(remaining))
+                    random_picks = rng.choice(remaining, size=n_rand, replace=False)
+                    picks.extend(int(i) for i in random_picks)
+
+                # Order by similarity rank so GPT sees most-representative examples first
+                rank_map = {int(i): r for r, i in enumerate(sorted_idx)}
+                picks.sort(key=lambda i: rank_map[int(i)])
+                return [docs[idx[i]] for i in picks]
+
+            raw_topics = []
+            labeling_docs_list: List[List[str]] = []
+            for _, row in topic_info.iterrows():
+                topic_id = int(row["Topic"])
+                kw_pairs = topic_model.get_topic(topic_id) or []
+                keywords = [kw for kw, _ in kw_pairs[:8]]
+                rep_docs_list = top_docs_by_similarity(topic_id)
+                labeling_docs_list.append(diverse_sample_for_labeling(topic_id))
+
+                fallback_label = (
+                    "Outliers / Miscellaneous"
+                    if topic_id == -1
+                    else (" · ".join(kw for kw, _ in kw_pairs[:3]) if kw_pairs else f"Topic {topic_id}")
+                )
+
+                raw_topics.append({
+                    "id": topic_id,
+                    "label": fallback_label,
+                    "keywords": keywords,
+                    "message_count": int(row["Count"]),
+                    "representative_docs": rep_docs_list,
+                })
+
+            used_openai = False
+            if OPENAI_API_KEY:
+                non_outlier_idx = [i for i, t in enumerate(raw_topics) if t["id"] != -1]
+                if non_outlier_idx:
+                    gpt_results = await asyncio.gather(
+                        *[
+                            gpt_label(raw_topics[i]["keywords"], labeling_docs_list[i])
+                            for i in non_outlier_idx
+                        ],
+                        return_exceptions=True,
+                    )
+                    for i, result in zip(non_outlier_idx, gpt_results):
+                        if isinstance(result, str) and result:
+                            raw_topics[i]["label"] = result
+                            used_openai = True
+
+            raw_topics.sort(key=lambda t: (t["id"] == -1, -t["message_count"]))
+
+            return {
+                "topics": raw_topics,
+                "doc_assignments": doc_assignments,
+                "total_docs": total_input,
+                "filtered_docs": len(docs),
+                "used_precomputed_embeddings": precomputed is not None,
+                "used_openai_labels": used_openai,
+            }
+
+        except Exception as exc:
+            logger.exception("BERTopic pipeline failed, falling back to keyword extraction")
+
+            fallback_stop = list(set(ENGLISH_STOP_WORDS) | set(DOMAIN_STOPWORDS))
+            fallback_vec = CountVectorizer(stop_words=fallback_stop, ngram_range=(1, 2), min_df=1)
+            try:
+                matrix = fallback_vec.fit_transform(docs)
+                freqs = matrix.toarray().sum(axis=0)
+                vocab = fallback_vec.get_feature_names_out()
+                top_idx = freqs.argsort()[::-1][:8]
+                keywords = [vocab[i] for i in top_idx if freqs[i] > 0]
+            except Exception:
+                keywords = []
+
+            fallback_label = " · ".join(keywords[:3]) if keywords else "General Discussion"
+            fallback_topic = {
+                "id": 0,
                 "label": fallback_label,
                 "keywords": keywords,
-                "message_count": int(row["Count"]),
-                "representative_docs": rep_docs_list,
-            })
+                "message_count": len(docs),
+                "representative_docs": docs[:10],
+            }
+            fallback_assignments = {u: 0 for u in filtered_uuids if u}
 
-        # Call GPT-4o-mini in parallel for all non-outlier topics
-        used_openai = False
-        if OPENAI_API_KEY:
-            non_outlier_idx = [i for i, t in enumerate(raw_topics) if t["id"] != -1]
-            if non_outlier_idx:
-                gpt_results = await asyncio.gather(
-                    *[
-                        gpt_label(raw_topics[i]["keywords"], raw_topics[i]["representative_docs"])
-                        for i in non_outlier_idx
-                    ],
-                    return_exceptions=True,
-                )
-                for i, result in zip(non_outlier_idx, gpt_results):
-                    if isinstance(result, str) and result:
-                        raw_topics[i]["label"] = result
-                        used_openai = True
+            return {
+                "topics": [fallback_topic],
+                "doc_assignments": fallback_assignments,
+                "total_docs": total_input,
+                "filtered_docs": len(docs),
+                "used_precomputed_embeddings": precomputed is not None,
+                "used_openai_labels": False,
+                "warning": f"BERTopic clustering failed ({exc}), using keyword-based fallback",
+            }
 
-        raw_topics.sort(key=lambda t: (t["id"] == -1, -t["message_count"]))
-
-        return {
-            "topics": raw_topics,
-            "doc_assignments": doc_assignments,
-            "total_docs": total_input,
-            "filtered_docs": len(docs),
-            "used_precomputed_embeddings": precomputed is not None,
-            "used_openai_labels": used_openai,
-        }
-
-    except Exception as exc:
-        logger.exception("BERTopic pipeline failed, falling back to keyword extraction")
-
-        # Graceful fallback: extract top keywords via CountVectorizer and return
-        # a single topic so the frontend still gets usable results.
-        stop_words = list(set(ENGLISH_STOP_WORDS) | set(DOMAIN_STOPWORDS))
-        fallback_vec = CountVectorizer(stop_words=stop_words, ngram_range=(1, 2), min_df=1)
-        try:
-            matrix = fallback_vec.fit_transform(docs)
-            freqs = matrix.toarray().sum(axis=0)
-            vocab = fallback_vec.get_feature_names_out()
-            top_idx = freqs.argsort()[::-1][:8]
-            keywords = [vocab[i] for i in top_idx if freqs[i] > 0]
-        except Exception:
-            keywords = []
-
-        fallback_label = " · ".join(keywords[:3]) if keywords else "General Discussion"
-        fallback_topic = {
-            "id": 0,
-            "label": fallback_label,
-            "keywords": keywords,
-            "message_count": len(docs),
-            "representative_docs": docs[:10],
-        }
-        fallback_assignments = {u: 0 for u in filtered_uuids if u}
-
-        return {
-            "topics": [fallback_topic],
-            "doc_assignments": fallback_assignments,
-            "total_docs": total_input,
-            "filtered_docs": len(docs),
-            "used_precomputed_embeddings": precomputed is not None,
-            "used_openai_labels": False,
-            "warning": f"BERTopic clustering failed ({exc}), using keyword-based fallback",
-        }
+    finally:
+        # Restore OMP/MKL thread counts so emotion model inference is unaffected.
+        if _prev_omp is None:
+            os.environ.pop("OMP_NUM_THREADS", None)
+        else:
+            os.environ["OMP_NUM_THREADS"] = _prev_omp
+        if _prev_mkl is None:
+            os.environ.pop("MKL_NUM_THREADS", None)
+        else:
+            os.environ["MKL_NUM_THREADS"] = _prev_mkl
 
 
 @app.post("/analyze_emotion")

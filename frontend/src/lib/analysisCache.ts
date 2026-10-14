@@ -1,6 +1,6 @@
 import { openDB } from 'idb'
 import type { IDBPDatabase } from 'idb'
-import type { EmotionPerMessage, EmotionResult, UserTopicsResult } from '../types'
+import type { EmotionPerMessage, EmotionResult } from '../types'
 
 const DB_NAME = 'retrieval_analysis_v1'
 const DB_VERSION = 2
@@ -26,15 +26,6 @@ function db(): Promise<IDBPDatabase> {
     })
   }
   return _db
-}
-
-export function makeBertopicKey(
-  username: string,
-  dateFrom: string,
-  dateTo: string,
-  scope: string,
-): string {
-  return `${username}|${dateFrom}|${dateTo}|${scope}`
 }
 
 export function makeEmotionKey(username: string, dateFrom: string, dateTo: string): string {
@@ -83,14 +74,13 @@ export function buildEmotionResult(perMessage: EmotionPerMessage[]): EmotionResu
     neutral: sentCounts.neutral / total,
   }
 
+  // Count only the dominant emotion (index 0, highest score) per message so each
+  // message contributes to exactly one emotion bucket — no overlap.
   const emotionAcc = new Map<string, number>()
   for (const m of perMessage) {
-    const seen = new Set<string>()
-    for (const e of m.top_emotions) {
-      if (!seen.has(e.label)) {
-        emotionAcc.set(e.label, (emotionAcc.get(e.label) ?? 0) + 1)
-        seen.add(e.label)
-      }
+    if (m.top_emotions.length > 0) {
+      const dominant = m.top_emotions[0].label
+      emotionAcc.set(dominant, (emotionAcc.get(dominant) ?? 0) + 1)
     }
   }
   const top_emotions = [...emotionAcc.entries()]
@@ -117,15 +107,4 @@ export function buildEmotionResult(perMessage: EmotionPerMessage[]): EmotionResu
     total_messages: perMessage.length,
     analyzed_messages: perMessage.length,
   }
-}
-
-// ── BERTopic ─────────────────────────────────────────────────────────────────
-
-export async function getBertopicResult(key: string): Promise<UserTopicsResult | null> {
-  const val = await (await db()).get('bertopic_results', key)
-  return (val as UserTopicsResult | undefined) ?? null
-}
-
-export async function saveBertopicResult(key: string, result: UserTopicsResult): Promise<void> {
-  await (await db()).put('bertopic_results', result, key)
 }

@@ -27,33 +27,16 @@ export interface User {
   created_at?: string
 }
 
-export type BookmarkSource = 'discord' | 'interview' | 'news'
-
 export interface Bookmark {
   id: number
   msg_id: number
   note?: string
   created_at: string
-  source?: BookmarkSource
   content?: string
   username?: string
   date?: string
   is_suno_team?: string | boolean
   codes: Code[]
-}
-
-export interface InterviewBookmark {
-  id: number
-  interview_id: string
-  excerpt: string
-  note: string
-  char_start?: number
-  char_end?: number
-  created_at: string
-  interviewees?: string
-  source_date?: string
-  codes: Code[]
-  highlights?: Array<{ id: number; code_id: number; code_name: string; code_color: string; highlighted_text: string }>
 }
 
 export interface Code {
@@ -133,6 +116,9 @@ export interface UserTopicsResult {
   total_docs: number
   filtered_docs: number
   warning?: string
+  // Set when the loaded run's date range differs from the requested filter
+  date_from?: string
+  date_to?: string
 }
 
 export type TopicPipelineStage = 'prepare' | 'fetch_embeddings' | 'align_docs' | 'bertopic' | 'complete' | 'error'
@@ -142,30 +128,6 @@ export interface TopicPipelineStep {
   stage: TopicPipelineStage
   status: TopicPipelineStatus
   message: string
-}
-
-export interface SearchFilters {
-  q?: string
-  date_from?: string
-  date_to?: string
-  upload_ids?: string[]
-  is_suno_team?: boolean
-  min_words?: number
-  limit?: number
-  offset?: number
-}
-
-export interface ChatMessage {
-  id: string
-  role: 'user' | 'assistant'
-  content: string
-  sources?: Message[]
-  isStreaming?: boolean
-}
-
-export interface TrendDataPoint {
-  period: string
-  count: number
 }
 
 export interface ContextMessage {

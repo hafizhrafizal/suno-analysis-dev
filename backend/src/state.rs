@@ -10,6 +10,13 @@ use crate::config::Config;
 /// cause the AI service to 503-fast-reject the excess, triggering retry storms.
 pub const AI_CONCURRENCY: usize = 8;
 
+/// Max concurrent OpenAI calls for on-demand topic relabeling.
+/// Shared across all browser tabs / sessions so that running "Relabel All"
+/// in multiple windows simultaneously doesn't flood the OpenAI API and trigger
+/// 429 rate-limit errors.  4 in-flight calls saturates the gpt-4o-mini tier
+/// without hitting the default RPM ceiling.
+pub const RELABEL_CONCURRENCY: usize = 4;
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: PgPool,
@@ -20,6 +27,10 @@ pub struct AppState {
     /// Global rate-limiter for calls to the AI service.  Shared across all
     /// tabs/users so two browser sessions can't collectively overwhelm the service.
     pub ai_semaphore: Arc<Semaphore>,
+    /// Global rate-limiter for on-demand OpenAI relabel calls.  Caps concurrent
+    /// GPT requests so running "Relabel All" in multiple browser tabs simultaneously
+    /// doesn't flood the OpenAI API and trigger 429 rate-limit errors.
+    pub relabel_semaphore: Arc<Semaphore>,
 }
 
 impl AsRef<AppState> for AppState {
@@ -46,6 +57,7 @@ impl AppState {
             fts_ready,
             http_client,
             ai_semaphore: Arc::new(Semaphore::new(AI_CONCURRENCY)),
+            relabel_semaphore: Arc::new(Semaphore::new(RELABEL_CONCURRENCY)),
         }
     }
 

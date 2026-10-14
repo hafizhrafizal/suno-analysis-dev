@@ -59,6 +59,8 @@ pub struct KeywordParams {
     pub min_words: Option<i64>,
     pub match_type: Option<String>,
     pub username: Option<String>,
+    pub sentiment: Option<String>,
+    pub emotion: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,6 +72,8 @@ pub struct UsernameParams {
     pub is_suno_team: Option<String>,
     pub min_words: Option<i64>,
     pub upload_ids: Option<String>,
+    pub sentiment: Option<String>,
+    pub emotion: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,6 +85,8 @@ pub struct RangeParams {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
     pub upload_ids: Option<String>,
+    pub sentiment: Option<String>,
+    pub emotion: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,6 +106,8 @@ pub struct UserMessagesParams {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
     pub upload_ids: Option<String>,
+    pub date_from: Option<String>,
+    pub date_to: Option<String>,
 }
 
 pub async fn keyword_search(
@@ -218,6 +226,22 @@ pub async fn keyword_search(
             qb.push(")");
         }
     }
+    if let Some(ref sent) = params.sentiment {
+        let s = sent.to_lowercase();
+        if matches!(s.as_str(), "positive" | "negative" | "neutral") {
+            qb.push(" AND m.msg_uuid IN (SELECT msg_uuid FROM message_emotions WHERE sentiment = ");
+            qb.push_bind(s);
+            qb.push(")");
+        }
+    }
+    if let Some(ref emo) = params.emotion {
+        let e = emo.to_lowercase();
+        if !e.is_empty() {
+            qb.push(" AND m.msg_uuid IN (SELECT msg_uuid FROM message_emotions WHERE dominant_emotion = ");
+            qb.push_bind(e);
+            qb.push(")");
+        }
+    }
 
     qb.push(" ORDER BY m.date DESC LIMIT ");
     qb.push_bind(limit);
@@ -278,11 +302,10 @@ fn blend_embeddings(a: &[f64], b: &[f64], w: f64) -> Vec<f64> {
     normalize_embedding(blended)
 }
 
-async fn hyde_embed(api_key: &str, query: &str, embed_model: &str) -> Option<Vec<f64>> {
-    let client = reqwest::Client::new();
-
+async fn hyde_embed(client: &reqwest::Client, api_key: &str, query: &str, embed_model: &str) -> Option<Vec<f64>> {
     let chat: serde_json::Value = client
         .post("https://api.openai.com/v1/chat/completions")
+        .timeout(std::time::Duration::from_secs(15))
         .bearer_auth(api_key)
         .json(&json!({
             "model": "gpt-4o-mini",
@@ -311,6 +334,7 @@ async fn hyde_embed(api_key: &str, query: &str, embed_model: &str) -> Option<Vec
 
     let embed: serde_json::Value = client
         .post("https://api.openai.com/v1/embeddings")
+        .timeout(std::time::Duration::from_secs(15))
         .bearer_auth(api_key)
         .json(&json!({ "model": embed_model, "input": hypo_doc }))
         .send()
@@ -329,10 +353,10 @@ async fn hyde_embed(api_key: &str, query: &str, embed_model: &str) -> Option<Vec
     if vec.is_empty() { None } else { Some(vec) }
 }
 
-async fn embed_query(api_key: &str, text: &str, model: &str) -> Result<Vec<f64>> {
-    let client = reqwest::Client::new();
+async fn embed_query(client: &reqwest::Client, api_key: &str, text: &str, model: &str) -> Result<Vec<f64>> {
     let resp = client
         .post("https://api.openai.com/v1/embeddings")
+        .timeout(std::time::Duration::from_secs(15))
         .bearer_auth(api_key)
         .json(&json!({ "model": model, "input": text }))
         .send()
@@ -370,6 +394,8 @@ pub struct SemanticParams {
     pub min_words: Option<i64>,
     pub username: Option<String>,
     pub sort_by: Option<String>,
+    pub sentiment: Option<String>,
+    pub emotion: Option<String>,
 }
 
 pub async fn semantic_search(
@@ -382,7 +408,10 @@ pub async fn semantic_search(
     if q.is_empty() {
         return Ok(Json(json!([])));
     }
-    let limit = params.limit.unwrap_or(20).min(200) as usize;
+    let limit = params
+        .limit
+        .unwrap_or(50)
+        .clamp(1, 500) as usize;
 
     let api_key = state
         .get_openai_key(key_from_header(&headers))
@@ -407,8 +436,8 @@ pub async fn semantic_search(
     );
 
     let (raw_res, hyde_opt) = tokio::join!(
-        embed_query(&api_key, &q, &embed_model),
-        hyde_embed(&api_key, &q, &embed_model)
+        embed_query(&state.http_client, &api_key, &q, &embed_model),
+        hyde_embed(&state.http_client, &api_key, &q, &embed_model)
     );
     let raw = normalize_embedding(raw_res?);
     let embedding = match hyde_opt {
@@ -419,21 +448,26 @@ pub async fn semantic_search(
         }
     };
 
-    // Fetch more candidates than needed so post-filters have a large pool to work with.
-    let n_results = (limit * 8).min(800);
-    let client = reqwest::Client::new();
+    // Fetch extra candidates so the date/username/sentiment post-filters below
+    // have a pool to work with, but cap the Qdrant request size so a search
+    // can't blow up into fetching+scoring hundreds of extra vectors+payloads.
+    let n_results = (limit * 4).min(500);
+    let client = &state.http_client;
 
     // ── Qdrant search ─────────────────────────────────────────────────────────
     let url = format!(
         "{}/collections/{}/points/search",
         state.config.qdrant_url, state.config.qdrant_collection
     );
-    let mut req = client.post(&url).json(&json!({
-        "vector": embedding,
-        "limit": n_results,
-        "with_payload": true,
-        "with_vector": false,
-    }));
+    let mut req = client
+        .post(&url)
+        .timeout(std::time::Duration::from_secs(20))
+        .json(&json!({
+            "vector": embedding,
+            "limit": n_results,
+            "with_payload": true,
+            "with_vector": false,
+        }));
     if let Some(key) = &state.config.qdrant_api_key {
         req = req.header("api-key", key);
     }
@@ -465,6 +499,9 @@ pub async fn semantic_search(
         .iter()
         .filter_map(|p| p["payload"]["msg_uuid"].as_str().map(String::from))
         .collect();
+    if msg_uuids.is_empty() {
+        return Ok(Json(json!([])));
+    }
     let uuid_to_similarity: std::collections::HashMap<String, f64> = results
         .iter()
         .filter_map(|p| {
@@ -487,17 +524,29 @@ pub async fn semantic_search(
         best_sim, min_similarity, word_count
     );
 
-    // Build IN clause with positional params
     let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
         "SELECT id, msg_uuid, author_id, username, date, content,
                 attachments, reactions, is_suno_team, upload_id, row_index
-         FROM messages WHERE msg_uuid IN (",
+         FROM messages WHERE msg_uuid = ANY(",
     );
-    let mut sep = qb.separated(", ");
-    for uuid in &msg_uuids {
-        sep.push_bind(uuid.clone());
-    }
+    qb.push_bind(msg_uuids.clone());
     qb.push(")");
+    if let Some(ref sent) = params.sentiment {
+        let s = sent.to_lowercase();
+        if matches!(s.as_str(), "positive" | "negative" | "neutral") {
+            qb.push(" AND msg_uuid IN (SELECT msg_uuid FROM message_emotions WHERE sentiment = ");
+            qb.push_bind(s);
+            qb.push(")");
+        }
+    }
+    if let Some(ref emo) = params.emotion {
+        let e = emo.to_lowercase();
+        if !e.is_empty() {
+            qb.push(" AND msg_uuid IN (SELECT msg_uuid FROM message_emotions WHERE dominant_emotion = ");
+            qb.push_bind(e);
+            qb.push(")");
+        }
+    }
     let rows = qb.build().fetch_all(&state.db).await?;
 
     use sqlx::Row;
@@ -674,6 +723,22 @@ pub async fn username_search(
             qb.push(")");
         }
     }
+    if let Some(ref sent) = params.sentiment {
+        let s = sent.to_lowercase();
+        if matches!(s.as_str(), "positive" | "negative" | "neutral") {
+            qb.push(" AND msg_uuid IN (SELECT msg_uuid FROM message_emotions WHERE sentiment = ");
+            qb.push_bind(s);
+            qb.push(")");
+        }
+    }
+    if let Some(ref emo) = params.emotion {
+        let e = emo.to_lowercase();
+        if !e.is_empty() {
+            qb.push(" AND msg_uuid IN (SELECT msg_uuid FROM message_emotions WHERE dominant_emotion = ");
+            qb.push_bind(e);
+            qb.push(")");
+        }
+    }
 
     qb.push(" ORDER BY date ASC LIMIT ");
     qb.push_bind(limit);
@@ -751,6 +816,22 @@ pub async fn range_search(
             for id in &ids {
                 sep.push_bind(id.to_string());
             }
+            qb.push(")");
+        }
+    }
+    if let Some(ref sent) = params.sentiment {
+        let s = sent.to_lowercase();
+        if matches!(s.as_str(), "positive" | "negative" | "neutral") {
+            qb.push(" AND msg_uuid IN (SELECT msg_uuid FROM message_emotions WHERE sentiment = ");
+            qb.push_bind(s);
+            qb.push(")");
+        }
+    }
+    if let Some(ref emo) = params.emotion {
+        let e = emo.to_lowercase();
+        if !e.is_empty() {
+            qb.push(" AND msg_uuid IN (SELECT msg_uuid FROM message_emotions WHERE dominant_emotion = ");
+            qb.push_bind(e);
             qb.push(")");
         }
     }
@@ -937,6 +1018,15 @@ pub async fn user_messages(
             }
             qb.push(")");
         }
+    }
+
+    if let Some(ref df) = params.date_from {
+        qb.push(" AND date >= ");
+        qb.push_bind(df.clone());
+    }
+    if let Some(ref dt) = params.date_to {
+        qb.push(" AND date <= ");
+        qb.push_bind(dt.clone());
     }
 
     qb.push(" ORDER BY date ASC LIMIT ");
