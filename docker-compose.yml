@@ -1,3 +1,11 @@
+# Local development stack: `docker compose up --build`, then open http://localhost
+# (run `npm run build` in frontend/ first so nginx has a dist/ to serve).
+#
+# Qdrant runs natively on the host (not in Docker); the backend reaches it via
+# host.docker.internal:6333. Postgres is exposed on 5432 for native tools.
+#
+# Production uses deploy/docker-compose.prod.yml instead (see deploy/README.md).
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -6,6 +14,8 @@ services:
       POSTGRES_DB: retrieval
       POSTGRES_USER: retrieval
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -20,6 +30,10 @@ services:
     restart: unless-stopped
     environment:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # When set, /analyze_emotion forwards inference to this HF Dedicated
+      # Endpoint (using the per-request X-HF-Token as the Bearer auth) instead
+      # of running the local ONNX model.  Empty = use local model.
+      HF_ENDPOINT_URL: ${HF_ENDPOINT_URL:-https://yk8g5z6jkf0tuyjs.us-east-1.aws.endpoints.huggingface.cloud}
     volumes:
       - ai_model_cache:/root/.cache/huggingface
     healthcheck:
@@ -28,18 +42,21 @@ services:
       timeout: 5s
       retries: 10
       start_period: 300s   # allow up to 5 min for model loading on first start
-    # No external port needed — only the backend calls it via the internal network
 
   backend:
     build:
-      context: .        # used by: docker compose up --build (git-pull workflow)
-    image: ${BACKEND_IMAGE:-ghcr.io/hafizhrafizal/retrieval-backend:latest}
+      context: .
+    image: retrieval-backend:local
     restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
       ai_service:
         condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8000:8000"
     environment:
       DATABASE_URL: postgres://retrieval:${POSTGRES_PASSWORD}@postgres:5432/retrieval
       VECTOR_DB: qdrant
@@ -58,14 +75,10 @@ services:
       - backend
     ports:
       - "80:80"
-      - "443:443"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./frontend/dist:/usr/share/nginx/html:ro
-      - /etc/letsencrypt:/etc/letsencrypt:ro
-      - nginx_cache:/var/cache/nginx
 
 volumes:
   postgres_data:
-  nginx_cache:
   ai_model_cache:   # HuggingFace model weights — persists across rebuilds

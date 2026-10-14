@@ -1,0 +1,5 @@
+# Build context for the backend Dockerfile — only the Rust sources are needed.
+*
+!backend/Cargo.toml
+!backend/Cargo.lock
+!backend/src/
